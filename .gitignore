@@ -1,0 +1,13 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Cached SEC ticker map (EDGAR_CACHE); refetched weekly on its own
+.edgar_cache/
+
+# Default output of a local `--html` run. The dashboard the workflow
+# publishes is docs/index.html, which IS tracked.
+dashboard.html
+
+# Note: discovery.db is deliberately tracked -- it is the collector's state
+# and the workflow commits it back after each run. Do not add it here.
