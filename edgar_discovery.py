@@ -486,6 +486,39 @@ def run_day(conn, day, tickers, limit=None):
     return n_docs, n_events
 
 
+def aggregate_buys(buys):
+    """Collapse one filing's purchases into the single decision they describe.
+
+    A Form 4 routinely reports a position built across several days as separate
+    transaction lines. Emitting only the first understates the commitment and
+    tiers on the wrong number: one real filing here reported $220K on 08-05 and
+    $438K on 08-06, and the dashboard showed $220K, Tier 2, against a $658K
+    total that clears the Tier 1 bar on its own.
+    """
+    shares = [b["shares"] for b in buys if b["shares"]]
+    values = [b["value"] for b in buys if b["value"] is not None]
+    dates = sorted(b["txn_date"] for b in buys if b["txn_date"])
+
+    # Volume-weighted over the priced lines only, so the quoted price is the
+    # one the reported money actually paid.
+    priced = [b for b in buys if b["shares"] and b["price"] is not None]
+    volume = sum(b["shares"] for b in priced)
+    price = sum(b["shares"] * b["price"] for b in priced) / volume if volume else None
+
+    agg = dict(buys[0])
+    agg.update(
+        {
+            "shares": sum(shares) if shares else None,
+            "price": price,
+            "value": sum(values) if values else None,
+            "txn_date": dates[-1] if dates else None,
+            "first_txn_date": dates[0] if dates else None,
+            "n_purchases": len(buys),
+        }
+    )
+    return agg
+
+
 def handle_form4(conn, row, tickers):
     text = fetch(f"https://www.sec.gov/Archives/{row['path']}")
     if not text:
@@ -495,7 +528,8 @@ def handle_form4(conn, row, tickers):
     if not buys:
         return 0
 
-    emitted = 0
+    # The ledger stays per-transaction; only the emitted event is aggregated.
+    by_ticker = {}
     for buy in buys:
         # Fall back to the ticker map when the XML omits the symbol.
         if not buy["ticker"] and buy["issuer_cik"] in tickers:
@@ -512,6 +546,11 @@ def handle_form4(conn, row, tickers):
              buy["owner"], buy["owner_title"], buy["txn_date"], buy["shares"],
              buy["price"], buy["value"]),
         )
+        by_ticker.setdefault(buy["ticker"], []).append(buy)
+
+    emitted = 0
+    for ticker, group in by_ticker.items():
+        buy = aggregate_buys(group)
 
         peers = cluster_insiders(conn, buy["issuer_cik"], buy["txn_date"])
         big = buy["value"] is not None and buy["value"] >= TIER1_VALUE_USD
@@ -521,17 +560,16 @@ def handle_form4(conn, row, tickers):
         reason = "cluster" if clustered else ("size" if big else "routine")
 
         if tier == 1:
-            promote(conn, buy["ticker"], buy["issuer_cik"],
-                    f"insider buying ({reason})")
+            promote(conn, ticker, buy["issuer_cik"], f"insider buying ({reason})")
 
         emitted += emit(
             conn,
             source_id=row["accession"],
-            entity=buy["ticker"],
+            entity=ticker,
             event_type="insider_buy",
             tier=tier,
             headline=(
-                f"{buy['ticker']}: {buy['owner']}"
+                f"{ticker}: {buy['owner']}"
                 + (
                     f" +{len(buy['co_owners'])} co-filer"
                     + ("s" if len(buy["co_owners"]) > 1 else "")
@@ -539,6 +577,11 @@ def handle_form4(conn, row, tickers):
                     else ""
                 )
                 + f" ({buy['owner_title']}) bought {usd(buy['value'])}"
+                + (
+                    f" across {buy['n_purchases']} purchases"
+                    if buy["n_purchases"] > 1
+                    else ""
+                )
                 + (f" — {len(peers)} insiders buying" if clustered else "")
             ),
             detail={**buy, "cluster_peers": peers, "tier_reason": reason},
@@ -705,6 +748,19 @@ h1 {
   border: 1px solid var(--signal); color: var(--signal);
   padding: 2px 6px; border-radius: 2px;
 }
+/* Secondary filings for a company already shown above. Subordinate to the
+   headline on purpose: the card is the story, these are its other filings. */
+.more {
+  list-style: none; margin: 10px 0 0; padding: 8px 0 0;
+  border-top: 1px solid var(--rule);
+}
+.more li {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 12px; padding: 3px 0; font-size: 13.5px; color: var(--muted);
+}
+.more li span {
+  font-family: "IBM Plex Mono", monospace; font-size: 11px; white-space: nowrap;
+}
 .empty {
   font-family: "IBM Plex Mono", monospace; font-size: 12px;
   color: var(--muted); padding: 20px 0;
@@ -737,21 +793,69 @@ def _initials(name):
     return "".join(p[0].upper() for p in parts[:2]) or "??"
 
 
-def render_row(row):
-    detail = json.loads(row["detail"] or "{}")
-    bits = [f"filed {html.escape(row['filed_date'] or '')}"]
+# Ranking sentinel, not a dollar figure: a deal filing and a position size are
+# not on one scale, and a definitive merger document is the least ambiguous
+# thing this collector finds, so it leads its tier.
+MA_RANK = 10 ** 12
 
-    if row["event_type"] == "insider_buy":
+
+def conviction(event):
+    """Sort key inside a tier. Dollars for buys, so the loudest signal is the
+    one you read first -- sorting by filing time buried a $5.0M purchase eight
+    rows under a $14K one."""
+    if event["event_type"] != "insider_buy":
+        return MA_RANK
+    return json.loads(event["detail"] or "{}").get("value") or 0
+
+
+def group_by_company(events):
+    """One card per ticker. A company that files three times in a week is one
+    story told three times, not three stories."""
+    groups = {}
+    for event in events:
+        groups.setdefault(event["entity"], []).append(event)
+    ranked = [
+        (entity, sorted(evs, key=conviction, reverse=True))
+        for entity, evs in groups.items()
+    ]
+    ranked.sort(key=lambda g: conviction(g[1][0]), reverse=True)
+    return ranked
+
+
+def _strip_ticker(headline, entity):
+    """The ticker is already the card's left column; drop the prefix the
+    headline carries for the CLI listing."""
+    prefix = f"{entity}: "
+    return headline[len(prefix):] if headline.startswith(prefix) else headline
+
+
+def render_company(entity, events):
+    primary = events[0]
+    detail = json.loads(primary["detail"] or "{}")
+    bits = [f"filed {html.escape(primary['filed_date'] or '')}"]
+
+    if primary["event_type"] == "insider_buy":
         if detail.get("shares") and detail.get("price"):
             bits.append(f"{int(detail['shares']):,} sh @ ${detail['price']:,.2f}")
-        if detail.get("txn_date"):
-            bits.append(f"traded {detail['txn_date']}")
+        first, last = detail.get("first_txn_date"), detail.get("txn_date")
+        if last:
+            span = f"{first} → {last}" if first and first != last else last
+            bits.append(f"traded {html.escape(span)}")
     else:
         bits.append(html.escape(detail.get("form_type", "")))
-    bits.append(html.escape(row["source_id"]))
+    bits.append(html.escape(primary["source_id"]))
 
-    # Signature: one chip per distinct insider, so a cluster is visible at a glance.
-    peers = detail.get("cluster_peers") or []
+    # Signature: one chip per distinct insider, so a cluster is visible at a
+    # glance. Pooled across the card's filings, because each one only recorded
+    # the peers visible when it was processed -- the filing that happens to
+    # lead on dollar value is often the one that saw the fewest.
+    peers = list(
+        dict.fromkeys(
+            name
+            for event in events
+            for name in (json.loads(event["detail"] or "{}").get("cluster_peers") or [])
+        )
+    )
     chips = ""
     if len(peers) > 1:
         marks = "".join(
@@ -759,12 +863,22 @@ def render_row(row):
         )
         chips = f'<div class="chips">{marks}</div>'
 
+    more = ""
+    if len(events) > 1:
+        items = "".join(
+            f"<li>{html.escape(_strip_ticker(e['headline'] or '', entity))}"
+            f"<span>{html.escape(e['filed_date'] or '')}</span></li>"
+            for e in events[1:]
+        )
+        more = f'<ul class="more">{items}</ul>'
+
     return f"""<div class="row">
-  <div class="ticker">{html.escape(row['entity'] or '—')}</div>
+  <div class="ticker">{html.escape(entity or '—')}</div>
   <div>
-    <p class="headline">{html.escape(row['headline'] or '')}</p>
+    <p class="headline">{html.escape(_strip_ticker(primary['headline'] or '', entity))}</p>
     <div class="detail">{"".join(f"<span>{b}</span>" for b in bits)}</div>
     {chips}
+    {more}
   </div>
 </div>"""
 
@@ -781,14 +895,18 @@ def write_html(conn, path="dashboard.html"):
     sections = []
     for tier, label in ((1, "Act on these"), (2, "Everything else")):
         rows = [e for e in events if e["tier"] == tier]
+        companies = group_by_company(rows)
         body = (
-            "".join(render_row(r) for r in rows)
-            if rows
+            "".join(render_company(entity, evs) for entity, evs in companies)
+            if companies
             else '<p class="empty">Nothing yet. Run a collection to populate this.</p>'
         )
+        count = f"{len(companies)}"
+        if len(rows) != len(companies):
+            count += f" · {len(rows)} filings"
         sections.append(
             f'<section class="t{tier}"><div class="tier-head">'
-            f"<b>Tier {tier} — {label}</b><span>{len(rows)}</span></div>{body}</section>"
+            f"<b>Tier {tier} — {label}</b><span>{count}</span></div>{body}</section>"
         )
 
     covered = ", ".join(r["run_date"] for r in runs) or "no runs yet"
