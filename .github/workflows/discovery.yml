@@ -4,10 +4,17 @@ name: discovery
 
 on:
   schedule:
-    - cron: '0 7 * * 1-5'
-      timezone: 'America/New_York'
-    - cron: '0 21 * * 1-5'
-      timezone: 'America/New_York'
+    # GitHub Actions evaluates cron in UTC only -- there is no timezone key and
+    # no DST handling, so the ET times below are pinned to EST (UTC-5). Through
+    # EDT each run lands an hour later in local terms (08:00 / 22:00 ET), which
+    # is the safe direction: the evening run must not fire before the daily
+    # index is published.
+    #
+    # 07:00 EST / 08:00 EDT -- morning pass over the last few weekdays
+    - cron: '0 12 * * 1-5'
+    # 21:00 EST / 22:00 EDT -- evening pass. Mon-Fri evenings ET fall on
+    # Tue-Sat in UTC, hence 2-6 rather than 1-5.
+    - cron: '0 2 * * 2-6'
   workflow_dispatch:
     inputs:
       backfill:
