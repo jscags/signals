@@ -82,8 +82,17 @@ def fetch(url, binary=False):
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
-        if exc.code in (403, 404):
+        # Only 404 means "this genuinely does not exist". A 403 means the SEC
+        # rejected us -- conflating the two hides real failures behind a
+        # cheerful "no filings today" message.
+        if exc.code == 404:
             return None
+        if exc.code == 403:
+            raise RuntimeError(
+                f"SEC returned 403 for {url}\n"
+                f"Usually a malformed User-Agent or rate limiting.\n"
+                f"Current value: {USER_AGENT!r}"
+            ) from exc
         raise
     return raw if binary else raw.decode("utf-8", errors="replace")
 
@@ -126,7 +135,7 @@ def index_url(day):
     quarter = (day.month - 1) // 3 + 1
     return (
         f"https://www.sec.gov/Archives/edgar/daily-index/"
-        f"{day.year}/QT{quarter}/master.{day:%Y%m%d}.idx"
+        f"{day.year}/QTR{quarter}/master.{day:%Y%m%d}.idx"
     )
 
 
@@ -408,7 +417,13 @@ def run_day(conn, day, tickers, limit=None):
         return 0, 0
 
     rows = parse_master_idx(body)
+    if not rows:
+        print(f"{day}  WARNING: index fetched ({len(body):,} bytes) but parsed "
+              f"to 0 rows — the file format may have changed")
     n_docs = n_events = 0
+    n_candidates = sum(
+        1 for r in rows if r["form_type"] == "4" or r["form_type"] in MA_FORMS
+    )
 
     for row in rows:
         if limit is not None and n_docs >= limit:
@@ -448,7 +463,8 @@ def run_day(conn, day, tickers, limit=None):
          datetime.utcnow().isoformat(timespec="seconds")),
     )
     conn.commit()
-    print(f"{day}  {n_docs} docs processed, {n_events} events emitted")
+    print(f"{day}  {len(rows):,} filings in index, {n_candidates} of interest, "
+          f"{n_docs} processed, {n_events} events")
     return n_docs, n_events
 
 
