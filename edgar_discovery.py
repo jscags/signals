@@ -212,6 +212,15 @@ def parse_form4(root):
     open-market purchase. Code A is a grant or award, and M is an option
     exercise -- neither reflects a decision to commit cash at market price.
     We also require acquired/disposed == 'A' to exclude oddities.
+
+    One row per transaction, never one per (transaction x reporting owner).
+    A Form 4 carrying several reporting owners is a joint filing by an
+    affiliated group -- a fund, its general partner, its managing member --
+    reporting the same shares once under shared beneficial ownership. The
+    schema offers no link from a transaction to a particular owner, so there
+    is nothing to attribute; fanning the transaction out across owners would
+    invent N insiders out of one decision and trip the cluster rule on the
+    strength of a single filing.
     """
     if root is None:
         return []
@@ -220,19 +229,28 @@ def parse_form4(root):
     issuer_name = _text(root, "issuer/issuerName")
     ticker = _text(root, "issuer/issuerTradingSymbol")
 
-    owners = []
+    names, titles = [], []
     for owner in root.findall("reportingOwner"):
-        name = _text(owner, "reportingOwnerId/rptOwnerName", "UNKNOWN")
+        names.append(_text(owner, "reportingOwnerId/rptOwnerName", "UNKNOWN"))
         rel = owner.find("reportingOwnerRelationship")
-        titles = []
-        if rel is not None:
-            if _text(rel, "isDirector") in ("1", "true"):
-                titles.append("Director")
-            if _text(rel, "isOfficer") in ("1", "true"):
-                titles.append(_text(rel, "officerTitle") or "Officer")
-            if _text(rel, "isTenPercentOwner") in ("1", "true"):
-                titles.append("10% Owner")
-        owners.append((name, ", ".join(titles) or "Insider"))
+        if rel is None:
+            continue
+        if _text(rel, "isDirector") in ("1", "true"):
+            titles.append("Director")
+        if _text(rel, "isOfficer") in ("1", "true"):
+            titles.append(_text(rel, "officerTitle") or "Officer")
+        if _text(rel, "isTenPercentOwner") in ("1", "true"):
+            titles.append("10% Owner")
+
+    # Sorted, so the identity a group files under does not depend on the order
+    # the filing agent happened to list them in. An unstable choice here would
+    # read as two different insiders across two filings by the same group --
+    # exactly the false cluster this function exists to avoid.
+    names = sorted(set(names)) or ["UNKNOWN"]
+    owner, co_owners = names[0], names[1:]
+    # Relationships are per-owner, but the transaction belongs to the group, so
+    # the union describes it: a fund plus its director co-filer is both.
+    owner_title = ", ".join(dict.fromkeys(titles)) or "Insider"
 
     buys = []
     for txn in root.findall("nonDerivativeTable/nonDerivativeTransaction"):
@@ -248,20 +266,20 @@ def parse_form4(root):
         txn_date = _text(txn, "transactionDate/value")
         value = shares * price if shares and price else None
 
-        for name, title in owners:
-            buys.append(
-                {
-                    "issuer_cik": int(issuer_cik) if issuer_cik else None,
-                    "issuer": issuer_name,
-                    "ticker": ticker,
-                    "owner": name,
-                    "owner_title": title,
-                    "txn_date": txn_date,
-                    "shares": shares,
-                    "price": price,
-                    "value": value,
-                }
-            )
+        buys.append(
+            {
+                "issuer_cik": int(issuer_cik) if issuer_cik else None,
+                "issuer": issuer_name,
+                "ticker": ticker,
+                "owner": owner,
+                "owner_title": owner_title,
+                "co_owners": co_owners,
+                "txn_date": txn_date,
+                "shares": shares,
+                "price": price,
+                "value": value,
+            }
+        )
     return buys
 
 
@@ -513,8 +531,14 @@ def handle_form4(conn, row, tickers):
             event_type="insider_buy",
             tier=tier,
             headline=(
-                f"{buy['ticker']}: {buy['owner']} ({buy['owner_title']}) "
-                f"bought {usd(buy['value'])}"
+                f"{buy['ticker']}: {buy['owner']}"
+                + (
+                    f" +{len(buy['co_owners'])} co-filer"
+                    + ("s" if len(buy["co_owners"]) > 1 else "")
+                    if buy["co_owners"]
+                    else ""
+                )
+                + f" ({buy['owner_title']}) bought {usd(buy['value'])}"
                 + (f" — {len(peers)} insiders buying" if clustered else "")
             ),
             detail={**buy, "cluster_peers": peers, "tier_reason": reason},
