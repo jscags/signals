@@ -34,7 +34,7 @@ jobs:
 
       - name: Collect filings
         env:
-          EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
+          EDGAR_USER_AGENT: "edgar-discovery 52y9fp5njf@privaterelay.appleid.com"
           BACKFILL: ${{ inputs.backfill || '2' }}
           LIMIT: ${{ inputs.limit }}
         run: |
