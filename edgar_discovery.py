@@ -1047,7 +1047,28 @@ def probe_buybacks(days=3, sample=60):
     print(f"\nany repurchase concept at all: {len(examples)}/{len(filers)} "
           f"({len(examples) / len(filers) * 100:.0f}%)\n")
 
-    print("sample of the most recent observation per filer:")
+    # What could turn a dollar figure into a share of the company?
+    print("\ncandidate denominators:")
+    denom = {"EntityPublicFloat": 0, "shares outstanding": 0,
+             "implied price (paired value+shares)": 0, "our own Form 4 price": 0}
+    for cik, (ticker, form, day) in filers.items():
+        facts = company_facts(cik)
+        if facts_concept(facts, "dei", "EntityPublicFloat"):
+            denom["EntityPublicFloat"] += 1
+        if any(facts_concept(facts, t, g) for t, g in XBRL_CONCEPTS):
+            denom["shares outstanding"] += 1
+        has_v = any(facts_concept(facts, t, g) for t, g in BUYBACK_VALUE_CONCEPTS)
+        has_s = any(facts_concept(facts, t, g) for t, g in BUYBACK_SHARE_CONCEPTS)
+        if has_v and has_s:
+            denom["implied price (paired value+shares)"] += 1
+    with connect() as conn:
+        known = {r[0] for r in conn.execute(
+            "SELECT DISTINCT issuer_cik FROM insider_buys WHERE price IS NOT NULL")}
+    denom["our own Form 4 price"] = sum(1 for cik in filers if cik in known)
+    for name, hit in denom.items():
+        print(f"  {name:38} {hit:>4}/{len(filers)} {hit / len(filers) * 100:>5.0f}%")
+
+    print("\nsample of the most recent observation per filer:")
     for ticker, form, found in examples[:12]:
         tag, point = next(iter(found.items()))
         print(f"  {ticker:7} {form:5} {tag[:38]:38} "
