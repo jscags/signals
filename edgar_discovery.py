@@ -85,15 +85,18 @@ EVENT_TTL_DAYS = {1: 14, 2: 5}
 SHARES_TTL_DAYS = 30
 
 # Not every issuer tags the cover-page concept with a real number. Galaxy
-# Digital reports 100 shares outstanding, which values the company at $1,963
-# and turns a $100K purchase into 51% of it -- top of Tier 1, flagged major.
-# A reporting issuer with fewer shares than this does not exist in practice.
+# Digital reports 100 shares outstanding, which values the whole company at
+# $1,963 -- so a $100K purchase came out as 51x the company, i.e. 5,100% of
+# it, and led Tier 1 flagged major. A reporting issuer with fewer shares than
+# this does not exist in practice.
 MIN_PLAUSIBLE_SHARES = 50_000
 
 # No open-market Form 4 purchase is a fifth of a company. Above this the
 # denominator is wrong, not the buy extraordinary -- a stake that size arrives
-# with a 13D, not a routine insider filing. The largest genuine reading in the
-# live data is 148 bps, so this leaves an order of magnitude of headroom.
+# with a 13D, not a routine insider filing. Genuine readings do run high at the
+# small end: the largest in the live data is EVGN at 918 bps (9.18% of a $4.4M
+# company), so this ceiling sits a little over 2x above the real range, not the
+# order of magnitude a mid-cap-only sample would suggest.
 MAX_PLAUSIBLE_BPS = 2_000.0
 
 # No insider has ever bought this much stock in one filing. A Form 4 reporting
