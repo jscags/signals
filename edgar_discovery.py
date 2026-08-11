@@ -84,6 +84,24 @@ EVENT_TTL_DAYS = {1: 14, 2: 5}
 # Shares outstanding moves slowly; a monthly refresh is plenty.
 SHARES_TTL_DAYS = 30
 
+# Not every issuer tags the cover-page concept with a real number. Galaxy
+# Digital reports 100 shares outstanding, which values the company at $1,963
+# and turns a $100K purchase into 51% of it -- top of Tier 1, flagged major.
+# A reporting issuer with fewer shares than this does not exist in practice.
+MIN_PLAUSIBLE_SHARES = 50_000
+
+# No open-market Form 4 purchase is a fifth of a company. Above this the
+# denominator is wrong, not the buy extraordinary -- a stake that size arrives
+# with a 13D, not a routine insider filing. The largest genuine reading in the
+# live data is 148 bps, so this leaves an order of magnitude of headroom.
+MAX_PLAUSIBLE_BPS = 2_000.0
+
+# No insider has ever bought this much stock in one filing. A Form 4 reporting
+# more has a bad price -- one live filing quotes $180,000 a share against a
+# $1.60 stock -- and the dollar figure must not be shown or tiered on. The
+# share-of-company score is unaffected, since price cancels out of that ratio.
+MAX_PLAUSIBLE_VALUE_USD = 1_000_000_000
+
 # Cover-page share count first, the us-gaap balance-sheet tag as a fallback for
 # issuers that do not tag the dei concept.
 XBRL_CONCEPTS = (
@@ -540,7 +558,9 @@ def shares_outstanding(conn, cik):
         try:
             age = date.today() - date.fromisoformat(row["fetched_at"][:10])
             if age.days < SHARES_TTL_DAYS:
-                return row["shares_out"]
+                # Filtered on the way out too, so a bad value already cached by
+                # an earlier version stops being served without a refetch.
+                return plausible_shares(row["shares_out"])
         except ValueError:
             pass  # unparseable timestamp: fall through and refetch
 
@@ -570,7 +590,10 @@ def shares_outstanding(conn, cik):
         if not points:
             continue
         latest = max(points, key=lambda p: (p.get("end") or "", p.get("filed") or ""))
-        value, as_of = float(latest["val"]), latest.get("end")
+        candidate = plausible_shares(float(latest["val"]))
+        if candidate is None:
+            continue  # placeholder count; try the other concept
+        value, as_of = candidate, latest.get("end")
         break
 
     # Cache misses too, so an issuer that tags neither concept is not re-asked
@@ -587,12 +610,42 @@ def shares_outstanding(conn, cik):
     return value
 
 
-def bps_of_market_cap(value, shares_out, price):
-    """How much of the company this purchase represents, in basis points."""
-    if not value or not shares_out or not price:
+def plausible_shares(shares_out):
+    """The share count, or None when it cannot be a real one."""
+    if not shares_out or shares_out < MIN_PLAUSIBLE_SHARES:
         return None
-    market_cap = shares_out * price
-    return value / market_cap * 10_000 if market_cap else None
+    return shares_out
+
+
+def bps_of_market_cap(value, shares_out, price, shares_bought=None):
+    """How much of the company this purchase represents, in basis points.
+
+    Returns None rather than a number whenever the denominator looks wrong. An
+    unscored filing is honest; a filing scored against a placeholder share
+    count outranks every real signal on the page.
+    """
+    shares_out = plausible_shares(shares_out)
+    if not shares_out:
+        return None
+
+    if shares_bought:
+        # Share counts, not dollars. The price multiplies both the purchase and
+        # the market cap and cancels exactly, so this is the same number by a
+        # route that a misreported price cannot corrupt -- one live filing
+        # quotes $180,000 a share, and its ratio still comes out right.
+        if shares_bought > shares_out:
+            # Bought more than the company has: that is not a share count.
+            return None
+        bps = shares_bought / shares_out * 10_000
+    else:
+        if not value or not price:
+            return None
+        market_cap = shares_out * price
+        if not market_cap:
+            return None
+        bps = value / market_cap * 10_000
+
+    return bps if bps <= MAX_PLAUSIBLE_BPS else None
 
 
 def significance_band(bps):
@@ -748,12 +801,19 @@ def aggregate_buys(buys):
         before = shares_after - total_shares
         position_before = before if before >= 0 else None
 
+    total_value = sum(values) if values else None
+    # A price the filing got wrong inflates the dollars and nothing else, so
+    # drop the figure rather than print it or tier on it. usd() renders None as
+    # "undisclosed", which is exactly what we know.
+    value_suspect = total_value is not None and total_value > MAX_PLAUSIBLE_VALUE_USD
+
     agg = dict(buys[0])
     agg.update(
         {
             "shares": total_shares,
-            "price": price,
-            "value": sum(values) if values else None,
+            "price": None if value_suspect else price,
+            "value": None if value_suspect else total_value,
+            "value_suspect": value_suspect,
             "txn_date": dates[-1] if dates else None,
             "first_txn_date": dates[0] if dates else None,
             "n_purchases": len(buys),
@@ -781,7 +841,10 @@ def score_buy(conn, ticker, buy):
     """
     peers = cluster_insiders(conn, buy["issuer_cik"], buy["txn_date"])
     bps = bps_of_market_cap(
-        buy["value"], shares_outstanding(conn, buy["issuer_cik"]), buy["price"]
+        buy["value"],
+        shares_outstanding(conn, buy["issuer_cik"]),
+        buy["price"],
+        shares_bought=buy.get("shares"),
     )
 
     big = buy["value"] is not None and buy["value"] >= TIER1_VALUE_USD
@@ -1044,7 +1107,11 @@ def rescore(conn):
         "WHERE event_type = 'insider_buy'"
     ).fetchall():
         detail = json.loads(row["detail"] or "{}")
-        if detail.get("bps_of_market_cap") is not None:
+        stored = detail.get("bps_of_market_cap")
+        # Already scored and the score is sane -- nothing to do. A stored figure
+        # above the plausible ceiling was computed against a bad share count and
+        # needs clearing, so it is deliberately not skipped here.
+        if stored is not None and stored <= MAX_PLAUSIBLE_BPS:
             continue
 
         ledger = conn.execute(
@@ -1064,7 +1131,10 @@ def rescore(conn):
         buy["new_position"] = detail.get("new_position", False)
 
         score = score_buy(conn, row["entity"], buy)
-        if score["bps"] is None:
+        # Nothing gained and nothing to correct: leave it alone. When there IS a
+        # stored figure we fall through even with no new one, so a score built
+        # on a placeholder share count is written back out as unscored.
+        if score["bps"] is None and stored is None:
             continue
 
         if score["tier"] == 1:
