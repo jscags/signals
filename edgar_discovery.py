@@ -929,11 +929,20 @@ def market_today():
 
 
 def business_days_back(n):
+    """The most recent n business days, today included when it is a weekday.
+
+    Today is worth asking for. EDGAR publishes a day's index around 22:00 ET,
+    so the evening run can collect that same day rather than leaving it for
+    tomorrow morning -- the difference between a filing surfacing in an hour
+    and in ten. This used to start from yesterday because an unpublished index
+    answered 403 and killed the whole run; run_day now records that as a skip,
+    so the early ask costs one request and one honest log line.
+    """
     days, cursor = [], market_today()
     while len(days) < n:
-        cursor -= timedelta(days=1)
         if cursor.weekday() < 5:
             days.append(cursor)
+        cursor -= timedelta(days=1)
     return sorted(days)
 
 
