@@ -75,6 +75,12 @@ TIER1_BPS = 25.0
 # thousands more requests.
 MAX_CONSECUTIVE_REFUSALS = 20
 
+# Shelf life for a dashboard event, by tier. Nothing else retires them, so
+# without this the feed only grows. Tier 1 is worth acting on for about a
+# fortnight; Tier 2 is mostly merger chatter and routine small buys and goes
+# stale far sooner.
+EVENT_TTL_DAYS = {1: 14, 2: 5}
+
 # Shares outstanding moves slowly; a monthly refresh is plenty.
 SHARES_TTL_DAYS = 30
 
@@ -97,6 +103,17 @@ TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 
 
 _last_request = 0.0
+
+
+class FetchError(RuntimeError):
+    """The request did not come back, and trying again later might fix it.
+
+    Covers an outright SEC refusal and the whole family of transport failures
+    -- reset connections, timeouts, DNS, a proxy declining the tunnel -- which
+    arrive as OSError rather than HTTPError and so slipped past handlers that
+    only knew about 403. Callers treat them alike: skip this one, keep the run.
+    Subclasses RuntimeError so existing handlers catch it unchanged.
+    """
 
 
 def fetch(url, binary=False):
@@ -124,12 +141,19 @@ def fetch(url, binary=False):
         if exc.code == 404:
             return None
         if exc.code == 403:
-            raise RuntimeError(
+            raise FetchError(
                 f"SEC returned 403 for {url}\n"
                 f"Usually a malformed User-Agent or rate limiting.\n"
                 f"Current value: {USER_AGENT!r}"
             ) from exc
+        if exc.code >= 500:
+            raise FetchError(f"SEC returned {exc.code} for {url}") from exc
+        # Anything else in the 4xx range is a bug in the request, not weather.
         raise
+    except OSError as exc:
+        # HTTPError is caught above; what is left here is transport -- URLError,
+        # timeouts, resets, a proxy declining. Same treatment as a refusal.
+        raise FetchError(f"could not reach {url}: {exc}") from exc
     return raw if binary else raw.decode("utf-8", errors="replace")
 
 
@@ -598,7 +622,7 @@ def run_day(conn, day, tickers, limit=None):
         # main() still exits non-zero when EVERY day is refused, which is what
         # an actually blocked client looks like.
         log_run(conn, day, "index_unavailable", 0, 0, started)
-        print(f"{day}  index unavailable (403) — not yet published, or refused")
+        print(f"{day}  index unavailable — not published yet, refused, or unreachable")
         return "unavailable"
 
     if body is None:
@@ -726,6 +750,61 @@ def aggregate_buys(buys):
     return agg
 
 
+def score_buy(conn, ticker, buy):
+    """Tier an aggregated purchase and describe why.
+
+    Shared by collection and by --rescore so a backfilled event is scored by
+    exactly the same rules as a freshly collected one; two copies of this would
+    drift apart the first time a threshold moved.
+    """
+    peers = cluster_insiders(conn, buy["issuer_cik"], buy["txn_date"])
+    bps = bps_of_market_cap(
+        buy["value"], shares_outstanding(conn, buy["issuer_cik"]), buy["price"]
+    )
+
+    big = buy["value"] is not None and buy["value"] >= TIER1_VALUE_USD
+    clustered = len(peers) >= CLUSTER_MIN_INSIDERS
+    relative = bps is not None and bps >= TIER1_BPS
+
+    # Relative size is the more informative label when both apply: it says what
+    # the purchase meant to the company, not just to the buyer.
+    reason = (
+        "cluster" if clustered
+        else "relative size" if relative
+        else "size" if big
+        else "routine"
+    )
+    return {
+        "tier": 1 if (big or clustered or relative) else 2,
+        "reason": reason,
+        "peers": peers,
+        "bps": bps,
+        "band": significance_band(bps),
+        "clustered": clustered,
+        "headline": buy_headline(ticker, buy, peers, bps, clustered),
+    }
+
+
+def buy_headline(ticker, buy, peers, bps, clustered):
+    co_owners = buy.get("co_owners") or []
+    return (
+        f"{ticker}: {buy['owner']}"
+        + (
+            f" +{len(co_owners)} co-filer" + ("s" if len(co_owners) > 1 else "")
+            if co_owners
+            else ""
+        )
+        + f" ({buy['owner_title']}) bought {usd(buy['value'])}"
+        + (
+            f" across {buy['n_purchases']} purchases"
+            if (buy.get("n_purchases") or 1) > 1
+            else ""
+        )
+        + (f" — {format_bps(bps)}" if bps is not None else "")
+        + (f" — {len(peers)} insiders buying" if clustered else "")
+    )
+
+
 def handle_form4(conn, row, tickers):
     """Events emitted for this filing, or None if the SEC refused the document.
 
@@ -769,58 +848,25 @@ def handle_form4(conn, row, tickers):
     for ticker, group in by_ticker.items():
         buy = aggregate_buys(group)
 
-        peers = cluster_insiders(conn, buy["issuer_cik"], buy["txn_date"])
-        big = buy["value"] is not None and buy["value"] >= TIER1_VALUE_USD
-        clustered = len(peers) >= CLUSTER_MIN_INSIDERS
+        score = score_buy(conn, ticker, buy)
 
-        bps = bps_of_market_cap(
-            buy["value"], shares_outstanding(conn, buy["issuer_cik"]), buy["price"]
-        )
-        band = significance_band(bps)
-        relative = bps is not None and bps >= TIER1_BPS
-
-        tier = 1 if (big or clustered or relative) else 2
-        # Relative size is the more informative label when both apply: it says
-        # what the purchase meant to the company, not just to the buyer.
-        reason = (
-            "cluster" if clustered
-            else "relative size" if relative
-            else "size" if big
-            else "routine"
-        )
-
-        if tier == 1:
-            promote(conn, ticker, buy["issuer_cik"], f"insider buying ({reason})")
+        if score["tier"] == 1:
+            promote(conn, ticker, buy["issuer_cik"],
+                    f"insider buying ({score['reason']})")
 
         emitted += emit(
             conn,
             source_id=row["accession"],
             entity=ticker,
             event_type="insider_buy",
-            tier=tier,
-            headline=(
-                f"{ticker}: {buy['owner']}"
-                + (
-                    f" +{len(buy['co_owners'])} co-filer"
-                    + ("s" if len(buy["co_owners"]) > 1 else "")
-                    if buy["co_owners"]
-                    else ""
-                )
-                + f" ({buy['owner_title']}) bought {usd(buy['value'])}"
-                + (
-                    f" across {buy['n_purchases']} purchases"
-                    if buy["n_purchases"] > 1
-                    else ""
-                )
-                + (f" — {format_bps(bps)}" if bps is not None else "")
-                + (f" — {len(peers)} insiders buying" if clustered else "")
-            ),
+            tier=score["tier"],
+            headline=score["headline"],
             detail={
                 **buy,
-                "cluster_peers": peers,
-                "tier_reason": reason,
-                "bps_of_market_cap": bps,
-                "significance": band,
+                "cluster_peers": score["peers"],
+                "tier_reason": score["reason"],
+                "bps_of_market_cap": score["bps"],
+                "significance": score["band"],
             },
             filed=row["filed"],
         )
@@ -884,6 +930,122 @@ def show_events(conn, tier=None, limit=50):
             current = row["tier"]
             print(f"\n--- TIER {current} " + "-" * 50)
         print(f"  [{row['filed_date']}] {row['headline']}")
+
+
+def review_events(conn, ticker=None, tier=None):
+    """Mark open events reviewed so they leave the dashboard.
+
+    The row is kept -- reviewed_at is a timestamp, not a delete -- so a company
+    can be brought back with --unreview and the history stays intact.
+    """
+    sql = "UPDATE events SET reviewed_at = ? WHERE reviewed_at IS NULL"
+    args = [market_today().isoformat()]
+    if ticker:
+        sql += " AND entity = ?"
+        args.append(ticker.upper())
+    if tier:
+        sql += " AND tier = ?"
+        args.append(tier)
+    return conn.execute(sql, args).rowcount
+
+
+def unreview_events(conn, ticker):
+    return conn.execute(
+        "UPDATE events SET reviewed_at = NULL WHERE entity = ?", (ticker.upper(),)
+    ).rowcount
+
+
+def prune_events(conn):
+    """Retire events past their tier's shelf life.
+
+    Nothing ever marked an event reviewed, so the dashboard only grew -- 65
+    events one day, 176 two runs later, on the way to thousands. This is the
+    same bargain prune_watchlist strikes: the row stays, it just stops being
+    shown. Tier 1 keeps a fortnight because that is roughly how long a filing
+    is still worth acting on; Tier 2 is largely 425 merger chatter and routine
+    small buys, which go stale in days. A filing that mattered has already
+    promoted its company to the watchlist, which has its own longer clock.
+    """
+    today = market_today()
+    retired = 0
+    for tier, days in EVENT_TTL_DAYS.items():
+        cutoff = (today - timedelta(days=days)).isoformat()
+        retired += conn.execute(
+            """UPDATE events SET reviewed_at = ?
+               WHERE reviewed_at IS NULL AND tier = ?
+                 AND COALESCE(filed_date, created_at) < ?""",
+            (today.isoformat(), tier, cutoff),
+        ).rowcount
+    return retired
+
+
+def rescore(conn):
+    """Backfill significance onto events emitted before the scale existed.
+
+    emit() is idempotent and already_processed stops the documents being read
+    again, so stored events never pick up a bps figure on their own -- they
+    would rank below every newer filing forever. The ledger still holds each
+    transaction, so both the aggregate and the score can be rebuilt without
+    refetching a single document.
+
+    Returns (rescored, promoted). Events whose issuer tags no share count stay
+    unscored, and pct_position cannot be recovered because the ledger has no
+    column for the post-transaction holding -- only newly collected filings
+    carry that.
+    """
+    rescored = promoted = 0
+    for row in conn.execute(
+        "SELECT id, source_id, entity, detail FROM events "
+        "WHERE event_type = 'insider_buy'"
+    ).fetchall():
+        detail = json.loads(row["detail"] or "{}")
+        if detail.get("bps_of_market_cap") is not None:
+            continue
+
+        ledger = conn.execute(
+            "SELECT * FROM insider_buys WHERE accession = ? AND ticker = ?",
+            (row["source_id"], row["entity"]),
+        ).fetchall()
+        if not ledger:
+            continue
+
+        # Rebuilding from the ledger also repairs any event stored before
+        # aggregate_buys existed, which recorded only the first purchase line.
+        buy = aggregate_buys(
+            [dict(b, co_owners=detail.get("co_owners") or [], shares_after=None)
+             for b in ledger]
+        )
+        buy["pct_position"] = detail.get("pct_position")
+        buy["new_position"] = detail.get("new_position", False)
+
+        score = score_buy(conn, row["entity"], buy)
+        if score["bps"] is None:
+            continue
+
+        if score["tier"] == 1:
+            promoted += promote(conn, row["entity"], buy["issuer_cik"],
+                                f"insider buying ({score['reason']})")
+
+        conn.execute(
+            "UPDATE events SET tier = ?, headline = ?, detail = ? WHERE id = ?",
+            (
+                score["tier"],
+                score["headline"],
+                json.dumps(
+                    {
+                        **buy,
+                        "cluster_peers": score["peers"],
+                        "tier_reason": score["reason"],
+                        "bps_of_market_cap": score["bps"],
+                        "significance": score["band"],
+                    },
+                    default=str,
+                ),
+                row["id"],
+            ),
+        )
+        rescored += 1
+    return rescored, promoted
 
 
 WATCH_TTL_DAYS = 90
@@ -1314,6 +1476,14 @@ def main():
                     help="remove a company from the watchlist")
     ap.add_argument("--watchlist", action="store_true",
                     help="show the current watchlist")
+    ap.add_argument("--review", metavar="TICKER",
+                    help="mark a company's open events reviewed (off the dashboard)")
+    ap.add_argument("--review-tier", type=int, choices=[1, 2],
+                    help="mark every open event in a tier reviewed")
+    ap.add_argument("--unreview", metavar="TICKER",
+                    help="put a company's events back on the dashboard")
+    ap.add_argument("--rescore", action="store_true",
+                    help="backfill significance onto events stored before the scale")
     args = ap.parse_args()
 
     conn = connect()
@@ -1338,6 +1508,30 @@ def main():
             tag = "pinned" if w["source"] == "manual" else f"expires {w['expires_at']}"
             print(f"  {w['ticker']:<8} {w['reason'] or '':<32} {tag}")
         return
+
+    if args.review or args.review_tier:
+        n = review_events(conn, ticker=args.review, tier=args.review_tier)
+        conn.commit()
+        scope = args.review.upper() if args.review else f"tier {args.review_tier}"
+        print(f"reviewed {n} event(s) for {scope}" if n else "nothing open to review")
+        if not args.html:
+            return
+
+    if args.unreview:
+        n = unreview_events(conn, args.unreview)
+        conn.commit()
+        print(f"restored {n} event(s) for {args.unreview.upper()}"
+              if n else "no events for that ticker")
+        if not args.html:
+            return
+
+    if args.rescore:
+        n, promoted = rescore(conn)
+        conn.commit()
+        print(f"rescored {n} event(s)"
+              + (f", {promoted} promoted to the watchlist" if promoted else ""))
+        if not args.html:
+            return
 
     if args.list:
         show_events(conn, tier=args.tier)
@@ -1368,8 +1562,11 @@ def main():
             "timing gap -- check EDGAR_USER_AGENT and how often this is running."
         )
 
+    aged = prune_events(conn)
     retired = prune_watchlist(conn)
     conn.commit()
+    if aged:
+        print(f"retired {aged} events past their shelf life")
     if retired:
         print(f"retired {retired} expired watchlist entries")
 
