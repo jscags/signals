@@ -89,7 +89,7 @@ SHARES_TTL_DAYS = 30
 # stale however recent it is -- otherwise a corrected rule sits inert behind a
 # thirty-day TTL, which is exactly how the multi-year buyback periods survived
 # the fix that was supposed to remove them.
-XBRL_DERIVATION = 2
+XBRL_DERIVATION = 3
 
 # How many stale issuers a single run re-derives. Bumping XBRL_DERIVATION
 # invalidates every cached row at once, and refetching them all in one run
@@ -184,6 +184,20 @@ TIER1_BUYBACK_PCT = 5.0
 
 # Above this it is a tender offer or a bad denominator, not a buyback.
 MAX_PLAUSIBLE_BUYBACK_PCT = 50.0
+
+# Only 22% of filers tag a repurchase share count, so most buybacks arrived as
+# dollars with no way to size them. The cover page carries the answer: the
+# aggregate market value of stock held by non-affiliates, reported by 98% of
+# the sample and already inside the companyfacts document we fetch. It is a
+# dollar denominator, so no share price is needed at all.
+#
+# Two things it is not. It is the FLOAT, excluding insider and affiliate
+# holdings, so a percentage against it runs higher than against full market
+# cap and must be labelled as such. And it is stamped as of the last business
+# day of the prior second fiscal quarter, so it is old by construction --
+# fine for sizing a company, wrong for anything price-sensitive.
+MIN_PLAUSIBLE_FLOAT_USD = 1_000_000
+FLOAT_MAX_AGE_DAYS = 800
 
 # Form types that are inherently M&A. No item-code parsing needed: the form
 # type alone is the signal, which is why these are in the first collector.
@@ -514,9 +528,11 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS issuer_facts (
     cik         INTEGER PRIMARY KEY,
     shares_out  REAL,
-    as_of       TEXT,
-    fetched_at  TEXT,
-    derived_v   INTEGER
+    as_of        TEXT,
+    fetched_at   TEXT,
+    derived_v    INTEGER,
+    public_float REAL,
+    float_as_of  TEXT
 );
 
 -- Annualised repurchase activity per issuer, cached on the same terms as the
@@ -569,10 +585,16 @@ def connect():
     # CREATE TABLE IF NOT EXISTS will not add a column to a table that already
     # exists, so databases written before derived_v need it grafted on. A NULL
     # there reads as version 0 and forces one refresh.
-    for table in ("issuer_facts", "issuer_buybacks"):
-        columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-        if "derived_v" not in columns:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN derived_v INTEGER")
+    wanted = {
+        "issuer_facts": (("derived_v", "INTEGER"), ("public_float", "REAL"),
+                         ("float_as_of", "TEXT")),
+        "issuer_buybacks": (("derived_v", "INTEGER"),),
+    }
+    for table, columns in wanted.items():
+        present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, kind in columns:
+            if name not in present:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
     conn.commit()
     return conn
 
@@ -699,17 +721,28 @@ def refresh_issuer_xbrl(conn, cik):
         shares_out, as_of = candidate, latest.get("end")
         break
 
+    floated = latest_instant(
+        facts_concept(facts, "dei", "EntityPublicFloat"),
+        max_age_days=FLOAT_MAX_AGE_DAYS,
+    )
+    public_float = plausible_float(floated["value"]) if floated else None
+
     # Cache misses too, so an issuer that tags nothing is not re-asked on every
     # run. The TTL still retires the answer.
     conn.execute(
-        """INSERT INTO issuer_facts (cik, shares_out, as_of, fetched_at, derived_v)
-           VALUES (?,?,?,?,?)
+        """INSERT INTO issuer_facts
+             (cik, shares_out, as_of, fetched_at, derived_v, public_float,
+              float_as_of)
+           VALUES (?,?,?,?,?,?,?)
            ON CONFLICT(cik) DO UPDATE SET
-             shares_out = excluded.shares_out,
-             as_of      = excluded.as_of,
-             fetched_at = excluded.fetched_at,
-             derived_v  = excluded.derived_v""",
-        (cik, shares_out, as_of, date.today().isoformat(), XBRL_DERIVATION),
+             shares_out   = excluded.shares_out,
+             as_of        = excluded.as_of,
+             fetched_at   = excluded.fetched_at,
+             derived_v    = excluded.derived_v,
+             public_float = excluded.public_float,
+             float_as_of  = excluded.float_as_of""",
+        (cik, shares_out, as_of, date.today().isoformat(), XBRL_DERIVATION,
+         public_float, floated["as_of"] if floated else None),
     )
 
     shares = _first_flow_from(facts, BUYBACK_SHARE_CONCEPTS)
@@ -893,6 +926,40 @@ def recent_flow(payload, today=None):
     }
 
 
+def latest_instant(payload, today=None, max_age_days=None):
+    """The most recent point-in-time value of a concept.
+
+    concept_points deliberately discards facts without a start date, because a
+    balance is not a flow and summing one would be wrong. Cover-page figures
+    like the public float are exactly that shape, so they need their own
+    reader rather than a loosened version of the flow one.
+    """
+    today = today or market_today()
+    best = None
+    for facts in ((payload or {}).get("units") or {}).values():
+        for fact in facts:
+            if fact.get("val") is None or not fact.get("end"):
+                continue
+            try:
+                end = date.fromisoformat(fact["end"])
+            except (ValueError, TypeError):
+                continue
+            if end > today:
+                continue
+            if max_age_days is not None and (today - end).days > max_age_days:
+                continue
+            if best is None or end > best[0]:
+                best = (end, float(fact["val"]))
+    return {"value": best[1], "as_of": best[0].isoformat()} if best else None
+
+
+def plausible_float(value):
+    """The public float, or None when it cannot be a real one."""
+    if not value or value < MIN_PLAUSIBLE_FLOAT_USD:
+        return None
+    return value
+
+
 def _first_flow_from(facts, concepts):
     """The first usable flow among a list of concepts, out of one payload."""
     for taxonomy, tag in concepts:
@@ -924,6 +991,51 @@ def buyback_activity(conn, cik):
     if not row or not (row["shares"] or row["value"]):
         return None
     return dict(row)
+
+
+def public_float(conn, cik):
+    """Cached public float for an issuer, or None."""
+    if not cik:
+        return None
+    row = conn.execute(
+        "SELECT public_float, fetched_at, derived_v FROM issuer_facts WHERE cik = ?",
+        (cik,),
+    ).fetchone()
+    if not _fresh(row):
+        refresh_issuer_xbrl(conn, cik)
+        row = conn.execute(
+            "SELECT public_float FROM issuer_facts WHERE cik = ?", (cik,)
+        ).fetchone()
+    return plausible_float(row["public_float"]) if row else None
+
+
+def buyback_float_pct(activity, floated):
+    """Annualised repurchase dollars as a percent of the public float."""
+    floated = plausible_float(floated)
+    if not activity or not floated:
+        return None
+    spent = activity.get("value")
+    if not spent:
+        return None
+    pct = spent / floated * 100.0
+    return pct if 0 < pct <= MAX_PLAUSIBLE_BUYBACK_PCT else None
+
+
+def buyback_measure(activity, shares_out, floated):
+    """The share of the company repurchased, and what it was measured against.
+
+    Share counts first: that ratio is exact and needs no price. The float is
+    the fallback and a different denominator, not a substitute one -- it
+    excludes affiliate holdings, so the same buyback reads larger against it.
+    Callers label which was used rather than presenting them as one number.
+    """
+    pct = buyback_pct(activity, shares_out)
+    if pct is not None:
+        return pct, "shares outstanding"
+    pct = buyback_float_pct(activity, floated)
+    if pct is not None:
+        return pct, "public float"
+    return None, None
 
 
 def buyback_pct(activity, shares_out):
@@ -966,16 +1078,20 @@ def handle_periodic(conn, row, listed):
     if not activity:
         return 0
 
-    pct = buyback_pct(activity, shares_outstanding(conn, row["cik"]))
+    pct, basis = buyback_measure(
+        activity,
+        shares_outstanding(conn, row["cik"]),
+        public_float(conn, row["cik"]),
+    )
     band = buyback_band(pct)
     tier = 1 if (pct is not None and pct >= TIER1_BUYBACK_PCT) else 2
 
     if tier == 1:
-        promote(conn, ticker, row["cik"], f"buyback ({pct:.1f}% of shares)")
+        promote(conn, ticker, row["cik"], f"buyback ({pct:.1f}% of {basis})")
 
     rate = "annualised " if activity.get("annualised") else ""
     if pct is not None:
-        scale = f" — {rate}{pct:.1f}% of shares outstanding"
+        scale = f" — {rate}{pct:.1f}% of {basis}"
     elif activity.get("value"):
         scale = f" — {rate}{usd(activity['value'])}, share of company unknown"
     else:
@@ -990,7 +1106,8 @@ def handle_periodic(conn, row, listed):
         event_type="buyback",
         tier=tier,
         headline=f"{ticker}: repurchased stock{scale} — {title}",
-        detail={**activity, "pct_of_shares": pct, "significance": band,
+        detail={**activity, "pct_of_shares": pct, "pct_basis": basis,
+                "significance": band,
                 "company": row["company"], "form_type": row["form_type"]},
         filed=row["filed"],
     )
@@ -1588,21 +1705,23 @@ def rescore_buybacks(conn):
         if not cik:
             continue
         activity = buyback_activity(conn, cik)
-        pct = buyback_pct(activity, shares_outstanding(conn, cik))
-        if pct == detail.get("pct_of_shares"):
+        pct, basis = buyback_measure(
+            activity, shares_outstanding(conn, cik), public_float(conn, cik)
+        )
+        if pct == detail.get("pct_of_shares") and basis == detail.get("pct_basis"):
             continue
 
         band = buyback_band(pct)
         tier = 1 if (pct is not None and pct >= TIER1_BUYBACK_PCT) else 2
         rate = "annualised " if (activity or {}).get("annualised") else ""
         if pct is not None:
-            scale = f" — {rate}{pct:.1f}% of shares outstanding"
+            scale = f" — {rate}{pct:.1f}% of {basis}"
         elif (activity or {}).get("value"):
             scale = f" — {rate}{usd(activity['value'])}, share of company unknown"
         else:
             scale = ""
-        merged = {**detail, **(activity or {}),
-                  "pct_of_shares": pct, "significance": band}
+        merged = {**detail, **(activity or {}), "pct_of_shares": pct,
+                  "pct_basis": basis, "significance": band}
         conn.execute(
             "UPDATE events SET tier = ?, headline = ?, detail = ? WHERE id = ?",
             (tier,
