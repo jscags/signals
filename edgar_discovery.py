@@ -84,6 +84,13 @@ EVENT_TTL_DAYS = {1: 14, 2: 5}
 # Shares outstanding moves slowly; a monthly refresh is plenty.
 SHARES_TTL_DAYS = 30
 
+# Bumped whenever the rules for deriving a cached XBRL figure change. A cached
+# row carries the version it was derived under, and a mismatch is treated as
+# stale however recent it is -- otherwise a corrected rule sits inert behind a
+# thirty-day TTL, which is exactly how the multi-year buyback periods survived
+# the fix that was supposed to remove them.
+XBRL_DERIVATION = 2
+
 # Not every issuer tags the cover-page concept with a real number. Galaxy
 # Digital reports 100 shares outstanding, which values the whole company at
 # $1,963 -- so a $100K purchase came out as 51x the company, i.e. 5,100% of
@@ -502,7 +509,8 @@ CREATE TABLE IF NOT EXISTS issuer_facts (
     cik         INTEGER PRIMARY KEY,
     shares_out  REAL,
     as_of       TEXT,
-    fetched_at  TEXT
+    fetched_at  TEXT,
+    derived_v   INTEGER
 );
 
 -- Annualised repurchase activity per issuer, cached on the same terms as the
@@ -516,7 +524,8 @@ CREATE TABLE IF NOT EXISTS issuer_buybacks (
     period_start TEXT,
     period_end   TEXT,
     annualised   INTEGER,
-    fetched_at   TEXT
+    fetched_at   TEXT,
+    derived_v    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS run_log (
@@ -551,6 +560,14 @@ def connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # CREATE TABLE IF NOT EXISTS will not add a column to a table that already
+    # exists, so databases written before derived_v need it grafted on. A NULL
+    # there reads as version 0 and forces one refresh.
+    for table in ("issuer_facts", "issuer_buybacks"):
+        columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "derived_v" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN derived_v INTEGER")
+    conn.commit()
     return conn
 
 
@@ -679,13 +696,14 @@ def refresh_issuer_xbrl(conn, cik):
     # Cache misses too, so an issuer that tags nothing is not re-asked on every
     # run. The TTL still retires the answer.
     conn.execute(
-        """INSERT INTO issuer_facts (cik, shares_out, as_of, fetched_at)
-           VALUES (?,?,?,?)
+        """INSERT INTO issuer_facts (cik, shares_out, as_of, fetched_at, derived_v)
+           VALUES (?,?,?,?,?)
            ON CONFLICT(cik) DO UPDATE SET
              shares_out = excluded.shares_out,
              as_of      = excluded.as_of,
-             fetched_at = excluded.fetched_at""",
-        (cik, shares_out, as_of, date.today().isoformat()),
+             fetched_at = excluded.fetched_at,
+             derived_v  = excluded.derived_v""",
+        (cik, shares_out, as_of, date.today().isoformat(), XBRL_DERIVATION),
     )
 
     shares = _first_flow_from(facts, BUYBACK_SHARE_CONCEPTS)
@@ -694,13 +712,13 @@ def refresh_issuer_xbrl(conn, cik):
     conn.execute(
         """INSERT INTO issuer_buybacks
              (cik, shares, value, concept, period_start, period_end,
-              annualised, fetched_at)
-           VALUES (?,?,?,?,?,?,?,?)
+              annualised, fetched_at, derived_v)
+           VALUES (?,?,?,?,?,?,?,?,?)
            ON CONFLICT(cik) DO UPDATE SET
              shares=excluded.shares, value=excluded.value,
              concept=excluded.concept, period_start=excluded.period_start,
              period_end=excluded.period_end, annualised=excluded.annualised,
-             fetched_at=excluded.fetched_at""",
+             fetched_at=excluded.fetched_at, derived_v=excluded.derived_v""",
         (cik,
          shares["value"] if shares else None,
          value["value"] if value else None,
@@ -708,14 +726,21 @@ def refresh_issuer_xbrl(conn, cik):
          (best or {}).get("start"),
          (best or {}).get("end"),
          int(bool((best or {}).get("annualised"))),
-         date.today().isoformat()),
+         date.today().isoformat(), XBRL_DERIVATION),
     )
     return shares_out
 
 
 def _fresh(row):
-    """True when a cached row is still inside its TTL."""
+    """True when a cached row is inside its TTL and derived by current rules."""
     if not row or not row["fetched_at"]:
+        return False
+    try:
+        derived = row["derived_v"] or 0
+    except (IndexError, KeyError):
+        derived = 0          # a row selected without the column, or written
+                             # before it existed: treat as an old derivation
+    if derived != XBRL_DERIVATION:
         return False
     try:
         return (date.today() - date.fromisoformat(row["fetched_at"][:10])).days \
@@ -739,7 +764,8 @@ def shares_outstanding(conn, cik):
         return None
 
     row = conn.execute(
-        "SELECT shares_out, fetched_at FROM issuer_facts WHERE cik = ?", (cik,)
+        "SELECT shares_out, fetched_at, derived_v FROM issuer_facts WHERE cik = ?",
+        (cik,)
     ).fetchone()
     if _fresh(row):
         # Filtered on the way out too, so a bad value already cached by an
