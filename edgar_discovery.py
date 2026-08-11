@@ -91,6 +91,12 @@ SHARES_TTL_DAYS = 30
 # the fix that was supposed to remove them.
 XBRL_DERIVATION = 2
 
+# How many stale issuers a single run re-derives. Bumping XBRL_DERIVATION
+# invalidates every cached row at once, and refetching them all in one run
+# would add minutes; this drains the backlog over a few runs instead, oldest
+# rules first, while a normal run is unaffected because nothing is stale.
+STALE_REFRESH_BUDGET = 150
+
 # Not every issuer tags the cover-page concept with a real number. Galaxy
 # Digital reports 100 shares outstanding, which values the whole company at
 # $1,963 -- so a $100K purchase came out as 51x the company, i.e. 5,100% of
@@ -1523,6 +1529,69 @@ def prune_events(conn):
     return len(stale)
 
 
+def refresh_stale_facts(conn, budget=STALE_REFRESH_BUDGET):
+    """Re-derive cached figures left behind by a rules change.
+
+    Versioning alone only helps issuers that happen to file again, which for a
+    quarterly filer can be months. This walks the backlog directly so a
+    corrected rule reaches the whole cache without waiting on the calendar.
+    """
+    stale = [
+        row["cik"] for row in conn.execute(
+            """SELECT cik FROM issuer_buybacks
+               WHERE derived_v IS NULL OR derived_v <> ?
+               ORDER BY cik LIMIT ?""",
+            (XBRL_DERIVATION, budget),
+        ).fetchall()
+    ]
+    for cik in stale:
+        refresh_issuer_xbrl(conn, cik)
+    return len(stale)
+
+
+def rescore_buybacks(conn):
+    """Recompute stored buyback events from the current cache.
+
+    emit() is idempotent, so an event keeps whatever it was written with --
+    AdvanSix stayed at 23.7% of itself, off an eight-year cumulative period,
+    after the rule that rejects such periods had already shipped. Repairing the
+    cache is not enough; what was published has to be recomputed too.
+    """
+    fixed = 0
+    for row in conn.execute(
+        "SELECT id, entity, detail FROM events WHERE event_type = 'buyback'"
+    ).fetchall():
+        detail = json.loads(row["detail"] or "{}")
+        cik = detail.get("cik")
+        if not cik:
+            continue
+        activity = buyback_activity(conn, cik)
+        pct = buyback_pct(activity, shares_outstanding(conn, cik))
+        if pct == detail.get("pct_of_shares"):
+            continue
+
+        band = buyback_band(pct)
+        tier = 1 if (pct is not None and pct >= TIER1_BUYBACK_PCT) else 2
+        rate = "annualised " if (activity or {}).get("annualised") else ""
+        if pct is not None:
+            scale = f" — {rate}{pct:.1f}% of shares outstanding"
+        elif (activity or {}).get("value"):
+            scale = f" — {rate}{usd(activity['value'])}, share of company unknown"
+        else:
+            scale = ""
+        merged = {**detail, **(activity or {}),
+                  "pct_of_shares": pct, "significance": band}
+        conn.execute(
+            "UPDATE events SET tier = ?, headline = ?, detail = ? WHERE id = ?",
+            (tier,
+             f"{row['entity']}: repurchased stock{scale}"
+             + (f" — {detail['company']}" if detail.get("company") else ""),
+             json.dumps(merged, default=str), row["id"]),
+        )
+        fixed += 1
+    return fixed
+
+
 def rescore(conn):
     """Backfill significance onto events emitted before the scale existed.
 
@@ -2145,10 +2214,16 @@ def main():
     # because clearing it needed someone to remember a flag; the run should
     # repair its own output. Cheap after the first pass -- sane scores are
     # skipped, and share counts come from the cache.
+    drained = refresh_stale_facts(conn)
     fixed, newly_promoted = rescore(conn)
+    fixed_buybacks = rescore_buybacks(conn)
     aged = prune_events(conn)
     retired = prune_watchlist(conn)
     conn.commit()
+    if drained:
+        print(f"re-derived {drained} stale issuer(s)")
+    if fixed_buybacks:
+        print(f"rescored {fixed_buybacks} buyback event(s)")
     if fixed:
         print(f"rescored {fixed} event(s)"
               + (f", {newly_promoted} promoted" if newly_promoted else ""))
