@@ -117,17 +117,53 @@ XBRL_CONCEPTS = (
 # served as structured XBRL from the same host.
 PERIODIC_FORMS = {"10-Q", "10-K"}
 
-# Candidate repurchase concepts, in the order worth trying. The cash-flow tag
-# is the most consistently reported; the share-count tags are better signal
-# when present, because a share count cannot be distorted by a bad price.
-BUYBACK_CONCEPTS = (
+# Candidate repurchase concepts. Measured coverage over 60 recent listed
+# filers: the cash-flow tag 83%, treasury value 55%, the share-count tags
+# 42/42/30%, and 92% report at least one of them.
+#
+# Share counts are tried first even though they are less common. A buyback is
+# only meaningful against the size of the company, and shares retired over
+# shares outstanding needs no price -- which matters because a company filing a
+# 10-Q has given us no price the way a Form 4 does.
+BUYBACK_SHARE_CONCEPTS = (
+    ("us-gaap", "StockRepurchasedAndRetiredDuringPeriodShares"),
+    ("us-gaap", "StockRepurchasedDuringPeriodShares"),
+    ("us-gaap", "TreasuryStockSharesAcquired"),
+)
+BUYBACK_VALUE_CONCEPTS = (
     ("us-gaap", "PaymentsForRepurchaseOfCommonStock"),
     ("us-gaap", "PaymentsForRepurchaseOfEquity"),
-    ("us-gaap", "StockRepurchasedDuringPeriodShares"),
-    ("us-gaap", "StockRepurchasedAndRetiredDuringPeriodShares"),
-    ("us-gaap", "TreasuryStockSharesAcquired"),
     ("us-gaap", "TreasuryStockValueAcquiredCostMethod"),
 )
+
+# A repurchase tag simply stops appearing once a company stops buying, so the
+# newest observation can be years old: Watsco last tagged one for 2008 and
+# still files quarterly. Anything older than this is history, not news.
+BUYBACK_MAX_AGE_DAYS = 400
+
+# Reported periods are fiscal year-to-date, not discrete quarters -- one filer
+# reports 2026-01-01..2026-06-30 and the next 2025-10-01..2026-06-30 -- so
+# consecutive observations overlap and must never be summed. A single period
+# shorter than a year is scaled up to an annual rate instead.
+BUYBACK_MIN_PERIOD_DAYS = 60
+
+# Annualised repurchases as a percent of shares outstanding. A different scale
+# from insider buying by an order of magnitude: buybacks run in whole percent,
+# and anything under 1% is usually just mopping up option dilution.
+BUYBACK_BANDS = (
+    (10.0, "major"),
+    (6.0, "significant"),
+    (3.0, "notable"),
+    (1.0, "minor"),
+    (0.0, "negligible"),
+)
+
+# Retiring this much of yourself in a year is a real capital-allocation
+# decision rather than housekeeping, and promotes on its own.
+TIER1_BUYBACK_PCT = 5.0
+
+# Above this it is a tender offer or a bad denominator, not a buyback.
+MAX_PLAUSIBLE_BUYBACK_PCT = 50.0
 
 # Form types that are inherently M&A. No item-code parsing needed: the form
 # type alone is the signal, which is why these are in the first collector.
@@ -462,6 +498,20 @@ CREATE TABLE IF NOT EXISTS issuer_facts (
     fetched_at  TEXT
 );
 
+-- Annualised repurchase activity per issuer, cached on the same terms as the
+-- share count: slow-moving, one small request, and worth surviving between
+-- runs on a fresh runner.
+CREATE TABLE IF NOT EXISTS issuer_buybacks (
+    cik          INTEGER PRIMARY KEY,
+    shares       REAL,
+    value        REAL,
+    concept      TEXT,
+    period_start TEXT,
+    period_end   TEXT,
+    annualised   INTEGER,
+    fetched_at   TEXT
+);
+
 CREATE TABLE IF NOT EXISTS run_log (
     run_date    TEXT,
     source      TEXT,
@@ -683,6 +733,192 @@ def concept_points(payload):
     return points
 
 
+def _period_days(point):
+    try:
+        start = date.fromisoformat(point["start"])
+        end = date.fromisoformat(point["end"])
+    except (ValueError, TypeError):
+        return None
+    return (end - start).days or None
+
+
+def recent_flow(payload, today=None):
+    """The most recent usable period from a flow concept, annualised.
+
+    Picks one observation rather than summing: the reported periods are fiscal
+    year-to-date and overlap each other, so adding them would count the same
+    dollars several times. Prefers the longest period among those ending on the
+    latest date, since a full year needs no scaling and a stub quarter does.
+    """
+    today = today or market_today()
+    usable = []
+    for point in concept_points(payload):
+        span = _period_days(point)
+        if not span or span < BUYBACK_MIN_PERIOD_DAYS:
+            continue
+        try:
+            end = date.fromisoformat(point["end"])
+        except ValueError:
+            continue
+        if (today - end).days > BUYBACK_MAX_AGE_DAYS or end > today:
+            continue
+        usable.append((point, span, end))
+    if not usable:
+        return None
+
+    latest_end = max(end for _, _, end in usable)
+    point, span, end = max(
+        (u for u in usable if u[2] == latest_end), key=lambda u: u[1]
+    )
+    if not point["val"]:
+        return None  # a tagged zero is not a buyback
+
+    # Only scale a genuine part-year. An XBRL period counts both endpoints, so
+    # a full fiscal year measures 364 days start-to-end, and scaling that by
+    # 365/364 would inflate every annual figure by a quarter of a percent for
+    # no reason. The threshold matches the annualised flag below, so the number
+    # and the label can never disagree.
+    part_year = span < 300
+    return {
+        "value": point["val"] * 365.0 / span if part_year else point["val"],
+        "reported": point["val"],
+        "start": point["start"],
+        "end": point["end"],
+        "period_days": span,
+        "annualised": part_year,
+        "unit": point["unit"],
+    }
+
+
+def first_flow(cik, concepts):
+    for taxonomy, tag in concepts:
+        flow = recent_flow(xbrl_concept(cik, taxonomy, tag))
+        if flow:
+            return {**flow, "concept": tag}
+    return None
+
+
+def buyback_activity(conn, cik):
+    """Annualised repurchases for an issuer, cached like any other slow fact."""
+    if not cik:
+        return None
+
+    row = conn.execute(
+        "SELECT * FROM issuer_buybacks WHERE cik = ?", (cik,)
+    ).fetchone()
+    if row and row["fetched_at"]:
+        try:
+            age = date.today() - date.fromisoformat(row["fetched_at"][:10])
+            if age.days < SHARES_TTL_DAYS:
+                return dict(row) if row["shares"] or row["value"] else None
+        except ValueError:
+            pass
+
+    shares = first_flow(cik, BUYBACK_SHARE_CONCEPTS)
+    value = first_flow(cik, BUYBACK_VALUE_CONCEPTS)
+    best = shares or value
+    conn.execute(
+        """INSERT INTO issuer_buybacks
+             (cik, shares, value, concept, period_start, period_end,
+              annualised, fetched_at)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(cik) DO UPDATE SET
+             shares=excluded.shares, value=excluded.value,
+             concept=excluded.concept, period_start=excluded.period_start,
+             period_end=excluded.period_end, annualised=excluded.annualised,
+             fetched_at=excluded.fetched_at""",
+        (cik,
+         shares["value"] if shares else None,
+         value["value"] if value else None,
+         (best or {}).get("concept"),
+         (best or {}).get("start"),
+         (best or {}).get("end"),
+         int(bool((best or {}).get("annualised"))),
+         date.today().isoformat()),
+    )
+    if not best:
+        return None
+    return {
+        "cik": cik,
+        "shares": shares["value"] if shares else None,
+        "value": value["value"] if value else None,
+        "concept": best["concept"],
+        "period_start": best["start"],
+        "period_end": best["end"],
+        "annualised": int(bool(best["annualised"])),
+    }
+
+
+def buyback_pct(activity, shares_out):
+    """Annualised repurchases as a percent of the company.
+
+    Share counts where the issuer tags them, since that ratio needs no price.
+    Otherwise dollars against a market cap -- which requires a price we only
+    have when the same issuer has also filed a Form 4, so many filings carry a
+    dollar figure and no percentage. Saying so beats inventing a denominator.
+    """
+    shares_out = plausible_shares(shares_out)
+    if not activity or not shares_out:
+        return None
+    retired = activity.get("shares")
+    if not retired:
+        return None
+    pct = retired / shares_out * 100.0
+    return pct if 0 < pct <= MAX_PLAUSIBLE_BUYBACK_PCT else None
+
+
+def buyback_band(pct):
+    if pct is None:
+        return None
+    for floor, name in BUYBACK_BANDS:
+        if pct >= floor:
+            return name
+    return "negligible"
+
+
+def handle_periodic(conn, row, listed):
+    """A 10-Q or 10-K is only the trigger; the numbers come from XBRL.
+
+    The filing itself is never downloaded. The index says this company reported,
+    and one small JSON per issuer -- cached for a month -- says what it bought
+    back, instead of several megabytes of HTML and a different Item 5(c) table
+    layout for every filer.
+    """
+    ticker, title = listed
+    activity = buyback_activity(conn, row["cik"])
+    if not activity:
+        return 0
+
+    pct = buyback_pct(activity, shares_outstanding(conn, row["cik"]))
+    band = buyback_band(pct)
+    tier = 1 if (pct is not None and pct >= TIER1_BUYBACK_PCT) else 2
+
+    if tier == 1:
+        promote(conn, ticker, row["cik"], f"buyback ({pct:.1f}% of shares)")
+
+    rate = "annualised " if activity.get("annualised") else ""
+    if pct is not None:
+        scale = f" — {rate}{pct:.1f}% of shares outstanding"
+    elif activity.get("value"):
+        scale = f" — {rate}{usd(activity['value'])}, share of company unknown"
+    else:
+        scale = ""
+
+    # Keyed on the reporting period, not the accession: the same quarter is
+    # reported again in the next 10-K, and that is one fact, not two.
+    return emit(
+        conn,
+        source_id=f"{row['cik']}:{activity['period_end']}",
+        entity=ticker,
+        event_type="buyback",
+        tier=tier,
+        headline=f"{ticker}: repurchased stock{scale} — {title}",
+        detail={**activity, "pct_of_shares": pct, "significance": band,
+                "company": row["company"], "form_type": row["form_type"]},
+        filed=row["filed"],
+    )
+
+
 def probe_buybacks(days=3, sample=60):
     """Report how many recent periodic filers actually tag repurchase data.
 
@@ -838,6 +1074,7 @@ def run_day(conn, day, tickers, limit=None):
     n_candidates = len({
         r["accession"] for r in rows
         if r["form_type"] == "4" or r["form_type"] in MA_FORMS
+        or r["form_type"] in PERIODIC_FORMS
     })
 
     for row in rows:
@@ -847,12 +1084,13 @@ def run_day(conn, day, tickers, limit=None):
         listed = tickers.get(row["cik"])
         is_form4 = row["form_type"] == "4"
         is_ma = row["form_type"] in MA_FORMS
+        is_periodic = row["form_type"] in PERIODIC_FORMS
 
-        if not (is_form4 or is_ma):
+        if not (is_form4 or is_ma or is_periodic):
             continue
         # Form 4 issuer CIK differs from the filer CIK, so we cannot use the
         # ticker map to pre-filter those -- resolve after parsing instead.
-        if is_ma and not listed:
+        if (is_ma or is_periodic) and not listed:
             continue
         if already_processed(conn, row["accession"]):
             continue
@@ -873,8 +1111,10 @@ def run_day(conn, day, tickers, limit=None):
                 continue
             refused = 0
             n_events += emitted
-        else:
+        elif is_ma:
             n_events += handle_ma(conn, row, listed)
+        else:
+            n_events += handle_periodic(conn, row, listed)
 
         conn.execute(
             """INSERT OR IGNORE INTO documents
