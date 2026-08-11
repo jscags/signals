@@ -224,12 +224,28 @@ def parse_master_idx(text):
                 "cik": int(cik),
                 "company": company,
                 "form_type": form_type,
-                "filed": filed,
+                "filed": iso_date(filed) or filed,
                 "path": path,
                 "accession": accession_from_path(path),
             }
         )
     return rows
+
+
+def iso_date(value):
+    """Normalise a filing date to YYYY-MM-DD, or None if it is not a date.
+
+    The daily index writes Date Filed as YYYYMMDD, so events stored it in that
+    form, and comparing it against an ISO cutoff silently never matches:
+    '20260805' sorts *above* '2026-08-06' because '0' is greater than '-'.
+    That one character is why nothing was ever retired.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if re.fullmatch(r"\d{8}", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text[:10] if re.match(r"\d{4}-\d{2}-\d{2}", text) else None
 
 
 def accession_from_path(path):
@@ -636,9 +652,15 @@ def run_day(conn, day, tickers, limit=None):
               f"to 0 rows — the file format may have changed")
     n_docs = n_events = refused = 0
     status = "ok"
-    n_candidates = sum(
-        1 for r in rows if r["form_type"] == "4" or r["form_type"] in MA_FORMS
-    )
+    # Unique accessions, not index rows. EDGAR lists a filing once per filer,
+    # so a Form 4 appears under both the issuer and the reporting owner -- about
+    # 2.04 rows per filing in practice. Counting rows made the day look twice as
+    # big as it is, and made a fully-collected day read as though the collector
+    # had stalled.
+    n_candidates = len({
+        r["accession"] for r in rows
+        if r["form_type"] == "4" or r["form_type"] in MA_FORMS
+    })
 
     for row in rows:
         if limit is not None and n_docs >= limit:
@@ -967,16 +989,30 @@ def prune_events(conn):
     promoted its company to the watchlist, which has its own longer clock.
     """
     today = market_today()
-    retired = 0
-    for tier, days in EVENT_TTL_DAYS.items():
-        cutoff = (today - timedelta(days=days)).isoformat()
-        retired += conn.execute(
-            """UPDATE events SET reviewed_at = ?
-               WHERE reviewed_at IS NULL AND tier = ?
-                 AND COALESCE(filed_date, created_at) < ?""",
-            (today.isoformat(), tier, cutoff),
-        ).rowcount
-    return retired
+    cutoffs = {
+        tier: (today - timedelta(days=days)).isoformat()
+        for tier, days in EVENT_TTL_DAYS.items()
+    }
+
+    # Compared in Python rather than SQL because filed_date is whatever the
+    # index wrote -- YYYYMMDD historically, ISO now -- and a string comparison
+    # across both forms is wrong in a way that fails silently.
+    stale = []
+    for row in conn.execute(
+        "SELECT id, tier, filed_date, created_at FROM events WHERE reviewed_at IS NULL"
+    ).fetchall():
+        cutoff = cutoffs.get(row["tier"])
+        when = iso_date(row["filed_date"]) or iso_date(row["created_at"])
+        if cutoff and when and when < cutoff:
+            stale.append(row["id"])
+
+    for start in range(0, len(stale), 500):
+        chunk = stale[start:start + 500]
+        conn.execute(
+            f"UPDATE events SET reviewed_at = ? WHERE id IN ({','.join('?' * len(chunk))})",
+            [today.isoformat(), *chunk],
+        )
+    return len(stale)
 
 
 def rescore(conn):
