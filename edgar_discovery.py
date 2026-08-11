@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
 from xml.etree import ElementTree
@@ -960,6 +961,18 @@ h1 {
   border: 1px solid var(--signal); color: var(--signal);
   padding: 2px 6px; border-radius: 2px;
 }
+/* Tickers link out to Yahoo Finance. Styled to look exactly like the plain
+   symbol until you touch it -- the ticker is the label, the link is a
+   convenience, and an underline on every card would be visual noise. The
+   underline is drawn as a border so it does not shift the baseline. */
+.ticker a, .watch b a {
+  color: inherit; text-decoration: none;
+  border-bottom: 1px solid transparent;
+}
+.ticker a:hover, .watch b a:hover { border-bottom-color: currentColor; }
+.ticker a:focus-visible, .watch b a:focus-visible {
+  outline: 2px solid var(--signal); outline-offset: 2px; border-radius: 1px;
+}
 /* The significance scale. One ramp of weight and colour so the rungs read in
    order at a glance -- negligible recedes into the page, major is the only one
    that fills. Bands carry a word as well as the shading, so the ranking does
@@ -1016,6 +1029,44 @@ h1 {
   @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
 }
 """
+
+
+YAHOO_QUOTE = "https://finance.yahoo.com/quote/{}"
+
+# Placeholders EDGAR emits when an issuer has no traded symbol. WILSON BANK
+# HOLDING CO really does report its trading symbol as the string "none", and
+# linking that lands on an empty quote page, so these render as plain text.
+NON_TICKERS = {"", "-", "—", "none", "n/a", "na", "null"}
+
+
+def yahoo_url(ticker):
+    """Quote-page URL for a symbol, or None when it is not one.
+
+    Yahoo writes class shares with a hyphen where EDGAR uses a dot, so BRK.B
+    has to become BRK-B to resolve. On a phone these are universal links: iOS
+    and Android hand them to the Yahoo Finance app when it is installed, and
+    fall back to the browser when it is not.
+    """
+    symbol = (ticker or "").strip()
+    if symbol.lower() in NON_TICKERS:
+        return None
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-]{0,9}", symbol):
+        return None
+    return YAHOO_QUOTE.format(
+        urllib.parse.quote(symbol.upper().replace(".", "-"), safe="")
+    )
+
+
+def ticker_link(ticker, fallback="—"):
+    """The symbol as a link when it resolves, as plain text when it does not."""
+    label = html.escape(ticker or fallback)
+    url = yahoo_url(ticker)
+    if not url:
+        return label
+    return (
+        f'<a href="{html.escape(url)}" target="_blank" rel="noopener noreferrer"'
+        f' title="{label} on Yahoo Finance">{label}</a>'
+    )
 
 
 def _initials(name):
@@ -1122,7 +1173,7 @@ def render_company(entity, events):
         )
 
     return f"""<div class="row">
-  <div class="ticker">{html.escape(entity or '—')}
+  <div class="ticker">{ticker_link(entity)}
     {f'<div class="scale">{badge}</div>' if badge else ''}
   </div>
   <div>
@@ -1178,7 +1229,7 @@ def write_html(conn, path="dashboard.html"):
             else:
                 note, pin = "", ""
             cards.append(
-                f'<div class="{pin.strip()}"><b>{html.escape(w["ticker"])}</b>'
+                f'<div class="{pin.strip()}"><b>{ticker_link(w["ticker"])}</b>'
                 f'<i>{html.escape(w["reason"] or "")}</i>'
                 f'<i>{note}</i></div>'
             )
