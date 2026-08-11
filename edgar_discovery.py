@@ -147,6 +147,13 @@ BUYBACK_MAX_AGE_DAYS = 400
 # shorter than a year is scaled up to an annual rate instead.
 BUYBACK_MIN_PERIOD_DAYS = 60
 
+# And never much longer than one. TreasuryStockSharesAcquired is often tagged
+# cumulatively -- AdvanSix reports 2018-05-04..2026-06-30 -- and dividing eight
+# years of buying by eight would invent an annual rate the company may never
+# have run: the whole amount could have been spent in the first year. Such a
+# period says nothing about the current year and is dropped.
+BUYBACK_MAX_PERIOD_DAYS = 500
+
 # Annualised repurchases as a percent of shares outstanding. A different scale
 # from insider buying by an order of magnitude: buybacks run in whole percent,
 # and anything under 1% is usually just mopping up option dilution.
@@ -754,7 +761,7 @@ def recent_flow(payload, today=None):
     usable = []
     for point in concept_points(payload):
         span = _period_days(point)
-        if not span or span < BUYBACK_MIN_PERIOD_DAYS:
+        if not span or not BUYBACK_MIN_PERIOD_DAYS <= span <= BUYBACK_MAX_PERIOD_DAYS:
             continue
         try:
             end = date.fromisoformat(point["end"])
