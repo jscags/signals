@@ -7,8 +7,11 @@ name: probe
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: 'Which probe: buybacks or contracts'
+        default: 'buybacks'
       sample:
-        description: 'How many periodic filers to sample'
+        description: 'Sample size'
         default: '60'
 
 jobs:
@@ -19,8 +22,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Probe repurchase tag coverage
+      - name: Run the probe
         env:
           EDGAR_USER_AGENT: "edgar-discovery 52y9fp5njf@privaterelay.appleid.com"
+          TARGET: ${{ inputs.target }}
           SAMPLE: ${{ inputs.sample }}
-        run: python3 edgar_discovery.py --probe-buybacks "${SAMPLE:-60}"
+        run: |
+          TARGET="${TARGET:-buybacks}"
+          SAMPLE="${SAMPLE:-60}"
+          python3 edgar_discovery.py "--probe-${TARGET}" "$SAMPLE"

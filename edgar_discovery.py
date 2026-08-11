@@ -265,6 +265,75 @@ def fetch(url, binary=False):
     return raw if binary else raw.decode("utf-8", errors="replace")
 
 
+USASPENDING_SEARCH = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
+DOD_CONTRACTS = "https://www.defense.gov/News/Contracts/"
+SAM_OPPORTUNITIES = "https://api.sam.gov/opportunities/v2/search"
+
+# Corporate boilerplate that differs between how a company registers with the
+# SEC and how it appears on a federal award. Stripped from both sides before
+# comparing, because "LOCKHEED MARTIN CORPORATION" and "Lockheed Martin Corp"
+# are the same company and no exact match will ever say so.
+NAME_SUFFIXES = {
+    "INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "COMPANY", "LLC", "LP",
+    "LLP", "LTD", "LIMITED", "PLC", "HOLDINGS", "HOLDING", "GROUP", "THE",
+    "AND", "NV", "SA", "AG", "SE", "TRUST", "PARTNERS", "INTERNATIONAL",
+}
+
+
+def normalize_company(name):
+    """A company name reduced to the words that identify it."""
+    text = re.sub(r"[^A-Z0-9 ]", " ", (name or "").upper())
+    return " ".join(w for w in text.split() if w and w not in NAME_SUFFIXES)
+
+
+def http_json(url, payload=None, agent=None):
+    """Rate-limited JSON request. POSTs when given a payload.
+
+    Separate from fetch() because these are not SEC endpoints: they want a
+    different contact string, some need POST, and a failure here must never
+    look like an EDGAR refusal.
+    """
+    global _last_request
+    elapsed = time.time() - _last_request
+    if elapsed < MIN_REQUEST_INTERVAL:
+        time.sleep(MIN_REQUEST_INTERVAL - elapsed)
+    _last_request = time.time()
+
+    body = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"User-Agent": agent or USER_AGENT or "signals-research",
+                 "Content-Type": "application/json",
+                 "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace")), resp.status
+    except urllib.error.HTTPError as exc:
+        return None, exc.code
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def http_text(url, agent=None):
+    """Rate-limited GET returning text, for pages that are not APIs."""
+    global _last_request
+    elapsed = time.time() - _last_request
+    if elapsed < MIN_REQUEST_INTERVAL:
+        time.sleep(MIN_REQUEST_INTERVAL - elapsed)
+    _last_request = time.time()
+    req = urllib.request.Request(
+        url, headers={"User-Agent": agent or USER_AGENT or "signals-research"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read().decode("utf-8", errors="replace"), resp.status
+    except urllib.error.HTTPError as exc:
+        return None, exc.code
+    except OSError as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
 # ---------------------------------------------------------------- ticker map
 
 
@@ -1111,6 +1180,90 @@ def handle_periodic(conn, row, listed):
                 "company": row["company"], "form_type": row["form_type"]},
         filed=row["filed"],
     )
+
+
+def probe_contracts(days=30, sample=200):
+    """Measure whether federal award data can be tied to listed companies.
+
+    The APIs working is not the question -- the question is entity resolution.
+    USAspending names legal entities and the DoD page names them in prose;
+    neither carries a ticker or a CIK. If award recipients cannot be matched to
+    listed issuers at a decent rate, a contract collector produces a stream of
+    names nobody can trade against, and the design has to change before it is
+    built rather than after.
+    """
+    tickers = load_ticker_map()
+    listed = {}
+    for cik, (ticker, title) in tickers.items():
+        key = normalize_company(title)
+        if key:
+            listed.setdefault(key, (ticker, title, cik))
+    print(f"ticker map: {len(tickers)} issuers, {len(listed)} distinct normalised names\n")
+
+    since = (market_today() - timedelta(days=days)).isoformat()
+    payload = {
+        "filters": {
+            "time_period": [{"start_date": since,
+                             "end_date": market_today().isoformat()}],
+            "award_type_codes": ["A", "B", "C", "D"],   # definitive contracts
+        },
+        "fields": ["Award ID", "Recipient Name", "Award Amount",
+                   "Awarding Agency", "Start Date"],
+        "sort": "Award Amount", "order": "desc",
+        "limit": min(sample, 100), "page": 1,
+    }
+    print(f"=== USAspending: contract awards since {since} ===")
+    data, status = http_json(USASPENDING_SEARCH, payload,
+                             agent="signals-research contracts probe")
+    if not data:
+        print(f"  request failed: {status}")
+        results = []
+    else:
+        results = data.get("results") or []
+        print(f"  HTTP {status}, {len(results)} awards returned")
+
+    matched = unmatched = 0
+    examples, misses = [], []
+    for row in results:
+        name = row.get("Recipient Name") or ""
+        hit = listed.get(normalize_company(name))
+        if hit:
+            matched += 1
+            if len(examples) < 8:
+                examples.append((hit[0], name, row.get("Award Amount"),
+                                 (row.get("Awarding Agency") or "")[:28]))
+        else:
+            unmatched += 1
+            if len(misses) < 10:
+                misses.append((name, row.get("Award Amount")))
+
+    total = matched + unmatched
+    if total:
+        print(f"  recipients matched to a listed ticker: {matched}/{total} "
+              f"({matched / total * 100:.0f}%)\n")
+        print("  matched:")
+        for tk, name, amt, agency in examples:
+            print(f"    {tk:7} {name[:38]:40} ${(amt or 0):>15,.0f}  {agency}")
+        print("\n  unmatched (the resolution problem, in the raw):")
+        for name, amt in misses:
+            print(f"    {'':7} {name[:38]:40} ${(amt or 0):>15,.0f}")
+
+    print(f"\n=== DoD daily contract announcements ===")
+    page, status = http_text(DOD_CONTRACTS, agent="signals-research contracts probe")
+    if not page:
+        print(f"  request failed: {status}")
+    else:
+        print(f"  HTTP {status}, {len(page):,} bytes")
+        dollars = re.findall(r"\$[\d,]{7,}", page)
+        links = re.findall(r'href="([^"]*contract[^"]*)"', page, re.I)
+        print(f"  dollar figures on the index page : {len(dollars)}")
+        print(f"  links that look like daily posts : {len(set(links))}")
+        print(f"  sample: {dollars[:5]}")
+
+    print(f"\n=== SAM.gov without an API key ===")
+    _, status = http_json(SAM_OPPORTUNITIES + "?limit=1",
+                          agent="signals-research contracts probe")
+    print(f"  HTTP {status}  (a key requirement would break the no-credentials property)")
 
 
 def probe_buybacks(days=3, sample=60):
@@ -2328,6 +2481,9 @@ def main():
                     help="mark every open event in a tier reviewed")
     ap.add_argument("--unreview", metavar="TICKER",
                     help="put a company's events back on the dashboard")
+    ap.add_argument("--probe-contracts", type=int, metavar="N", nargs="?", const=100,
+                    help="diagnostic: can federal award recipients be matched "
+                         "to listed tickers (sample size N)")
     ap.add_argument("--probe-buybacks", type=int, metavar="N", nargs="?", const=60,
                     help="diagnostic: how many recent 10-Q/10-K filers tag "
                          "repurchase data (sample size N)")
@@ -2373,6 +2529,10 @@ def main():
               if n else "no events for that ticker")
         if not args.html:
             return
+
+    if args.probe_contracts:
+        probe_contracts(sample=args.probe_contracts)
+        return
 
     if args.probe_buybacks:
         probe_buybacks(sample=args.probe_buybacks)
