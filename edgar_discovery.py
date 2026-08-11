@@ -1194,6 +1194,64 @@ def probe_buybacks(days=3, sample=60):
               f"{point['start']}..{point['end']}")
 
 
+def usd_scaled(value):
+    """Compact dollars for figures spanning nano-caps to mega-caps."""
+    if value is None:
+        return ""
+    for unit, size in (("T", 1e12), ("B", 1e9), ("M", 1e6)):
+        if value >= size:
+            return f"${value / size:,.1f}{unit}"
+    return f"${value:,.0f}"
+
+
+def market_cap(shares_out, price):
+    """Shares outstanding times the price on the filing.
+
+    Not a live quote. The price is the one the insider paid on the transaction
+    date, so this is the company's size as of that trade rather than today's.
+    That is enough to tell a nano-cap from a mega-cap, which is the whole point
+    of showing it next to a purchase.
+    """
+    shares_out = plausible_shares(shares_out)
+    if not shares_out or not price:
+        return None
+    return shares_out * price
+
+
+def trusted_price(detail):
+    """The filing's price, or None when it cannot be believed.
+
+    Reborn Coffee quotes $180,000 a share against a $1.60 stock. aggregate_buys
+    withholds a total built on such a price, but events stored before that
+    guard existed still carry one, and multiplying it by the share count put a
+    $1.5T market cap on a nano-cap. The implied purchase value is the tell, and
+    it is checked here rather than trusted from storage.
+    """
+    price, shares = detail.get("price"), detail.get("shares")
+    if not price:
+        return None
+    if detail.get("value_suspect"):
+        return None
+    if shares and shares * price > MAX_PLAUSIBLE_VALUE_USD:
+        return None
+    return price
+
+
+def cached_shares_outstanding(conn, cik):
+    """Share count from the cache only, never fetching.
+
+    shares_outstanding() refreshes a stale row, which is right during
+    collection and wrong while rendering: writing the dashboard must not
+    depend on the network or quietly take minutes.
+    """
+    if not cik:
+        return None
+    row = conn.execute(
+        "SELECT shares_out FROM issuer_facts WHERE cik = ?", (cik,)
+    ).fetchone()
+    return plausible_shares(row["shares_out"]) if row else None
+
+
 def bps_of_market_cap(value, shares_out, price, shares_bought=None):
     """How much of the company this purchase represents, in basis points.
 
@@ -2091,7 +2149,7 @@ def _strip_ticker(headline, entity):
     return headline[len(prefix):] if headline.startswith(prefix) else headline
 
 
-def render_company(entity, events):
+def render_company(entity, events, conn=None):
     primary = events[0]
     detail = json.loads(primary["detail"] or "{}")
     bits = [f"filed {html.escape(primary['filed_date'] or '')}"]
@@ -2099,6 +2157,13 @@ def render_company(entity, events):
     if primary["event_type"] == "insider_buy":
         if detail.get("shares") and detail.get("price"):
             bits.append(f"{int(detail['shares']):,} sh @ ${detail['price']:,.2f}")
+        if conn is not None:
+            cap = market_cap(
+                cached_shares_outstanding(conn, detail.get("issuer_cik")),
+                trusted_price(detail),
+            )
+            if cap:
+                bits.append(f"mkt cap {usd_scaled(cap)}")
         # The second denominator: what this did to the buyer's own stake.
         if detail.get("new_position"):
             bits.append("new position")
@@ -2178,7 +2243,7 @@ def write_html(conn, path="dashboard.html"):
     for tier, label in ((1, "Act on these"), (2, "Everything else")):
         companies = [g for g in grouped if g[1][0]["tier"] == tier]
         body = (
-            "".join(render_company(entity, evs) for entity, evs in companies)
+            "".join(render_company(entity, evs, conn) for entity, evs in companies)
             if companies
             else '<p class="empty">Nothing yet. Run a collection to populate this.</p>'
         )
