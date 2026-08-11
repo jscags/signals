@@ -1028,11 +1028,12 @@ def probe_buybacks(days=3, sample=60):
         print("no periodic filings found in the window -- try more days")
         return
 
-    hits = {tag: 0 for _, tag in BUYBACK_CONCEPTS}
+    candidates = BUYBACK_SHARE_CONCEPTS + BUYBACK_VALUE_CONCEPTS
+    hits = {tag: 0 for _, tag in candidates}
     examples = []
     for cik, (ticker, form, day) in filers.items():
         found = {}
-        for taxonomy, tag in BUYBACK_CONCEPTS:
+        for taxonomy, tag in candidates:
             points = concept_points(xbrl_concept(cik, taxonomy, tag))
             if points:
                 hits[tag] += 1
@@ -1041,7 +1042,7 @@ def probe_buybacks(days=3, sample=60):
             examples.append((ticker, form, found))
 
     print(f"{'CONCEPT':46} {'FILERS':>7} {'COVERAGE':>9}")
-    for _, tag in BUYBACK_CONCEPTS:
+    for _, tag in candidates:
         print(f"{tag:46} {hits[tag]:>7} {hits[tag] / len(filers) * 100:>8.0f}%")
 
     print(f"\nany repurchase concept at all: {len(examples)}/{len(filers)} "
