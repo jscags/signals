@@ -1,0 +1,26 @@
+# Diagnostic only. Answers a design question -- how much repurchase data is
+# actually tagged in XBRL -- before a collector is built on the assumption.
+# Never scheduled, writes nothing, commits nothing.
+
+name: probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample:
+        description: 'How many periodic filers to sample'
+        default: '60'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Probe repurchase tag coverage
+        env:
+          EDGAR_USER_AGENT: "edgar-discovery 52y9fp5njf@privaterelay.appleid.com"
+          SAMPLE: ${{ inputs.sample }}
+        run: python3 edgar_discovery.py --probe-buybacks "${SAMPLE:-60}"

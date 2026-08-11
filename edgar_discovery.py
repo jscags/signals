@@ -112,6 +112,23 @@ XBRL_CONCEPTS = (
     ("us-gaap", "CommonStockSharesOutstanding"),
 )
 
+# Periodic reports. A company filing one is the trigger to look up what it
+# repurchased -- the filing itself is never downloaded, since the numbers are
+# served as structured XBRL from the same host.
+PERIODIC_FORMS = {"10-Q", "10-K"}
+
+# Candidate repurchase concepts, in the order worth trying. The cash-flow tag
+# is the most consistently reported; the share-count tags are better signal
+# when present, because a share count cannot be distorted by a bad price.
+BUYBACK_CONCEPTS = (
+    ("us-gaap", "PaymentsForRepurchaseOfCommonStock"),
+    ("us-gaap", "PaymentsForRepurchaseOfEquity"),
+    ("us-gaap", "StockRepurchasedDuringPeriodShares"),
+    ("us-gaap", "StockRepurchasedAndRetiredDuringPeriodShares"),
+    ("us-gaap", "TreasuryStockSharesAcquired"),
+    ("us-gaap", "TreasuryStockValueAcquiredCostMethod"),
+)
+
 # Form types that are inherently M&A. No item-code parsing needed: the form
 # type alone is the signal, which is why these are in the first collector.
 MA_FORMS_TIER1 = {"SC TO-T", "SC 14D9", "DEFM14A", "SC 13D"}
@@ -618,6 +635,111 @@ def plausible_shares(shares_out):
     if not shares_out or shares_out < MIN_PLAUSIBLE_SHARES:
         return None
     return shares_out
+
+
+def xbrl_concept(cik, taxonomy, tag):
+    """Raw companyconcept payload for one tag, or None if it is not reported."""
+    if not cik:
+        return None
+    url = (
+        f"https://data.sec.gov/api/xbrl/companyconcept/"
+        f"CIK{cik:010d}/{taxonomy}/{tag}.json"
+    )
+    try:
+        body = fetch(url)
+    except RuntimeError:
+        return None
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return None
+
+
+def concept_points(payload):
+    """Flatten a companyconcept payload into dated observations.
+
+    Only closed periods with both a start and an end, so instantaneous
+    balances and open-ended facts do not get summed as if they were flows.
+    """
+    if not payload:
+        return []
+    points = []
+    for unit, facts in (payload.get("units") or {}).items():
+        for fact in facts:
+            if fact.get("val") is None or not fact.get("start") or not fact.get("end"):
+                continue
+            points.append({
+                "unit": unit,
+                "val": float(fact["val"]),
+                "start": fact["start"],
+                "end": fact["end"],
+                "form": fact.get("form"),
+                "fy": fact.get("fy"),
+                "fp": fact.get("fp"),
+            })
+    points.sort(key=lambda p: (p["end"], p["start"]))
+    return points
+
+
+def probe_buybacks(days=3, sample=60):
+    """Report how many recent periodic filers actually tag repurchase data.
+
+    Written before building the collector rather than after: if the cash-flow
+    concept is tagged by a small minority, the whole XBRL approach is wrong and
+    the Item 5(c) table in the filing itself is the only route. Cheap to answer,
+    and it decides the design.
+    """
+    tickers = load_ticker_map()
+    filers = {}
+    for day in business_days_back(days):
+        try:
+            body = fetch(index_url(day))
+        except RuntimeError:
+            continue
+        if not body:
+            continue
+        for row in parse_master_idx(body):
+            if row["form_type"] in PERIODIC_FORMS and row["cik"] in tickers:
+                filers.setdefault(row["cik"], (tickers[row["cik"]][0],
+                                               row["form_type"], day.isoformat()))
+            if len(filers) >= sample:
+                break
+        if len(filers) >= sample:
+            break
+
+    print(f"sampled {len(filers)} listed {'/'.join(sorted(PERIODIC_FORMS))} filers "
+          f"over the last {days} business days\n")
+    if not filers:
+        print("no periodic filings found in the window -- try more days")
+        return
+
+    hits = {tag: 0 for _, tag in BUYBACK_CONCEPTS}
+    examples = []
+    for cik, (ticker, form, day) in filers.items():
+        found = {}
+        for taxonomy, tag in BUYBACK_CONCEPTS:
+            points = concept_points(xbrl_concept(cik, taxonomy, tag))
+            if points:
+                hits[tag] += 1
+                found[tag] = points[-1]
+        if found:
+            examples.append((ticker, form, found))
+
+    print(f"{'CONCEPT':46} {'FILERS':>7} {'COVERAGE':>9}")
+    for _, tag in BUYBACK_CONCEPTS:
+        print(f"{tag:46} {hits[tag]:>7} {hits[tag] / len(filers) * 100:>8.0f}%")
+
+    print(f"\nany repurchase concept at all: {len(examples)}/{len(filers)} "
+          f"({len(examples) / len(filers) * 100:.0f}%)\n")
+
+    print("sample of the most recent observation per filer:")
+    for ticker, form, found in examples[:12]:
+        tag, point = next(iter(found.items()))
+        print(f"  {ticker:7} {form:5} {tag[:38]:38} "
+              f"{point['val']:>18,.0f} {point['unit']:<5} "
+              f"{point['start']}..{point['end']}")
 
 
 def bps_of_market_cap(value, shares_out, price, shares_bought=None):
@@ -1620,6 +1742,9 @@ def main():
                     help="mark every open event in a tier reviewed")
     ap.add_argument("--unreview", metavar="TICKER",
                     help="put a company's events back on the dashboard")
+    ap.add_argument("--probe-buybacks", type=int, metavar="N", nargs="?", const=60,
+                    help="diagnostic: how many recent 10-Q/10-K filers tag "
+                         "repurchase data (sample size N)")
     ap.add_argument("--rescore", action="store_true",
                     help="backfill significance onto events stored before the scale")
     args = ap.parse_args()
@@ -1662,6 +1787,10 @@ def main():
               if n else "no events for that ticker")
         if not args.html:
             return
+
+    if args.probe_buybacks:
+        probe_buybacks(sample=args.probe_buybacks)
+        return
 
     if args.rescore:
         n, promoted = rescore(conn)
