@@ -1412,16 +1412,32 @@ def conviction(event):
 
 
 def group_by_company(events):
-    """One card per ticker. A company that files three times in a week is one
-    story told three times, not three stories."""
+    """One card per ticker, across every tier.
+
+    A company that files three times in a week is one story told three times,
+    not three stories -- and grouping inside a tier only got that half right.
+    A ticker with both a Tier 1 and a Tier 2 filing drew a card in each
+    section, so it appeared twice on the page: 22 of them on the live
+    dashboard, which is the duplication the rollup exists to remove.
+
+    Each company is placed once, at the best tier any of its filings earned,
+    with the rest nested underneath. The leading event is the best-tier one
+    and, within that, the loudest -- the filing that put the company on the
+    page is the one that should headline its card. Callers split the returned
+    list on the leading event's tier.
+    """
+    def rank(event):
+        # Ascending tier, descending conviction, in one sort key.
+        return (event["tier"], *(-part for part in conviction(event)))
+
     groups = {}
     for event in events:
         groups.setdefault(event["entity"], []).append(event)
+
     ranked = [
-        (entity, sorted(evs, key=conviction, reverse=True))
-        for entity, evs in groups.items()
+        (entity, sorted(evs, key=rank)) for entity, evs in groups.items()
     ]
-    ranked.sort(key=lambda g: conviction(g[1][0]), reverse=True)
+    ranked.sort(key=lambda group: rank(group[1][0]))
     return ranked
 
 
@@ -1511,18 +1527,22 @@ def write_html(conn, path="dashboard.html"):
         "SELECT * FROM run_log ORDER BY run_date DESC LIMIT 5"
     ).fetchall()
 
+    # Grouped once over everything, then split by the tier each company earned,
+    # so a ticker with filings in both tiers gets one card rather than two.
+    grouped = group_by_company(events)
+
     sections = []
     for tier, label in ((1, "Act on these"), (2, "Everything else")):
-        rows = [e for e in events if e["tier"] == tier]
-        companies = group_by_company(rows)
+        companies = [g for g in grouped if g[1][0]["tier"] == tier]
         body = (
             "".join(render_company(entity, evs) for entity, evs in companies)
             if companies
             else '<p class="empty">Nothing yet. Run a collection to populate this.</p>'
         )
+        n_filings = sum(len(evs) for _, evs in companies)
         count = f"{len(companies)}"
-        if len(rows) != len(companies):
-            count += f" · {len(rows)} filings"
+        if n_filings != len(companies):
+            count += f" · {n_filings} filings"
         sections.append(
             f'<section class="t{tier}"><div class="tier-head">'
             f"<b>Tier {tier} — {label}</b><span>{count}</span></div>{body}</section>"
