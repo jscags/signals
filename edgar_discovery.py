@@ -70,6 +70,11 @@ SIGNIFICANCE_BANDS = (
 # at a mega-cap, and only one of those is a real signal about the company.
 TIER1_BPS = 25.0
 
+# A refused document is skipped, but a run of them means the SEC has stopped
+# answering us and the honest move is to stop asking rather than push through
+# thousands more requests.
+MAX_CONSECUTIVE_REFUSALS = 20
+
 # Shares outstanding moves slowly; a monthly refresh is plenty.
 SHARES_TTL_DAYS = 30
 
@@ -142,7 +147,13 @@ def load_ticker_map():
         or time.time() - os.path.getmtime(path) > 7 * 86400
     )
     if stale:
-        body = fetch(TICKER_MAP_URL)
+        try:
+            body = fetch(TICKER_MAP_URL)
+        except RuntimeError:
+            # Same reasoning as the document fetch: a refusal here degrades
+            # M&A filtering, which main() already warns about, and is not
+            # worth ending the run over.
+            body = None
         if body:
             with open(path, "w") as fh:
                 fh.write(body)
@@ -599,7 +610,8 @@ def run_day(conn, day, tickers, limit=None):
     if not rows:
         print(f"{day}  WARNING: index fetched ({len(body):,} bytes) but parsed "
               f"to 0 rows — the file format may have changed")
-    n_docs = n_events = 0
+    n_docs = n_events = refused = 0
+    status = "ok"
     n_candidates = sum(
         1 for r in rows if r["form_type"] == "4" or r["form_type"] in MA_FORMS
     )
@@ -622,7 +634,21 @@ def run_day(conn, day, tickers, limit=None):
             continue
 
         if is_form4:
-            n_events += handle_form4(conn, row, tickers)
+            emitted = handle_form4(conn, row, tickers)
+            if emitted is None:
+                # Refused. Leave the accession unrecorded so a later run
+                # retries it, and watch for a run of them: once the SEC starts
+                # saying no, asking three thousand more times is the wrong
+                # thing to do. Tripping the breaker keeps what we already have.
+                refused += 1
+                if refused >= MAX_CONSECUTIVE_REFUSALS:
+                    status = "partial"
+                    print(f"  (stopped after {refused} consecutive refusals; "
+                          f"keeping the {n_docs} documents already collected)")
+                    break
+                continue
+            refused = 0
+            n_events += emitted
         else:
             n_events += handle_ma(conn, row, listed)
 
@@ -636,9 +662,10 @@ def run_day(conn, day, tickers, limit=None):
         )
         n_docs += 1
 
-    log_run(conn, day, "ok", n_docs, n_events, started)
+    log_run(conn, day, status, n_docs, n_events, started)
     print(f"{day}  {len(rows):,} filings in index, {n_candidates} of interest, "
-          f"{n_docs} processed, {n_events} events")
+          f"{n_docs} processed, {n_events} events"
+          + ("  [partial: refused]" if status == "partial" else ""))
     return "ok"
 
 
@@ -700,7 +727,17 @@ def aggregate_buys(buys):
 
 
 def handle_form4(conn, row, tickers):
-    text = fetch(f"https://www.sec.gov/Archives/{row['path']}")
+    """Events emitted for this filing, or None if the SEC refused the document.
+
+    None and 0 mean different things to the caller. 0 is a document we read
+    that held no open-market purchase, and it should be recorded so it is never
+    fetched again. None is a refusal that says nothing about the contents, so
+    the accession stays unrecorded and a later run picks it up.
+    """
+    try:
+        text = fetch(f"https://www.sec.gov/Archives/{row['path']}")
+    except RuntimeError:
+        return None
     if not text:
         return 0
 

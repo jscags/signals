@@ -21,7 +21,7 @@ on:
         description: 'Weekdays to scan'
         default: '3'
       limit:
-        description: 'Max documents (blank = no cap)'
+        description: 'Max documents per day (blank = 500, the scheduled default)'
         default: '40'
 
 permissions:
@@ -56,7 +56,16 @@ jobs:
         env:
           EDGAR_USER_AGENT: "edgar-discovery 52y9fp5njf@privaterelay.appleid.com"
           BACKFILL: ${{ inputs.backfill || '3' }}
-          LIMIT: ${{ inputs.limit }}
+          # inputs.* is null on a schedule event, so without a fallback here a
+          # scheduled run went out uncapped -- roughly 3,900 documents and 15+
+          # minutes, where every manual run had been capped at 40.
+          #
+          # 500/day is deliberate, not arbitrary. A filing day sits in the
+          # --backfill 3 window for three business days, which is six scheduled
+          # runs, and already_processed means each run advances rather than
+          # repeats. 500 x 6 = 3,000 slots against ~1,300 candidates a day, so a
+          # day is still fully covered before it slides out, with margin.
+          LIMIT: ${{ inputs.limit || '500' }}
         run: |
           mkdir -p docs
           ARGS="--backfill $BACKFILL --html docs/index.html"
