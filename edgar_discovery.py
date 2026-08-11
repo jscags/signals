@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import collections
 import html
 import json
 import os
@@ -664,6 +665,18 @@ def connect():
         for name, kind in columns:
             if name not in present:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+
+    # Events stored before iso_date() existed kept the index's YYYYMMDD form,
+    # so the table holds two formats at once and any ordering by filed_date
+    # interleaves them wrongly -- '20260806' sorts above every ISO date because
+    # '0' > '-'. Normalising in place is cheap and permanent; doing it at read
+    # time would leave the next date control to rediscover the same trap.
+    conn.execute(
+        "UPDATE events SET filed_date = "
+        "substr(filed_date,1,4) || '-' || substr(filed_date,5,2) || '-' || "
+        "substr(filed_date,7,2) "
+        "WHERE filed_date GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'"
+    )
     conn.commit()
     return conn
 
@@ -1968,7 +1981,15 @@ def rescore(conn):
         # Already scored and the score is sane -- nothing to do. A stored figure
         # above the plausible ceiling was computed against a bad share count and
         # needs clearing, so it is deliberately not skipped here.
-        if stored is not None and stored <= MAX_PLAUSIBLE_BPS:
+        #
+        # So is an implausible dollar total. aggregate_buys() drops a value that
+        # a bad reported price inflated, but the bps it produces can still land
+        # inside the ceiling and hide the event from this skip: REBN sat on the
+        # dashboard as a $23.6bn "major" purchase at a coffee-shop microcap,
+        # because the Form 4 reported $180,000 a share and the resulting 160 bps
+        # looked perfectly ordinary.
+        suspect = (detail.get("value") or 0) > MAX_PLAUSIBLE_VALUE_USD
+        if stored is not None and stored <= MAX_PLAUSIBLE_BPS and not suspect:
             continue
 
         ledger = conn.execute(
@@ -2082,6 +2103,26 @@ CSS = """
 :root {
   --ink: #14202B; --paper: #EDF0F2; --card: #FFFFFF;
   --rule: #C7D0D6; --signal: #1B3FD8; --muted: #6B7B87;
+  --field: #FFFFFF; --sunk: #E2E7EA;
+  /* The significance ramp: one hue, five steps, light to dark, so the rungs
+     read in order without reading the words. Stepped in OKLCH at the signal
+     hue and checked against the card surface -- monotone lightness, >= 0.06
+     between steps, and the palest step clears 2:1 on white so "negligible"
+     is still a mark and not a smudge. Dark mode re-steps the same hue for
+     the dark surface rather than inverting these. */
+  --r1: #91AEF0; --r2: #6F94EE; --r3: #4E79EC; --r4: #305AE1; --r5: #1736D0;
+  --on-r1: #14202B; --on-r2: #14202B; --on-r3: #FFFFFF;
+  --on-r4: #FFFFFF; --on-r5: #FFFFFF;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #E1E9EF; --paper: #080E13; --card: #151C21;
+    --rule: #2B343B; --signal: #7EA2FF; --muted: #8E9AA4;
+    --field: #101820; --sunk: #1E272E;
+    --r1: #3561E8; --r2: #4F7BF2; --r3: #6C95F9; --r4: #8AADFF; --r5: #A7C5FF;
+    --on-r1: #FFFFFF; --on-r2: #08101C; --on-r3: #08101C;
+    --on-r4: #08101C; --on-r5: #08101C;
+  }
 }
 * { box-sizing: border-box; }
 body {
@@ -2109,18 +2150,21 @@ h1 {
 .tier-head span {
   font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--muted);
 }
-.t1 .tier-head b { color: var(--signal); }
+.tier-head[data-head="1"] b { color: var(--signal); }
 .row {
   display: grid; grid-template-columns: 88px 1fr; gap: 16px;
   background: var(--card); border-left: 3px solid var(--rule);
   padding: 14px 16px; margin-bottom: 8px;
 }
-.t1 .row { border-left-color: var(--signal); }
+.row[data-tier="1"] { border-left-color: var(--signal); }
 .ticker {
   font-family: "IBM Plex Mono", monospace; font-size: 19px; font-weight: 600;
   letter-spacing: -.02em; word-break: break-all;
 }
-.t1 .ticker { color: var(--signal); }
+.row[data-tier="1"] .ticker { color: var(--signal); }
+/* The tier tag repeats on the card what the section heading says, so the fact
+   survives a sort that dissolves the sections. */
+.row[data-tier="1"] .tag { border-color: var(--signal); color: var(--signal); }
 .headline { margin: 0 0 6px; }
 .detail {
   font-family: "IBM Plex Mono", monospace; font-size: 11.5px; color: var(--muted);
@@ -2144,24 +2188,121 @@ h1 {
 .ticker a:focus-visible, .watch b a:focus-visible {
   outline: 2px solid var(--signal); outline-offset: 2px; border-radius: 1px;
 }
-/* The significance scale. One ramp of weight and colour so the rungs read in
-   order at a glance -- negligible recedes into the page, major is the only one
-   that fills. Bands carry a word as well as the shading, so the ranking does
-   not depend on colour perception. */
+/* The significance scale. The word names the rung and the ramp step shades it,
+   so the ranking never depends on colour perception alone, and the exact
+   figure is printed underneath so nothing has to be read off a colour.
+   (A five-segment meter sat here briefly. At 88px wide it drew as a dashed
+   rule -- noise, and a third encoding of a rung the badge already carries in
+   both a word and a shade.) */
 .scale { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; }
 .band {
   font-family: "IBM Plex Mono", monospace; font-size: 9.5px; font-weight: 600;
   letter-spacing: .08em; text-transform: uppercase; text-align: center;
   padding: 2px 4px; border: 1px solid var(--rule); color: var(--muted);
+  border-radius: 2px;
 }
-.b-minor      { border-color: var(--muted); color: var(--ink); }
-.b-notable    { border-color: var(--ink); color: var(--ink); }
-.b-significant{ border-color: var(--signal); color: var(--signal); }
-.b-major      { border-color: var(--signal); background: var(--signal); color: #fff; }
+/* .b-unscored deliberately adds nothing: the base style above -- grey hairline,
+   muted text, no fill -- IS the off-the-ramp look. "We could not measure this"
+   is a different statement from "this is small", and the page must not let the
+   two resemble each other. */
+.b-negligible { border-color: var(--r1); color: var(--ink); }
+.b-minor      { border-color: var(--r2); background: var(--r2); color: var(--on-r2); }
+.b-notable    { border-color: var(--r3); background: var(--r3); color: var(--on-r3); }
+.b-significant{ border-color: var(--r4); background: var(--r4); color: var(--on-r4); }
+.b-major      { border-color: var(--r5); background: var(--r5); color: var(--on-r5); }
 .bps {
   font-family: "IBM Plex Mono", monospace; font-size: 9.5px;
   color: var(--muted); text-align: center; letter-spacing: -.01em;
 }
+/* ---- controls: one row above everything they scope ---- */
+.controls {
+  display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center;
+  margin: 0 0 18px;
+}
+.controls label { font-size: 12px; color: var(--muted); }
+#q, #sort {
+  font-family: inherit; font-size: 13px; color: var(--ink);
+  background: var(--field); border: 1px solid var(--rule);
+  border-radius: 3px; padding: 7px 10px;
+}
+#q { flex: 1 1 220px; min-width: 0; }
+#q::placeholder { color: var(--muted); }
+#q:focus-visible, #sort:focus-visible, .chipbtn:focus-visible,
+.dist-row:focus-visible {
+  outline: 2px solid var(--signal); outline-offset: 2px;
+}
+.chipset { display: flex; gap: 6px; flex-wrap: wrap; }
+.chipbtn {
+  font-family: "IBM Plex Mono", monospace; font-size: 11px; font-weight: 600;
+  letter-spacing: .04em; cursor: pointer;
+  background: var(--field); color: var(--muted);
+  border: 1px solid var(--rule); border-radius: 3px; padding: 6px 9px;
+}
+.chipbtn small { font-weight: 400; opacity: .75; margin-left: 5px; }
+.chipbtn[aria-pressed="true"] {
+  background: var(--signal); border-color: var(--signal); color: var(--card);
+}
+/* ---- significance distribution: the overview, and the band filter ---- */
+.dist {
+  background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
+  padding: 8px 14px; margin: 0 0 18px;
+}
+.dist-row {
+  cursor: pointer; background: none; border: 0; font: inherit; color: inherit;
+  text-align: left; width: 100%; border-radius: 2px;
+  /* The hit target is the whole row, not the 9px bar -- padding included, it
+     clears the 24px minimum at every count. */
+  display: grid; grid-template-columns: 84px 1fr 44px; gap: 10px;
+  align-items: center; padding: 6px 4px;
+}
+.dist-label {
+  font-family: "IBM Plex Mono", monospace; font-size: 10.5px; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+}
+.dist-row[aria-pressed="true"] .dist-label { color: var(--ink); }
+.dist-row[aria-pressed="true"] .dist-label::before { content: "\\2713\\00a0"; }
+.dist-track { display: block; }
+.dist-bar {
+  display: block; height: 9px; border-radius: 0 2px 2px 0; min-width: 2px;
+  background: var(--r3); transition: width .18s ease-out;
+}
+.dist-n {
+  font-family: "IBM Plex Mono", monospace; font-size: 11px;
+  color: var(--muted); text-align: right; font-variant-numeric: tabular-nums;
+}
+.dist-row:hover .dist-bar { filter: brightness(1.08); }
+.dist-row[data-band="major"]       .dist-bar { background: var(--r5); }
+.dist-row[data-band="significant"] .dist-bar { background: var(--r4); }
+.dist-row[data-band="notable"]     .dist-bar { background: var(--r3); }
+.dist-row[data-band="minor"]       .dist-bar { background: var(--r2); }
+.dist-row[data-band="negligible"]  .dist-bar { background: var(--r1); }
+.dist-row[data-band="unscored"]    .dist-bar { background: var(--rule); }
+#tip {
+  position: fixed; z-index: 9; pointer-events: none; opacity: 0;
+  background: var(--ink); color: var(--paper); border-radius: 3px;
+  padding: 6px 9px; font-size: 12px; line-height: 1.35;
+  transition: opacity .12s; max-width: 240px;
+}
+#tip b { font-size: 13px; }
+/* ---- KPI row ---- */
+.kpis { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
+.kpi {
+  background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
+  padding: 10px 14px; flex: 1 1 120px;
+}
+.kpi b { display: block; font-size: 26px; font-weight: 600; letter-spacing: -.02em; }
+.kpi.lead b { font-size: 38px; color: var(--signal); line-height: 1.05; }
+.kpi span {
+  font-family: "IBM Plex Mono", monospace; font-size: 10px;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--muted);
+}
+.tag {
+  font-family: "IBM Plex Mono", monospace; font-size: 9.5px; font-weight: 600;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+  border: 1px solid var(--rule); border-radius: 2px; padding: 1px 5px;
+  margin-left: 8px; vertical-align: 1px; white-space: nowrap;
+}
+.none { display: none !important; }
 /* Secondary filings for a company already shown above. Subordinate to the
    headline on purpose: the card is the story, these are its other filings. */
 .more {
@@ -2194,11 +2335,181 @@ h1 {
 .watch .pin { border-left: 3px solid var(--ink); }
 @media (max-width: 520px) {
   .row { grid-template-columns: 1fr; gap: 6px; }
+  /* Stacked, the 88px column becomes the full width and the badge with it --
+     a saturated bar across the card, shouting far louder than the rung it
+     names. Laid on its side it stays a badge. */
+  .scale { flex-direction: row; align-items: baseline; gap: 8px; margin-top: 0; }
+  .band { padding: 2px 8px; }
+  .bps { text-align: left; }
+  .kpi.lead { flex-basis: 100%; }
 }
 @media (prefers-reduced-motion: no-preference) {
   .row { animation: rise .3s ease-out backwards; }
   @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
 }
+"""
+
+
+"""Filtering and sorting, applied over the cards already on the page.
+
+Progressive enhancement on purpose. Every card, count and bar is rendered by
+Python and correct on its own; this script only narrows and reorders what is
+already there. With scripting off the controls stay hidden and the page is
+exactly the dashboard it was before -- there is no second copy of the data and
+no template that can disagree with the server's.
+
+Reordering 400-odd nodes with appendChild is well under a frame, so there is no
+virtualisation here and no need for any.
+"""
+SCRIPT = """
+(function () {
+  var list = document.getElementById('list');
+  if (!list) return;
+  var cards = [].slice.call(list.querySelectorAll('.row'));
+  if (!cards.length) return;
+
+  var origin = [].slice.call(list.children);   // server order, headings included
+  var heads = [].slice.call(list.querySelectorAll('.tier-head'));
+  var allHead = document.querySelector('[data-head="all"]');
+  var allCount = document.getElementById('allcount');
+  var nohits = document.getElementById('nohits');
+  var dist = document.getElementById('dist');
+  var distRows = [].slice.call(dist.querySelectorAll('.dist-row'));
+  var famBtns = [].slice.call(document.querySelectorAll('.chipbtn[data-fam]'));
+  var t1 = document.getElementById('t1');
+  var q = document.getElementById('q');
+  var sort = document.getElementById('sort');
+  var tip = document.getElementById('tip');
+  var controls = document.getElementById('controls');
+  controls.hidden = false;
+
+  var fams = new Set(), bands = new Set(), tierOnly = false, needle = '';
+
+  function num(card, key) { return parseFloat(card.getAttribute(key)); }
+
+  // Everything except the band filter. The distribution has to count what the
+  // OTHER filters leave standing, or narrowing by band would collapse every bar
+  // but the one you picked and the overview would stop being an overview.
+  function passesBase(card) {
+    if (tierOnly && card.getAttribute('data-tier') !== '1') return false;
+    if (fams.size) {
+      var has = card.getAttribute('data-fam').split(' ');
+      if (!has.some(function (f) { return fams.has(f); })) return false;
+    }
+    if (needle && card.getAttribute('data-find').indexOf(needle) < 0) return false;
+    return true;
+  }
+
+  var SORTS = {
+    conviction: null,
+    mag:    function (a, b) { return num(b, 'data-mag') - num(a, 'data-mag'); },
+    usd:    function (a, b) { return num(b, 'data-usd') - num(a, 'data-usd'); },
+    filed:  function (a, b) {
+      return a.getAttribute('data-filed') < b.getAttribute('data-filed') ? 1 : -1;
+    },
+    ticker: function (a, b) {
+      return a.getAttribute('data-find').localeCompare(b.getAttribute('data-find'));
+    }
+  };
+
+  function apply() {
+    var counts = Object.create(null), widest = 0, shown = 0;
+
+    cards.forEach(function (card) {
+      var base = passesBase(card);
+      var band = card.getAttribute('data-band');
+      if (base) {
+        counts[band] = (counts[band] || 0) + 1;
+        if (counts[band] > widest) widest = counts[band];
+      }
+      var visible = base && (!bands.size || bands.has(band));
+      card.classList.toggle('none', !visible);
+      if (visible) shown++;
+    });
+
+    distRows.forEach(function (row) {
+      var n = counts[row.getAttribute('data-band')] || 0;
+      row.querySelector('.dist-bar').style.width =
+        (widest ? n / widest * 100 : 0) + '%';
+      row.querySelector('.dist-n').textContent = n.toLocaleString();
+    });
+
+    var cmp = SORTS[sort.value];
+    if (cmp) {
+      heads.forEach(function (h) { h.classList.add('none'); });
+      allHead.classList.toggle('none', shown === 0);
+      allCount.textContent = shown.toLocaleString();
+      cards.slice().sort(cmp).forEach(function (card) { list.appendChild(card); });
+    } else {
+      allHead.classList.add('none');
+      // Back to the order Python wrote, headings and all.
+      origin.forEach(function (node) { list.appendChild(node); });
+      heads.forEach(function (head) {
+        var tier = head.getAttribute('data-head');
+        var n = cards.filter(function (card) {
+          return !card.classList.contains('none') &&
+                 card.getAttribute('data-tier') === tier;
+        }).length;
+        head.classList.toggle('none', n === 0);
+        head.querySelector('span').textContent = n.toLocaleString();
+      });
+    }
+    nohits.classList.toggle('none', shown > 0);
+  }
+
+  function toggle(button, set, key) {
+    var value = button.getAttribute(key);
+    if (set.has(value)) { set.delete(value); } else { set.add(value); }
+    button.setAttribute('aria-pressed', set.has(value) ? 'true' : 'false');
+    apply();
+  }
+
+  famBtns.forEach(function (b) {
+    b.addEventListener('click', function () { toggle(b, fams, 'data-fam'); });
+  });
+  distRows.forEach(function (b) {
+    b.addEventListener('click', function () { toggle(b, bands, 'data-band'); });
+  });
+  t1.addEventListener('click', function () {
+    tierOnly = !tierOnly;
+    t1.setAttribute('aria-pressed', tierOnly ? 'true' : 'false');
+    apply();
+  });
+  sort.addEventListener('change', apply);
+  q.addEventListener('input', function () {
+    needle = q.value.trim().toLowerCase();
+    apply();
+  });
+
+  // The bars carry their counts as text already, so the tooltip is the share of
+  // the list -- something the page does not otherwise say. Keyboard focus shows
+  // the same readout as the pointer.
+  function showTip(row) {
+    var band = row.getAttribute('data-band');
+    var n = parseInt(row.querySelector('.dist-n').textContent.replace(/,/g, ''), 10);
+    var total = cards.filter(passesBase).length;
+    tip.textContent = '';
+    var strong = document.createElement('b');
+    strong.textContent = n.toLocaleString() + (n === 1 ? ' company' : ' companies');
+    tip.appendChild(strong);
+    tip.appendChild(document.createTextNode(
+      ' \\u00b7 ' + band + (total ? ' \\u00b7 ' + Math.round(n / total * 100) + '% of the list' : '')
+    ));
+    var box = row.getBoundingClientRect();
+    tip.style.opacity = '1';
+    tip.style.left = Math.min(box.left + 90, window.innerWidth - tip.offsetWidth - 8) + 'px';
+    tip.style.top = Math.max(8, box.top - tip.offsetHeight - 6) + 'px';
+  }
+  function hideTip() { tip.style.opacity = '0'; }
+  distRows.forEach(function (row) {
+    row.addEventListener('pointerenter', function () { showTip(row); });
+    row.addEventListener('focus', function () { showTip(row); });
+    row.addEventListener('pointerleave', hideTip);
+    row.addEventListener('blur', hideTip);
+  });
+
+  apply();
+})();
 """
 
 
@@ -2295,6 +2606,89 @@ def group_by_company(events):
     return ranked
 
 
+BAND_RUNGS = ("negligible", "minor", "notable", "significant", "major")
+
+# The three families the collector emits, as the page names them. Grouped so a
+# reader filtering for "M&A" gets every deal document without knowing that a
+# 425 and an SC TO-T are different forms.
+FAMILIES = (
+    ("insider", "Insider buys", lambda t: t == "insider_buy"),
+    ("buyback", "Buybacks", lambda t: t == "buyback"),
+    ("ma", "M&A", lambda t: t.startswith("ma_")),
+)
+
+
+def band_rung(band):
+    """Position on the significance ladder, 1-5.
+
+    0 means the issuer tags no share count to measure against, which is a
+    different statement from "small" and is kept separate everywhere: unscored
+    filings never mix into the ramp, they sit at the end of it.
+    """
+    return BAND_RUNGS.index(band) + 1 if band in BAND_RUNGS else 0
+
+
+def family_of(event_type):
+    return next((key for key, _, test in FAMILIES if test(event_type)), "other")
+
+
+def share_of_company(event_type, detail):
+    """Magnitude in basis points of the company, whatever the filing is.
+
+    An insider buy is already measured that way. A buyback is measured in whole
+    percent, so it multiplies up by 100. They are not the same *kind* of
+    statement -- one is a single purchase, the other a year of repurchases --
+    but both answer "how much of this company", which is the axis the page
+    sorts on, and putting them in one unit is what makes the sort mean anything.
+    """
+    if event_type == "insider_buy":
+        return detail.get("bps_of_market_cap")
+    if event_type == "buyback" and detail.get("pct_of_shares") is not None:
+        return detail["pct_of_shares"] * 100
+    return None
+
+
+def card_facets(entity, events, order):
+    """The card's sortable and filterable facts, as data-* attributes.
+
+    Written onto the card itself rather than shipped alongside as a JSON blob,
+    so the page holds one copy of every figure and the controls cannot come to
+    disagree with what is drawn under them.
+    """
+    primary = events[0]
+    detail = json.loads(primary["detail"] or "{}")
+    band = detail.get("significance") or "unscored"
+
+    # Filtering by kind looks at every filing on the card -- a company shown for
+    # its insider buying should still appear under "Buybacks" when it also
+    # bought back stock. Rank, band and magnitude come from the leading filing
+    # alone, because that is the filing the card is placed by.
+    families = " ".join(
+        dict.fromkeys(family_of(e["event_type"]) for e in events)
+    )
+
+    haystack = {entity.lower()}
+    for event in events:
+        d = json.loads(event["detail"] or "{}")
+        for key in ("issuer", "company", "owner"):
+            if d.get(key):
+                haystack.add(str(d[key]).lower())
+        for name in (d.get("cluster_peers") or []) + (d.get("co_owners") or []):
+            haystack.add(str(name).lower())
+
+    return {
+        "data-ord": str(order),
+        "data-fam": families,
+        "data-tier": str(primary["tier"]),
+        "data-band": band,
+        "data-rung": str(band_rung(detail.get("significance"))),
+        "data-mag": f"{share_of_company(primary['event_type'], detail) or -1:.4f}",
+        "data-usd": f"{detail.get('value') or -1:.2f}",
+        "data-filed": primary["filed_date"] or "",
+        "data-find": " ".join(sorted(haystack)),
+    }
+
+
 def _strip_ticker(headline, entity):
     """The ticker is already the card's left column; drop the prefix the
     headline carries for the CLI listing."""
@@ -2302,7 +2696,7 @@ def _strip_ticker(headline, entity):
     return headline[len(prefix):] if headline.startswith(prefix) else headline
 
 
-def render_company(entity, events, conn=None):
+def render_company(entity, events, conn=None, order=0):
     primary = events[0]
     detail = json.loads(primary["detail"] or "{}")
     bits = [f"filed {html.escape(primary['filed_date'] or '')}"]
@@ -2358,25 +2752,110 @@ def render_company(entity, events, conn=None):
         more = f'<ul class="more">{items}</ul>'
 
     band = detail.get("significance")
-    badge = ""
-    if band:
-        bps = detail.get("bps_of_market_cap")
-        badge = (
+    if not band:
+        # An empty column reads as an unfinished card. Say the thing instead:
+        # this issuer tags no share count, so there is nothing to measure the
+        # filing against -- which is why it ranks where it does.
+        scale = (
+            '<div class="scale"><span class="band b-unscored" '
+            'title="the issuer reports no share count to measure this against">'
+            "unscored</span></div>"
+        )
+    else:
+        # The column is 88px wide, so the figure has to say which denominator
+        # it used without spelling out "of shares outstanding" over two lines.
+        # The headline beside it carries the full phrasing.
+        if primary["event_type"] == "buyback":
+            basis = "float" if "float" in (detail.get("pct_basis") or "") else "shares"
+            figure = f"{detail['pct_of_shares']:.1f}% of {basis}"
+        else:
+            figure = format_bps(detail.get("bps_of_market_cap")).replace(
+                " of company", ""
+            )
+        scale = (
+            f'<div class="scale">'
             f'<span class="band b-{band}">{html.escape(band)}</span>'
-            f'<span class="bps">{html.escape(format_bps(bps))}</span>'
+            f'<span class="bps">{html.escape(figure)}</span></div>'
         )
 
-    return f"""<div class="row">
+    attrs = " ".join(
+        f'{k}="{html.escape(v)}"' for k, v in card_facets(entity, events, order).items()
+    )
+    tier_tag = '<span class="tag">tier 1</span>' if primary["tier"] == 1 else ""
+
+    return f"""<div class="row" {attrs}>
   <div class="ticker">{ticker_link(entity)}
-    {f'<div class="scale">{badge}</div>' if badge else ''}
+    {scale}
   </div>
   <div>
-    <p class="headline">{html.escape(_strip_ticker(primary['headline'] or '', entity))}</p>
+    <p class="headline">{html.escape(_strip_ticker(primary['headline'] or '', entity))}{tier_tag}</p>
     <div class="detail">{"".join(f"<span>{b}</span>" for b in bits)}</div>
     {chips}
     {more}
   </div>
 </div>"""
+
+
+def render_controls(grouped):
+    """The filter row, the significance distribution, and the KPI tiles.
+
+    All three are one thing: a way through 400-odd cards. The distribution is
+    both the overview and the band filter, which is why it is a chart rather
+    than another row of chips -- where the mass sits is the first useful fact
+    about a day's collection, and the answer is also the control.
+
+    Every count here is rendered server-side and correct without JavaScript.
+    The script only narrows them.
+    """
+    cards = [
+        (entity, evs, json.loads(evs[0]["detail"] or "{}")) for entity, evs in grouped
+    ]
+    tier1 = sum(1 for _, evs, _ in cards if evs[0]["tier"] == 1)
+
+    tiles = "".join(
+        f'<div class="kpi{cls}"><b>{value:,}</b><span>{label}</span></div>'
+        for value, label, cls in (
+            (tier1, "to act on", " lead"),
+            (len(cards), "companies", ""),
+            (sum(len(evs) for _, evs, _ in cards), "filings", ""),
+        )
+    )
+
+    chips = "".join(
+        f'<button class="chipbtn" type="button" data-fam="{key}" aria-pressed="false">'
+        f"{label}<small>{sum(1 for _, evs, _ in cards if any(test(e['event_type']) for e in evs)):,}</small>"
+        f"</button>"
+        for key, label, test in FAMILIES
+    )
+
+    counts = collections.Counter(d.get("significance") or "unscored" for _, _, d in cards)
+    widest = max(counts.values(), default=1)
+    rows = "".join(
+        f'<button class="dist-row" type="button" data-band="{band}" aria-pressed="false">'
+        f'<span class="dist-label">{band}</span>'
+        f'<span class="dist-track"><span class="dist-bar" '
+        f'style="width:{counts.get(band, 0) / widest * 100:.1f}%"></span></span>'
+        f'<span class="dist-n">{counts.get(band, 0):,}</span></button>'
+        for band in tuple(reversed(BAND_RUNGS)) + ("unscored",)
+    )
+
+    return f"""<div class="kpis">{tiles}</div>
+<div class="controls" id="controls" hidden>
+  <input id="q" type="search" placeholder="Ticker, company or person"
+         aria-label="Filter by ticker, company or person" autocomplete="off">
+  <div class="chipset">{chips}
+    <button class="chipbtn" type="button" id="t1" aria-pressed="false">Tier 1 only</button>
+  </div>
+  <label for="sort">Sort</label>
+  <select id="sort">
+    <option value="conviction">Conviction</option>
+    <option value="mag">Share of company</option>
+    <option value="usd">Dollar size</option>
+    <option value="filed">Most recent</option>
+    <option value="ticker">Ticker A–Z</option>
+  </select>
+</div>
+<div class="dist" id="dist" role="group" aria-label="Filter by significance">{rows}</div>"""
 
 
 def write_html(conn, path="dashboard.html"):
@@ -2392,22 +2871,39 @@ def write_html(conn, path="dashboard.html"):
     # so a ticker with filings in both tiers gets one card rather than two.
     grouped = group_by_company(events)
 
-    sections = []
+    # One list rather than two sections. Sorting by anything other than
+    # conviction cuts across the tiers, and a card cannot be in two places at
+    # once -- so the tier is a heading the script hides when it stops being the
+    # thing the order means, and a tag on the card that is always true.
+    heads = {}
     for tier, label in ((1, "Act on these"), (2, "Everything else")):
         companies = [g for g in grouped if g[1][0]["tier"] == tier]
-        body = (
-            "".join(render_company(entity, evs, conn) for entity, evs in companies)
-            if companies
-            else '<p class="empty">Nothing yet. Run a collection to populate this.</p>'
-        )
         n_filings = sum(len(evs) for _, evs in companies)
         count = f"{len(companies)}"
         if n_filings != len(companies):
             count += f" · {n_filings} filings"
-        sections.append(
-            f'<section class="t{tier}"><div class="tier-head">'
-            f"<b>Tier {tier} — {label}</b><span>{count}</span></div>{body}</section>"
+        heads[tier] = (
+            f'<div class="tier-head" data-head="{tier}">'
+            f"<b>Tier {tier} — {label}</b><span>{count}</span></div>"
         )
+
+    body, seen_tiers = [], set()
+    for order, (entity, evs) in enumerate(grouped):
+        tier = evs[0]["tier"]
+        if tier not in seen_tiers:
+            seen_tiers.add(tier)
+            body.append(heads[tier])
+        body.append(render_company(entity, evs, conn, order))
+    if not grouped:
+        body.append('<p class="empty">Nothing yet. Run a collection to populate this.</p>')
+
+    sections = [
+        f'<div class="tier-head none" data-head="all"><b>All companies</b>'
+        f'<span id="allcount">{len(grouped)}</span></div>',
+        f'<section id="list">{"".join(body)}</section>',
+        '<p class="empty none" id="nohits">No company matches these filters.</p>',
+    ]
+    sections = [render_controls(grouped)] + sections
 
     covered = ", ".join(r["run_date"] for r in runs) or "no runs yet"
     docs = sum(r["n_docs"] or 0 for r in runs)
@@ -2444,15 +2940,17 @@ def write_html(conn, path="dashboard.html"):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Discovery — {date.today()}</title>
+<meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
 <style>{CSS}</style>
 </head><body><div class="wrap">
 <h1>EDGAR Discovery</h1>
-<p class="meta">{len(events)} open events &nbsp;·&nbsp; {docs} filings scanned &nbsp;·&nbsp; days covered: {covered}</p>
+<p class="meta">days covered: {covered}{f" &nbsp;·&nbsp; {docs} filings scanned" if docs else ""}</p>
 {"".join(sections)}
 {watch_html}
-</div></body></html>"""
+</div><div id="tip" role="status" aria-live="polite"></div>
+<script>{SCRIPT}</script></body></html>"""
 
     with open(path, "w") as fh:
         fh.write(doc)
