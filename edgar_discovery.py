@@ -614,6 +614,116 @@ def usd(value):
 # ---------------------------------------------------------------- significance
 
 
+def company_facts(cik):
+    """Every XBRL fact an issuer reports, in one request.
+
+    The alternative is companyconcept, one request per tag, and this collector
+    wants up to eight of them per issuer: two for the share count and six
+    walking the repurchase concepts. The rate limiter charges per request
+    rather than per byte, so a bigger single document is markedly cheaper than
+    the walk -- the first buyback run took twelve minutes against two and a
+    half, almost all of it waiting between small requests for facts that live
+    in the same file.
+    """
+    if not cik:
+        return None
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+    try:
+        body = fetch(url)
+    except RuntimeError:
+        # A refusal on an optional enrichment must not end the run; the filing
+        # is still worth reporting without its denominator.
+        return None
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return None
+
+
+def facts_concept(facts, taxonomy, tag):
+    """One concept out of a companyfacts payload, shaped like companyconcept."""
+    try:
+        return facts["facts"][taxonomy][tag]
+    except (KeyError, TypeError):
+        return None
+
+
+def refresh_issuer_xbrl(conn, cik):
+    """Derive every cached XBRL figure for an issuer from a single fetch.
+
+    Both caches are filled together even when only one was asked for, so an
+    issuer is fetched once per run however many of its facts get used.
+    """
+    facts = company_facts(cik)
+
+    shares_out = as_of = None
+    for taxonomy, tag in XBRL_CONCEPTS:
+        points = [
+            point
+            for unit in ((facts_concept(facts, taxonomy, tag) or {}).get("units")
+                         or {}).values()
+            for point in unit
+            if point.get("val")
+        ]
+        if not points:
+            continue
+        latest = max(points, key=lambda p: (p.get("end") or "", p.get("filed") or ""))
+        candidate = plausible_shares(float(latest["val"]))
+        if candidate is None:
+            continue  # placeholder count; try the other concept
+        shares_out, as_of = candidate, latest.get("end")
+        break
+
+    # Cache misses too, so an issuer that tags nothing is not re-asked on every
+    # run. The TTL still retires the answer.
+    conn.execute(
+        """INSERT INTO issuer_facts (cik, shares_out, as_of, fetched_at)
+           VALUES (?,?,?,?)
+           ON CONFLICT(cik) DO UPDATE SET
+             shares_out = excluded.shares_out,
+             as_of      = excluded.as_of,
+             fetched_at = excluded.fetched_at""",
+        (cik, shares_out, as_of, date.today().isoformat()),
+    )
+
+    shares = _first_flow_from(facts, BUYBACK_SHARE_CONCEPTS)
+    value = _first_flow_from(facts, BUYBACK_VALUE_CONCEPTS)
+    best = shares or value
+    conn.execute(
+        """INSERT INTO issuer_buybacks
+             (cik, shares, value, concept, period_start, period_end,
+              annualised, fetched_at)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(cik) DO UPDATE SET
+             shares=excluded.shares, value=excluded.value,
+             concept=excluded.concept, period_start=excluded.period_start,
+             period_end=excluded.period_end, annualised=excluded.annualised,
+             fetched_at=excluded.fetched_at""",
+        (cik,
+         shares["value"] if shares else None,
+         value["value"] if value else None,
+         (best or {}).get("concept"),
+         (best or {}).get("start"),
+         (best or {}).get("end"),
+         int(bool((best or {}).get("annualised"))),
+         date.today().isoformat()),
+    )
+    return shares_out
+
+
+def _fresh(row):
+    """True when a cached row is still inside its TTL."""
+    if not row or not row["fetched_at"]:
+        return False
+    try:
+        return (date.today() - date.fromisoformat(row["fetched_at"][:10])).days \
+            < SHARES_TTL_DAYS
+    except ValueError:
+        return False
+
+
 def shares_outstanding(conn, cik):
     """Shares outstanding for an issuer, cached in the DB for SHARES_TTL_DAYS.
 
@@ -631,60 +741,14 @@ def shares_outstanding(conn, cik):
     row = conn.execute(
         "SELECT shares_out, fetched_at FROM issuer_facts WHERE cik = ?", (cik,)
     ).fetchone()
-    if row and row["fetched_at"]:
-        try:
-            age = date.today() - date.fromisoformat(row["fetched_at"][:10])
-            if age.days < SHARES_TTL_DAYS:
-                # Filtered on the way out too, so a bad value already cached by
-                # an earlier version stops being served without a refetch.
-                return plausible_shares(row["shares_out"])
-        except ValueError:
-            pass  # unparseable timestamp: fall through and refetch
+    if _fresh(row):
+        # Filtered on the way out too, so a bad value already cached by an
+        # earlier version stops being served without a refetch.
+        return plausible_shares(row["shares_out"])
 
-    value = as_of = None
-    for taxonomy, tag in XBRL_CONCEPTS:
-        url = (
-            f"https://data.sec.gov/api/xbrl/companyconcept/"
-            f"CIK{cik:010d}/{taxonomy}/{tag}.json"
-        )
-        try:
-            body = fetch(url)
-        except RuntimeError:
-            # A refusal on an optional enrichment must not end the run; the
-            # filing is still worth reporting without its denominator.
-            body = None
-        if not body:
-            continue
-        try:
-            points = [
-                point
-                for unit in json.loads(body).get("units", {}).values()
-                for point in unit
-                if point.get("val")
-            ]
-        except (json.JSONDecodeError, AttributeError):
-            continue
-        if not points:
-            continue
-        latest = max(points, key=lambda p: (p.get("end") or "", p.get("filed") or ""))
-        candidate = plausible_shares(float(latest["val"]))
-        if candidate is None:
-            continue  # placeholder count; try the other concept
-        value, as_of = candidate, latest.get("end")
-        break
+    return plausible_shares(refresh_issuer_xbrl(conn, cik))
 
-    # Cache misses too, so an issuer that tags neither concept is not re-asked
-    # on every run. The TTL still retires the answer.
-    conn.execute(
-        """INSERT INTO issuer_facts (cik, shares_out, as_of, fetched_at)
-           VALUES (?,?,?,?)
-           ON CONFLICT(cik) DO UPDATE SET
-             shares_out = excluded.shares_out,
-             as_of      = excluded.as_of,
-             fetched_at = excluded.fetched_at""",
-        (cik, value, as_of, date.today().isoformat()),
-    )
-    return value
+
 
 
 def plausible_shares(shares_out):
@@ -797,63 +861,37 @@ def recent_flow(payload, today=None):
     }
 
 
-def first_flow(cik, concepts):
+def _first_flow_from(facts, concepts):
+    """The first usable flow among a list of concepts, out of one payload."""
     for taxonomy, tag in concepts:
-        flow = recent_flow(xbrl_concept(cik, taxonomy, tag))
+        flow = recent_flow(facts_concept(facts, taxonomy, tag))
         if flow:
             return {**flow, "concept": tag}
     return None
 
 
 def buyback_activity(conn, cik):
-    """Annualised repurchases for an issuer, cached like any other slow fact."""
+    """Annualised repurchases for an issuer, cached like any other slow fact.
+
+    Both this and the share count come out of one companyfacts document, so
+    whichever is asked for first pays the single request and the other is
+    already waiting in the cache.
+    """
     if not cik:
         return None
 
     row = conn.execute(
         "SELECT * FROM issuer_buybacks WHERE cik = ?", (cik,)
     ).fetchone()
-    if row and row["fetched_at"]:
-        try:
-            age = date.today() - date.fromisoformat(row["fetched_at"][:10])
-            if age.days < SHARES_TTL_DAYS:
-                return dict(row) if row["shares"] or row["value"] else None
-        except ValueError:
-            pass
+    if not _fresh(row):
+        refresh_issuer_xbrl(conn, cik)
+        row = conn.execute(
+            "SELECT * FROM issuer_buybacks WHERE cik = ?", (cik,)
+        ).fetchone()
 
-    shares = first_flow(cik, BUYBACK_SHARE_CONCEPTS)
-    value = first_flow(cik, BUYBACK_VALUE_CONCEPTS)
-    best = shares or value
-    conn.execute(
-        """INSERT INTO issuer_buybacks
-             (cik, shares, value, concept, period_start, period_end,
-              annualised, fetched_at)
-           VALUES (?,?,?,?,?,?,?,?)
-           ON CONFLICT(cik) DO UPDATE SET
-             shares=excluded.shares, value=excluded.value,
-             concept=excluded.concept, period_start=excluded.period_start,
-             period_end=excluded.period_end, annualised=excluded.annualised,
-             fetched_at=excluded.fetched_at""",
-        (cik,
-         shares["value"] if shares else None,
-         value["value"] if value else None,
-         (best or {}).get("concept"),
-         (best or {}).get("start"),
-         (best or {}).get("end"),
-         int(bool((best or {}).get("annualised"))),
-         date.today().isoformat()),
-    )
-    if not best:
+    if not row or not (row["shares"] or row["value"]):
         return None
-    return {
-        "cik": cik,
-        "shares": shares["value"] if shares else None,
-        "value": value["value"] if value else None,
-        "concept": best["concept"],
-        "period_start": best["start"],
-        "period_end": best["end"],
-        "annualised": int(bool(best["annualised"])),
-    }
+    return dict(row)
 
 
 def buyback_pct(activity, shares_out):
