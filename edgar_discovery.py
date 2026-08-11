@@ -32,6 +32,7 @@ import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------- config
 
@@ -420,19 +421,35 @@ def usd(value):
 # ---------------------------------------------------------------- run
 
 
+def log_run(conn, day, status, n_docs, n_events, started):
+    conn.execute(
+        """INSERT OR REPLACE INTO run_log VALUES (?,?,?,?,?,?,?)""",
+        (day.isoformat(), "edgar_daily", status, n_docs, n_events, started,
+         datetime.utcnow().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+
+
 def run_day(conn, day, tickers, limit=None):
+    """Collect one day. Returns 'ok', 'no_index' or 'unavailable'."""
     started = datetime.utcnow().isoformat(timespec="seconds")
-    body = fetch(index_url(day))
+    try:
+        body = fetch(index_url(day))
+    except RuntimeError:
+        # The SEC answers 403, not 404, for a daily index that has not been
+        # published yet. One day being early is not a reason to abandon the
+        # days already collected -- and letting it raise did exactly that,
+        # discarding two good days' work before the caller could store it.
+        # main() still exits non-zero when EVERY day is refused, which is what
+        # an actually blocked client looks like.
+        log_run(conn, day, "index_unavailable", 0, 0, started)
+        print(f"{day}  index unavailable (403) — not yet published, or refused")
+        return "unavailable"
 
     if body is None:
-        conn.execute(
-            """INSERT OR REPLACE INTO run_log VALUES (?,?,?,?,?,?,?)""",
-            (day.isoformat(), "edgar_daily", "no_index", 0, 0, started,
-             datetime.utcnow().isoformat(timespec="seconds")),
-        )
-        conn.commit()
+        log_run(conn, day, "no_index", 0, 0, started)
         print(f"{day}  no index published (weekend or holiday)")
-        return 0, 0
+        return "no_index"
 
     rows = parse_master_idx(body)
     if not rows:
@@ -475,15 +492,10 @@ def run_day(conn, day, tickers, limit=None):
         )
         n_docs += 1
 
-    conn.execute(
-        """INSERT OR REPLACE INTO run_log VALUES (?,?,?,?,?,?,?)""",
-        (day.isoformat(), "edgar_daily", "ok", n_docs, n_events, started,
-         datetime.utcnow().isoformat(timespec="seconds")),
-    )
-    conn.commit()
+    log_run(conn, day, "ok", n_docs, n_events, started)
     print(f"{day}  {len(rows):,} filings in index, {n_candidates} of interest, "
           f"{n_docs} processed, {n_events} events")
-    return n_docs, n_events
+    return "ok"
 
 
 def aggregate_buys(buys):
@@ -610,8 +622,21 @@ def handle_ma(conn, row, listed):
     )
 
 
+def market_today():
+    """Today as EDGAR reckons it.
+
+    The collector runs on UTC machines, but filings are stamped in US Eastern
+    and a day's index does not appear until roughly 22:00 ET. Any run after
+    20:00 ET is already on the next UTC date, so a UTC-based "yesterday" asks
+    for a day that, in Eastern terms, has not finished -- which the SEC answers
+    with a 403 for a file that does not exist yet. The evening schedule sits
+    squarely in that window.
+    """
+    return datetime.now(ZoneInfo("America/New_York")).date()
+
+
 def business_days_back(n):
-    days, cursor = [], date.today()
+    days, cursor = [], market_today()
     while len(days) < n:
         cursor -= timedelta(days=1)
         if cursor.weekday() < 5:
@@ -1019,10 +1044,15 @@ def main():
     elif args.date:
         days = [datetime.strptime(args.date, "%Y-%m-%d").date()]
     else:
-        days = [date.today()]
+        days = [market_today()]
 
-    for day in days:
-        run_day(conn, day, tickers, limit=args.limit)
+    outcomes = [run_day(conn, day, tickers, limit=args.limit) for day in days]
+    if outcomes and all(o == "unavailable" for o in outcomes):
+        # One refused index is a publication gap; every index refused is us.
+        sys.exit(
+            "every daily index was refused. That is a blocked client, not a\n"
+            "timing gap -- check EDGAR_USER_AGENT and how often this is running."
+        )
 
     retired = prune_watchlist(conn)
     conn.commit()
