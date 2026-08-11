@@ -60,12 +60,17 @@ jobs:
         run: |
           mkdir -p docs
           # A schedule event carries no inputs at all, so both arrive empty and
-          # the shell defaults below are what a scheduled run actually uses. The
-          # defaulting lives here rather than in a ${{ }} expression because a
-          # dispatch substitutes the input's declared default for a blank field,
-          # which makes the expression form impossible to exercise outside a
-          # real scheduled fire -- and an unverifiable default is how the run
-          # went out uncapped in the first place.
+          # the shell defaults below are what a scheduled run actually uses.
+          #
+          # The defaulting lives here rather than in a workflow expression for
+          # one reason: a dispatch substitutes an input's declared default for a
+          # blank field, so the expression form cannot be exercised outside a
+          # real scheduled fire. Plain shell treats absent and empty alike and
+          # can be run directly. An unverifiable default is how this went out
+          # uncapped in the first place.
+          #
+          # (Expression delimiters are parsed anywhere in this block, comments
+          # included, so an empty one here is a workflow syntax error.)
           #
           # 500/day is chosen, not guessed. A filing day sits in the
           # --backfill 3 window for three business days, which is six scheduled
