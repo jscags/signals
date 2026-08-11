@@ -1680,9 +1680,18 @@ def main():
             "timing gap -- check EDGAR_USER_AGENT and how often this is running."
         )
 
+    # Housekeeping every run, not on request. A score computed against a bad
+    # denominator sat on the published dashboard reading 5,100% of the company
+    # because clearing it needed someone to remember a flag; the run should
+    # repair its own output. Cheap after the first pass -- sane scores are
+    # skipped, and share counts come from the cache.
+    fixed, newly_promoted = rescore(conn)
     aged = prune_events(conn)
     retired = prune_watchlist(conn)
     conn.commit()
+    if fixed:
+        print(f"rescored {fixed} event(s)"
+              + (f", {newly_promoted} promoted" if newly_promoted else ""))
     if aged:
         print(f"retired {aged} events past their shelf life")
     if retired:
