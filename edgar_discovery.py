@@ -50,6 +50,35 @@ TIER1_VALUE_USD = 250_000
 CLUSTER_WINDOW_DAYS = 10
 CLUSTER_MIN_INSIDERS = 2
 
+# A dollar figure alone says nothing about significance: $1M is a rounding
+# error at a trillion-dollar company and a serious commitment at a small one.
+# Measured against market cap instead, purchases sort onto a scale that means
+# the same thing for every issuer. Insider buys are tiny next to a whole
+# company by construction, so the working range is basis points, not percent:
+# 100 bps (1%) of a company bought by one person is extraordinary.
+SIGNIFICANCE_BANDS = (
+    (100.0, "major"),
+    (25.0, "significant"),
+    (5.0, "notable"),
+    (1.0, "minor"),
+    (0.0, "negligible"),
+)
+
+# Relative size promotes on its own. This is the whole point of the scale: a
+# $60K purchase in a $20M company moves more of the float than a $5M purchase
+# at a mega-cap, and only one of those is a real signal about the company.
+TIER1_BPS = 25.0
+
+# Shares outstanding moves slowly; a monthly refresh is plenty.
+SHARES_TTL_DAYS = 30
+
+# Cover-page share count first, the us-gaap balance-sheet tag as a fallback for
+# issuers that do not tag the dei concept.
+XBRL_CONCEPTS = (
+    ("dei", "EntityCommonStockSharesOutstanding"),
+    ("us-gaap", "CommonStockSharesOutstanding"),
+)
+
 # Form types that are inherently M&A. No item-code parsing needed: the form
 # type alone is the signal, which is why these are in the first collector.
 MA_FORMS_TIER1 = {"SC TO-T", "SC 14D9", "DEFM14A", "SC 13D"}
@@ -266,6 +295,12 @@ def parse_form4(root):
         price = _num(txn, "transactionAmounts/transactionPricePerShare/value")
         txn_date = _text(txn, "transactionDate/value")
         value = shares * price if shares and price else None
+        # The position this leaves the insider holding. Free -- it is already in
+        # the document -- and it gives the second denominator: a director who
+        # just doubled their own stake is saying more than the dollars alone.
+        shares_after = _num(
+            txn, "postTransactionAmounts/sharesOwnedFollowingTransaction/value"
+        )
 
         buys.append(
             {
@@ -279,6 +314,7 @@ def parse_form4(root):
                 "shares": shares,
                 "price": price,
                 "value": value,
+                "shares_after": shares_after,
             }
         )
     return buys
@@ -324,6 +360,16 @@ CREATE TABLE IF NOT EXISTS events (
     created_at  TEXT,
     reviewed_at TEXT,
     UNIQUE(source_id, entity, event_type)
+);
+
+-- Issuer facts that change slowly and cost a request to learn. Cached here
+-- rather than in CACHE_DIR because this file is the state the workflow commits,
+-- so the cache survives between runs on a fresh runner.
+CREATE TABLE IF NOT EXISTS issuer_facts (
+    cik         INTEGER PRIMARY KEY,
+    shares_out  REAL,
+    as_of       TEXT,
+    fetched_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS run_log (
@@ -416,6 +462,103 @@ def usd(value):
     if value >= 1_000_000:
         return f"${value / 1_000_000:.1f}M"
     return f"${value / 1_000:.0f}K"
+
+
+# ---------------------------------------------------------------- significance
+
+
+def shares_outstanding(conn, cik):
+    """Shares outstanding for an issuer, cached in the DB for SHARES_TTL_DAYS.
+
+    This is the only term missing from a market cap: the Form 4 already gives
+    the price the insider paid, which is the market price that day. So the
+    denominator costs one request per issuer per month, from the same host,
+    with no market-data vendor involved.
+
+    Returns None when the issuer does not tag either concept -- the scale then
+    simply does not apply to that filing, rather than guessing at a cap.
+    """
+    if not cik:
+        return None
+
+    row = conn.execute(
+        "SELECT shares_out, fetched_at FROM issuer_facts WHERE cik = ?", (cik,)
+    ).fetchone()
+    if row and row["fetched_at"]:
+        try:
+            age = date.today() - date.fromisoformat(row["fetched_at"][:10])
+            if age.days < SHARES_TTL_DAYS:
+                return row["shares_out"]
+        except ValueError:
+            pass  # unparseable timestamp: fall through and refetch
+
+    value = as_of = None
+    for taxonomy, tag in XBRL_CONCEPTS:
+        url = (
+            f"https://data.sec.gov/api/xbrl/companyconcept/"
+            f"CIK{cik:010d}/{taxonomy}/{tag}.json"
+        )
+        try:
+            body = fetch(url)
+        except RuntimeError:
+            # A refusal on an optional enrichment must not end the run; the
+            # filing is still worth reporting without its denominator.
+            body = None
+        if not body:
+            continue
+        try:
+            points = [
+                point
+                for unit in json.loads(body).get("units", {}).values()
+                for point in unit
+                if point.get("val")
+            ]
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if not points:
+            continue
+        latest = max(points, key=lambda p: (p.get("end") or "", p.get("filed") or ""))
+        value, as_of = float(latest["val"]), latest.get("end")
+        break
+
+    # Cache misses too, so an issuer that tags neither concept is not re-asked
+    # on every run. The TTL still retires the answer.
+    conn.execute(
+        """INSERT INTO issuer_facts (cik, shares_out, as_of, fetched_at)
+           VALUES (?,?,?,?)
+           ON CONFLICT(cik) DO UPDATE SET
+             shares_out = excluded.shares_out,
+             as_of      = excluded.as_of,
+             fetched_at = excluded.fetched_at""",
+        (cik, value, as_of, date.today().isoformat()),
+    )
+    return value
+
+
+def bps_of_market_cap(value, shares_out, price):
+    """How much of the company this purchase represents, in basis points."""
+    if not value or not shares_out or not price:
+        return None
+    market_cap = shares_out * price
+    return value / market_cap * 10_000 if market_cap else None
+
+
+def significance_band(bps):
+    """Name the rung on the scale. None when there is no cap to measure against."""
+    if bps is None:
+        return None
+    for floor, name in SIGNIFICANCE_BANDS:
+        if bps >= floor:
+            return name
+    return "negligible"
+
+
+def format_bps(bps):
+    if bps is None:
+        return ""
+    if bps >= 100:
+        return f"{bps / 100:.2f}% of company"
+    return f"{bps:.1f} bps of company"
 
 
 # ---------------------------------------------------------------- run
@@ -517,15 +660,39 @@ def aggregate_buys(buys):
     volume = sum(b["shares"] for b in priced)
     price = sum(b["shares"] * b["price"] for b in priced) / volume if volume else None
 
+    total_shares = sum(shares) if shares else None
+
+    # The holding after the *last* purchase is the one that stands, so the
+    # position before this filing is that figure minus everything bought in it.
+    ordered = sorted(buys, key=lambda b: b["txn_date"] or "")
+    shares_after = next(
+        (b["shares_after"] for b in reversed(ordered) if b.get("shares_after") is not None),
+        None,
+    )
+    position_before = None
+    if shares_after is not None and total_shares:
+        before = shares_after - total_shares
+        position_before = before if before >= 0 else None
+
     agg = dict(buys[0])
     agg.update(
         {
-            "shares": sum(shares) if shares else None,
+            "shares": total_shares,
             "price": price,
             "value": sum(values) if values else None,
             "txn_date": dates[-1] if dates else None,
             "first_txn_date": dates[0] if dates else None,
             "n_purchases": len(buys),
+            "shares_after": shares_after,
+            "position_before": position_before,
+            # A first-ever position has no percentage to grow by; say so rather
+            # than dividing by zero or reporting a misleading number.
+            "new_position": position_before == 0,
+            "pct_position": (
+                total_shares / position_before * 100
+                if position_before and total_shares
+                else None
+            ),
         }
     )
     return agg
@@ -568,8 +735,21 @@ def handle_form4(conn, row, tickers):
         big = buy["value"] is not None and buy["value"] >= TIER1_VALUE_USD
         clustered = len(peers) >= CLUSTER_MIN_INSIDERS
 
-        tier = 1 if (big or clustered) else 2
-        reason = "cluster" if clustered else ("size" if big else "routine")
+        bps = bps_of_market_cap(
+            buy["value"], shares_outstanding(conn, buy["issuer_cik"]), buy["price"]
+        )
+        band = significance_band(bps)
+        relative = bps is not None and bps >= TIER1_BPS
+
+        tier = 1 if (big or clustered or relative) else 2
+        # Relative size is the more informative label when both apply: it says
+        # what the purchase meant to the company, not just to the buyer.
+        reason = (
+            "cluster" if clustered
+            else "relative size" if relative
+            else "size" if big
+            else "routine"
+        )
 
         if tier == 1:
             promote(conn, ticker, buy["issuer_cik"], f"insider buying ({reason})")
@@ -594,9 +774,16 @@ def handle_form4(conn, row, tickers):
                     if buy["n_purchases"] > 1
                     else ""
                 )
+                + (f" — {format_bps(bps)}" if bps is not None else "")
                 + (f" — {len(peers)} insiders buying" if clustered else "")
             ),
-            detail={**buy, "cluster_peers": peers, "tier_reason": reason},
+            detail={
+                **buy,
+                "cluster_peers": peers,
+                "tier_reason": reason,
+                "bps_of_market_cap": bps,
+                "significance": band,
+            },
             filed=row["filed"],
         )
     return emitted
@@ -773,6 +960,24 @@ h1 {
   border: 1px solid var(--signal); color: var(--signal);
   padding: 2px 6px; border-radius: 2px;
 }
+/* The significance scale. One ramp of weight and colour so the rungs read in
+   order at a glance -- negligible recedes into the page, major is the only one
+   that fills. Bands carry a word as well as the shading, so the ranking does
+   not depend on colour perception. */
+.scale { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; }
+.band {
+  font-family: "IBM Plex Mono", monospace; font-size: 9.5px; font-weight: 600;
+  letter-spacing: .08em; text-transform: uppercase; text-align: center;
+  padding: 2px 4px; border: 1px solid var(--rule); color: var(--muted);
+}
+.b-minor      { border-color: var(--muted); color: var(--ink); }
+.b-notable    { border-color: var(--ink); color: var(--ink); }
+.b-significant{ border-color: var(--signal); color: var(--signal); }
+.b-major      { border-color: var(--signal); background: var(--signal); color: #fff; }
+.bps {
+  font-family: "IBM Plex Mono", monospace; font-size: 9.5px;
+  color: var(--muted); text-align: center; letter-spacing: -.01em;
+}
 /* Secondary filings for a company already shown above. Subordinate to the
    headline on purpose: the card is the story, these are its other filings. */
 .more {
@@ -818,19 +1023,24 @@ def _initials(name):
     return "".join(p[0].upper() for p in parts[:2]) or "??"
 
 
-# Ranking sentinel, not a dollar figure: a deal filing and a position size are
-# not on one scale, and a definitive merger document is the least ambiguous
-# thing this collector finds, so it leads its tier.
-MA_RANK = 10 ** 12
-
-
 def conviction(event):
-    """Sort key inside a tier. Dollars for buys, so the loudest signal is the
-    one you read first -- sorting by filing time buried a $5.0M purchase eight
-    rows under a $14K one."""
+    """Sort key inside a tier, as a (class, magnitude) pair.
+
+    Deal filings lead: a definitive merger document is the least ambiguous
+    thing this collector finds, and it has no dollar size to compare anyway.
+    Buys then rank by share of the company rather than by dollars, which is
+    the point of the scale -- $5M at a mega-cap is a smaller statement than
+    $60K at a nano-cap. Filings whose issuer tags no share count keep ranking
+    by dollars among themselves; they cannot be compared to a bps figure
+    honestly, so they are not mixed in with one.
+    """
     if event["event_type"] != "insider_buy":
-        return MA_RANK
-    return json.loads(event["detail"] or "{}").get("value") or 0
+        return (2, 0.0)
+    detail = json.loads(event["detail"] or "{}")
+    bps = detail.get("bps_of_market_cap")
+    if bps is not None:
+        return (1, bps)
+    return (0, detail.get("value") or 0)
 
 
 def group_by_company(events):
@@ -862,6 +1072,11 @@ def render_company(entity, events):
     if primary["event_type"] == "insider_buy":
         if detail.get("shares") and detail.get("price"):
             bits.append(f"{int(detail['shares']):,} sh @ ${detail['price']:,.2f}")
+        # The second denominator: what this did to the buyer's own stake.
+        if detail.get("new_position"):
+            bits.append("new position")
+        elif detail.get("pct_position"):
+            bits.append(f"+{detail['pct_position']:,.0f}% to position")
         first, last = detail.get("first_txn_date"), detail.get("txn_date")
         if last:
             span = f"{first} → {last}" if first and first != last else last
@@ -897,8 +1112,19 @@ def render_company(entity, events):
         )
         more = f'<ul class="more">{items}</ul>'
 
+    band = detail.get("significance")
+    badge = ""
+    if band:
+        bps = detail.get("bps_of_market_cap")
+        badge = (
+            f'<span class="band b-{band}">{html.escape(band)}</span>'
+            f'<span class="bps">{html.escape(format_bps(bps))}</span>'
+        )
+
     return f"""<div class="row">
-  <div class="ticker">{html.escape(entity or '—')}</div>
+  <div class="ticker">{html.escape(entity or '—')}
+    {f'<div class="scale">{badge}</div>' if badge else ''}
+  </div>
   <div>
     <p class="headline">{html.escape(_strip_ticker(primary['headline'] or '', entity))}</p>
     <div class="detail">{"".join(f"<span>{b}</span>" for b in bits)}</div>
