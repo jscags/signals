@@ -153,6 +153,33 @@ BUYBACK_VALUE_CONCEPTS = (
 # A repurchase tag simply stops appearing once a company stops buying, so the
 # newest observation can be years old: Watsco last tagged one for 2008 and
 # still files quarterly. Anything older than this is history, not news.
+# An ETF or a commodity pool "repurchases" shares continuously -- that is the
+# redemption half of the creation/redemption mechanism, not a decision anyone
+# made about the price. The XBRL is correct and the arithmetic is correct; the
+# category is wrong, so no plausibility band can catch it. ProShares Trust II
+# alone tagged $26.8bn against a 131m share count, which is the largest figure
+# the collector has ever produced.
+#
+# There is a proper answer -- the SEC assigns every filer a SIC code, and
+# commodity pools and investment offices sit in their own -- and it belongs in
+# a later pass, one request per issuer against data.sec.gov/submissions. This
+# pattern is the offline stand-in, and it was measured rather than guessed:
+# across the 322 issuers then holding a buyback event it matched 17 (5.3%),
+# every one a pooled vehicle, with no false positive. Deliberately narrow.
+# A bare FUND|TRUST would have caught Medical Properties Trust and RLJ Lodging
+# Trust, which are REITs running real buybacks, so it names sponsors and
+# vehicle types instead of those two words on their own.
+#
+# Known to fall through, and left alone rather than guessed at: non-traded
+# vehicles whose "share repurchase program" is really an investor redemption
+# facility -- Blackstone Real Estate Income Trust, MSC Income Fund. The SIC
+# lookup settles those; a name pattern cannot.
+FUND_VEHICLE = re.compile(
+    r"\b(ETF|ETNS?|PROSHARES|ISHARES|SPDR|GRAYSCALE|BITWISE|INVESCO DB"
+    r"|INDEX TRACKING|COMMODITY|CURRENCYSHARES|TRUST I{2,3})\b",
+    re.IGNORECASE,
+)
+
 BUYBACK_MAX_AGE_DAYS = 400
 
 # Reported periods are fiscal year-to-date, not discrete quarters -- one filer
@@ -731,11 +758,24 @@ def cluster_insiders(conn, issuer_cik, txn_date):
 
 
 def usd(value):
+    """Dollars at the precision a reader needs, over eight orders of magnitude.
+
+    The unit is chosen from the ROUNDED figure rather than the raw one, which
+    is the difference between "$1000K" and "$1.0M": a $999,999.75 purchase is
+    below the million mark by a quarter of a dollar and used to print in
+    thousands with four digits. Under a thousand it prints in whole dollars --
+    a $31 purchase is a real thing a director occasionally files, and "$0K" is
+    not a number.
+    """
     if value is None:
         return "undisclosed"
-    if value >= 1_000_000:
-        return f"${value / 1_000_000:.1f}M"
-    return f"${value / 1_000:.0f}K"
+    if value < 1_000:
+        return f"${value:,.0f}"
+    for unit, size in (("K", 1e3), ("M", 1e6), ("B", 1e9)):
+        scaled = value / size
+        if round(scaled, 0 if unit == "K" else 1) < 1000:
+            return f"${scaled:,.0f}K" if unit == "K" else f"${scaled:,.1f}{unit}"
+    return f"${value / 1e12:,.1f}T"
 
 
 # ---------------------------------------------------------------- significance
@@ -1138,6 +1178,11 @@ def buyback_pct(activity, shares_out):
     return pct if 0 < pct <= MAX_PLAUSIBLE_BUYBACK_PCT else None
 
 
+def is_fund_vehicle(name):
+    """True for a pooled vehicle whose "repurchases" are share redemptions."""
+    return bool(name and FUND_VEHICLE.search(name))
+
+
 def buyback_band(pct):
     if pct is None:
         return None
@@ -1156,6 +1201,11 @@ def handle_periodic(conn, row, listed):
     layout for every filer.
     """
     ticker, title = listed
+    # Checked before the XBRL request, not after: a fund is not a company whose
+    # management is saying anything, so there is nothing here worth a fetch.
+    if is_fund_vehicle(row["company"]) or is_fund_vehicle(title):
+        return 0
+
     activity = buyback_activity(conn, row["cik"])
     if not activity:
         return 0
@@ -1171,13 +1221,9 @@ def handle_periodic(conn, row, listed):
     if tier == 1:
         promote(conn, ticker, row["cik"], f"buyback ({pct:.1f}% of {basis})")
 
-    rate = "annualised " if activity.get("annualised") else ""
-    if pct is not None:
-        scale = f" — {rate}{pct:.1f}% of {basis}"
-    elif activity.get("value"):
-        scale = f" — {rate}{usd(activity['value'])}, share of company unknown"
-    else:
-        scale = ""
+    detail = {**activity, "pct_of_shares": pct, "pct_basis": basis,
+              "significance": band, "company": row["company"],
+              "form_type": row["form_type"]}
 
     # Keyed on the reporting period, not the accession: the same quarter is
     # reported again in the next 10-K, and that is one fact, not two.
@@ -1187,10 +1233,8 @@ def handle_periodic(conn, row, listed):
         entity=ticker,
         event_type="buyback",
         tier=tier,
-        headline=f"{ticker}: repurchased stock{scale} — {title}",
-        detail={**activity, "pct_of_shares": pct, "pct_basis": basis,
-                "significance": band,
-                "company": row["company"], "form_type": row["form_type"]},
+        headline=buyback_headline(ticker, detail),
+        detail=detail,
         filed=row["filed"],
     )
 
@@ -1912,6 +1956,56 @@ def refresh_stale_facts(conn, budget=STALE_REFRESH_BUDGET):
     return len(stale)
 
 
+def buyback_headline(entity, detail):
+    """The one place a buyback headline is written, so it cannot fork."""
+    pct, basis = detail.get("pct_of_shares"), detail.get("pct_basis")
+    rate = "annualised " if detail.get("annualised") else ""
+    if pct is not None:
+        scale = f" — {rate}{pct:.1f}% of {basis}"
+    elif detail.get("value"):
+        scale = f" — {rate}{usd(detail['value'])}, share of company unknown"
+    else:
+        scale = ""
+    return (f"{entity}: repurchased stock{scale}"
+            + (f" — {detail['company']}" if detail.get("company") else ""))
+
+
+def refresh_headlines(conn):
+    """Rewrite stored headlines with the current formatters.
+
+    A headline is written once, at collection, and then never again unless the
+    event happens to be rescored -- so a change to how a figure READS never
+    reaches the page. Fixing usd() so that $999,999.75 stops printing as
+    "$1000K" and a $31 purchase stops printing as "$0K" changed nothing at all
+    on the dashboard, because both strings were already baked into 561 stored
+    rows. This makes the headline a derived value: rebuilt from the detail that
+    is already stored, using whatever the formatters say today.
+
+    Nothing is refetched and no score is touched -- only the wording.
+    """
+    changed = 0
+    for row in conn.execute(
+        "SELECT id, entity, event_type, headline, detail FROM events"
+    ).fetchall():
+        detail = json.loads(row["detail"] or "{}")
+        if row["event_type"] == "insider_buy":
+            peers = detail.get("cluster_peers") or []
+            rebuilt = buy_headline(
+                row["entity"], detail, peers,
+                detail.get("bps_of_market_cap"),
+                len(peers) >= CLUSTER_MIN_INSIDERS,
+            )
+        elif row["event_type"] == "buyback":
+            rebuilt = buyback_headline(row["entity"], detail)
+        else:
+            continue  # deal filings quote no figures
+        if rebuilt != row["headline"]:
+            conn.execute("UPDATE events SET headline = ? WHERE id = ?",
+                         (rebuilt, row["id"]))
+            changed += 1
+    return changed
+
+
 def rescore_buybacks(conn):
     """Recompute stored buyback events from the current cache.
 
@@ -1920,6 +2014,20 @@ def rescore_buybacks(conn):
     after the rule that rejects such periods had already shipped. Repairing the
     cache is not enough; what was published has to be recomputed too.
     """
+    # Events for pooled vehicles are dropped rather than rescored: there is no
+    # figure that makes a fund redemption a buyback. The document stays recorded
+    # as processed, so nothing re-emits them, and the collector now declines
+    # them before it spends a request. Doing this here rather than leaving it to
+    # "the next run will be clean" is the whole lesson of the last four rule
+    # changes -- a guard that never reaches what is already stored isn't shipped.
+    dropped = 0
+    for row in conn.execute(
+        "SELECT id, detail FROM events WHERE event_type = 'buyback'"
+    ).fetchall():
+        if is_fund_vehicle(json.loads(row["detail"] or "{}").get("company")):
+            conn.execute("DELETE FROM events WHERE id = ?", (row["id"],))
+            dropped += 1
+
     fixed = 0
     for row in conn.execute(
         "SELECT id, entity, detail FROM events WHERE event_type = 'buyback'"
@@ -1937,24 +2045,15 @@ def rescore_buybacks(conn):
 
         band = buyback_band(pct)
         tier = 1 if (pct is not None and pct >= TIER1_BUYBACK_PCT) else 2
-        rate = "annualised " if (activity or {}).get("annualised") else ""
-        if pct is not None:
-            scale = f" — {rate}{pct:.1f}% of {basis}"
-        elif (activity or {}).get("value"):
-            scale = f" — {rate}{usd(activity['value'])}, share of company unknown"
-        else:
-            scale = ""
         merged = {**detail, **(activity or {}), "pct_of_shares": pct,
                   "pct_basis": basis, "significance": band}
         conn.execute(
             "UPDATE events SET tier = ?, headline = ?, detail = ? WHERE id = ?",
-            (tier,
-             f"{row['entity']}: repurchased stock{scale}"
-             + (f" — {detail['company']}" if detail.get("company") else ""),
+            (tier, buyback_headline(row["entity"], merged),
              json.dumps(merged, default=str), row["id"]),
         )
         fixed += 1
-    return fixed
+    return fixed, dropped
 
 
 def rescore(conn):
@@ -3037,10 +3136,22 @@ def main():
         return
 
     if args.rescore:
+        # Both halves. The flag has only ever rescored insider buys, so a
+        # buyback rule change could not be applied to stored events without a
+        # full collection run -- which needs the network, and needs the SEC to
+        # be answering, neither of which a repair should depend on.
         n, promoted = rescore(conn)
+        fixed, dropped = rescore_buybacks(conn)
+        reworded = refresh_headlines(conn)
         conn.commit()
         print(f"rescored {n} event(s)"
               + (f", {promoted} promoted to the watchlist" if promoted else ""))
+        if dropped:
+            print(f"dropped {dropped} fund redemption(s) miscounted as buybacks")
+        if fixed:
+            print(f"rescored {fixed} buyback event(s)")
+        if reworded:
+            print(f"reworded {reworded} headline(s)")
         if not args.html:
             return
 
@@ -3080,14 +3191,19 @@ def main():
     # skipped, and share counts come from the cache.
     drained = refresh_stale_facts(conn)
     fixed, newly_promoted = rescore(conn)
-    fixed_buybacks = rescore_buybacks(conn)
+    fixed_buybacks, dropped_funds = rescore_buybacks(conn)
+    reworded = refresh_headlines(conn)
     aged = prune_events(conn)
     retired = prune_watchlist(conn)
     conn.commit()
     if drained:
         print(f"re-derived {drained} stale issuer(s)")
+    if dropped_funds:
+        print(f"dropped {dropped_funds} fund redemption(s) miscounted as buybacks")
     if fixed_buybacks:
         print(f"rescored {fixed_buybacks} buyback event(s)")
+    if reworded:
+        print(f"reworded {reworded} headline(s)")
     if fixed:
         print(f"rescored {fixed} event(s)"
               + (f", {newly_promoted} promoted" if newly_promoted else ""))
