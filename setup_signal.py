@@ -176,9 +176,15 @@ def evaluate_setup(facts, today=None):
     # billings in one quarter, and a quarter-on-quarter reading would swing
     # between +200% and -60% on a business that is not changing at all.
     quarters = []
-    for when, liability in reversed(liabilities[-LOOKBACK_QUARTERS * 2:]):
-        if when > today:
-            continue
+    # Cut to the as-of date FIRST, then take the window. Slicing the raw series
+    # and filtering afterwards looks equivalent and is not: the last sixteen
+    # points of Axon's history are 2022-2026, so a backtest standing in 2016
+    # took a window entirely in its own future and discarded all of it, and
+    # every quarter came back "not enough overlapping history" off 63 perfectly
+    # good liability points. Live it worked, because the tail of the series IS
+    # the present -- which is exactly why only a backtest could show it.
+    asof_liabilities = [(w, v) for w, v in liabilities if w <= today]
+    for when, liability in reversed(asof_liabilities[-LOOKBACK_QUARTERS * 2:]):
         year_ago = date(when.year - 1, when.month, min(when.day, 28))
         prior_liability = _nearest(liabilities, year_ago)
         revenue = _nearest(revenues, when)
