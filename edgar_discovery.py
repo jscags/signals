@@ -318,6 +318,18 @@ TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
 
 _last_request = 0.0
 
+# Added to the interval between requests once the SEC has said 429, and kept
+# for the rest of the run. Backing off only for the retry treats throttling as
+# one unlucky request; it is the pace that was wrong, so the pace changes.
+_throttle_penalty = 0.0
+
+# How many times to wait and try again before giving up on one URL. The SEC
+# sends Retry-After sometimes; when it does not, these double from the base.
+THROTTLE_RETRIES = 3
+THROTTLE_BACKOFF = 4.0
+THROTTLE_PENALTY_STEP = 0.20
+MAX_THROTTLE_PENALTY = 1.50
+
 
 class FetchError(RuntimeError):
     """The request did not come back, and trying again later might fix it.
@@ -330,18 +342,59 @@ class FetchError(RuntimeError):
     """
 
 
+class Throttled(FetchError):
+    """The SEC said 429. Retryable, and the run should slow down permanently.
+
+    Distinct from a plain refusal because it is the one failure that says the
+    collector itself caused the problem. It used to fall through `fetch`'s
+    final `raise` as a bare HTTPError, which is not a FetchError, so nothing
+    upstream caught it: a single 429 anywhere in a 150-issuer refresh took the
+    whole daily run down instead of costing one issuer.
+    """
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 def fetch(url, binary=False):
-    """Rate-limited GET. Returns None on 404 (missing index = non-trading day)."""
-    global _last_request
+    """Rate-limited GET, retried through throttling.
+
+    Returns None on 404 (a missing index is a non-trading day, not a failure).
+    A 429 is waited out rather than raised on the first sight of it, because
+    the SEC's limit is a moving target and a bulk pass -- 150 companyfacts in
+    a refresh, more in a probe -- will find it sooner or later.
+    """
     if not USER_AGENT:
         sys.exit(
             "EDGAR_USER_AGENT is not set. The SEC rejects requests without a\n"
             'declared contact. Example: export EDGAR_USER_AGENT="Jane Doe jane@ex.com"'
         )
 
+    for attempt in range(THROTTLE_RETRIES + 1):
+        try:
+            return _fetch_once(url, binary)
+        except Throttled as exc:
+            if attempt == THROTTLE_RETRIES:
+                raise FetchError(
+                    f"SEC returned 429 for {url} after "
+                    f"{THROTTLE_RETRIES + 1} attempts; the run is being "
+                    f"throttled faster than it can back off"
+                ) from exc
+            wait = exc.retry_after or THROTTLE_BACKOFF * (2 ** attempt)
+            print(f"WARNING: SEC returned 429; waiting {wait:.0f}s "
+                  f"(attempt {attempt + 1}/{THROTTLE_RETRIES})", flush=True)
+            time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def _fetch_once(url, binary=False):
+    global _last_request, _throttle_penalty
+
+    interval = MIN_REQUEST_INTERVAL + _throttle_penalty
     elapsed = time.time() - _last_request
-    if elapsed < MIN_REQUEST_INTERVAL:
-        time.sleep(MIN_REQUEST_INTERVAL - elapsed)
+    if elapsed < interval:
+        time.sleep(interval - elapsed)
     _last_request = time.time()
 
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -360,6 +413,14 @@ def fetch(url, binary=False):
                 f"Usually a malformed User-Agent or rate limiting.\n"
                 f"Current value: {USER_AGENT!r}"
             ) from exc
+        if exc.code == 429:
+            # Slow every later request too, not just the retry of this one.
+            # Throttling says the pace was wrong, and the next thousand
+            # requests are the ones that have to live with the answer.
+            _throttle_penalty = min(_throttle_penalty + THROTTLE_PENALTY_STEP,
+                                    MAX_THROTTLE_PENALTY)
+            raise Throttled(f"SEC returned 429 for {url}",
+                            retry_after=_retry_after(exc)) from exc
         if exc.code >= 500:
             raise FetchError(f"SEC returned {exc.code} for {url}") from exc
         # Anything else in the 4xx range is a bug in the request, not weather.
@@ -369,6 +430,19 @@ def fetch(url, binary=False):
         # timeouts, resets, a proxy declining. Same treatment as a refusal.
         raise FetchError(f"could not reach {url}: {exc}") from exc
     return raw if binary else raw.decode("utf-8", errors="replace")
+
+
+def _retry_after(exc, ceiling=120.0):
+    """Seconds the server asked us to wait, if it named a number.
+
+    Capped: a Retry-After of an hour is not something a daily run can honour,
+    and waiting it out would be indistinguishable from hanging.
+    """
+    try:
+        value = float((exc.headers or {}).get("Retry-After", ""))
+    except (TypeError, ValueError):
+        return None
+    return min(value, ceiling) if value > 0 else None
 
 
 USASPENDING_SEARCH = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
@@ -1643,6 +1717,11 @@ def probe_setup_population(sample=150):
     print(f"\n{'outcome':>20}  count   share")
     for key, count in tally.items():
         print(f"{key:>20}  {count:>5}  {count / len(picked) * 100:>5.1f}%")
+
+    # "no facts" covers both an issuer that tags nothing and one the SEC
+    # refused us, and those mean opposite things about the measurement. A
+    # sample thinned by throttling is a smaller sample, not a finding.
+    report_degraded()
 
     reporting = tally["SETUP"] + tally["streak too short"]
     if reporting:
