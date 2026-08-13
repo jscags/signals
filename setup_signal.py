@@ -61,8 +61,24 @@ MIN_CONSECUTIVE_QUARTERS = 3
 MIN_GROWTH_GAP_PP = 5.0
 
 # Ignore quarters where revenue is tiny: a pre-revenue company can post any
-# growth ratio at all and none of it means what this metric means.
-MIN_QUARTERLY_REVENUE_USD = 1_000_000
+# growth ratio at all and none of it means what this metric means. The first
+# population probe at $1m returned an antimony miner, a micro-cap e-commerce
+# roll-up and a near-pre-revenue device company -- businesses small enough
+# that one contract moves the balance sheet.
+MIN_QUARTERLY_REVENUE_USD = 10_000_000
+
+# The liability must matter to the business. This is the threshold that does
+# the real work, and it is not a size filter: Dave & Buster's fired on eight
+# consecutive quarters at $559m of revenue, where the "deferred revenue" is
+# unredeemed gift cards worth 3% of a quarter. Paychex's is payroll float,
+# Bristol Myers' is rebate and return accruals. A 5pp growth gap on a rounding
+# item is arithmetic, not a business changing shape.
+#
+# Measured, not guessed. Across a 250-issuer sample the hits split at almost
+# exactly this line -- customer prepayments above it, accounting residue below
+# -- and Axon over the quarters that mattered ran 0.63 to 0.93, so the floor
+# sits far below the case the metric was built to find.
+MIN_LIABILITY_TO_REVENUE = 0.15
 
 # A balance more than this far from its quarter end is not that quarter's.
 QUARTER_MATCH_TOLERANCE_DAYS = 45
@@ -225,6 +241,7 @@ def evaluate_setup(facts, today=None):
             "liability_growth_pct": round(lg, 1),
             "revenue_growth_pct": round(rg, 1),
             "gap_pp": round(lg - rg, 1),
+            "liability_to_revenue": round(liability / revenue, 3),
         })
         if len(quarters) >= LOOKBACK_QUARTERS:
             break
@@ -236,18 +253,33 @@ def evaluate_setup(facts, today=None):
     # Consecutive from the most recent quarter backwards. A gap that closed two
     # quarters ago is a condition that has stopped being true, and saying so
     # requires counting from the present rather than anywhere in the window.
+    #
+    # Both conditions have to hold in the same quarter, so materiality is part
+    # of the streak rather than a filter applied before it. Filtering first
+    # would let a company whose liability used to matter keep a streak running
+    # on quarters where it no longer does.
     streak = 0
+    immaterial = False
     for q in quarters:
+        if q["liability_to_revenue"] < MIN_LIABILITY_TO_REVENUE:
+            immaterial = streak == 0
+            break
         if q["gap_pp"] >= MIN_GROWTH_GAP_PP:
             streak += 1
         else:
             break
 
     if streak < MIN_CONSECUTIVE_QUARTERS:
+        if immaterial:
+            reason = (f"contract liability is only "
+                      f"{quarters[0]['liability_to_revenue']:.0%} of quarterly "
+                      f"revenue, below the {MIN_LIABILITY_TO_REVENUE:.0%} floor")
+        else:
+            reason = (f"liability outgrew revenue for {streak} quarter(s), "
+                      f"needs {MIN_CONSECUTIVE_QUARTERS}")
         return {
             "setup": False,
-            "reason": (f"liability outgrew revenue for {streak} quarter(s), "
-                       f"needs {MIN_CONSECUTIVE_QUARTERS}"),
+            "reason": reason,
             "quarters": quarters,
             "streak": streak,
         }

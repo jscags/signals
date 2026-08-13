@@ -1639,7 +1639,8 @@ def probe_setup(cik=1069183, start_year=2013, end_year=2018):
     print("thresholds in force: "
           f"{setup_signal.MIN_CONSECUTIVE_QUARTERS} consecutive quarters, "
           f"{setup_signal.MIN_GROWTH_GAP_PP}pp gap, "
-          f"${setup_signal.MIN_QUARTERLY_REVENUE_USD:,.0f} revenue floor")
+          f"${setup_signal.MIN_QUARTERLY_REVENUE_USD:,.0f} revenue floor, "
+          f"{setup_signal.MIN_LIABILITY_TO_REVENUE:.0%} liability materiality")
 
     # The evidence, so a threshold can be moved on numbers rather than feel.
     latest = setup_signal.evaluate_setup(facts, today=date(end_year, 12, 31))
@@ -1679,7 +1680,8 @@ def probe_setup_population(sample=150):
     print("thresholds in force: "
           f"{setup_signal.MIN_CONSECUTIVE_QUARTERS} consecutive quarters, "
           f"{setup_signal.MIN_GROWTH_GAP_PP}pp gap, "
-          f"${setup_signal.MIN_QUARTERLY_REVENUE_USD:,.0f} revenue floor\n")
+          f"${setup_signal.MIN_QUARTERLY_REVENUE_USD:,.0f} revenue floor, "
+          f"{setup_signal.MIN_LIABILITY_TO_REVENUE:.0%} liability materiality\n")
 
     tally = {"no facts": 0, "no liability tag": 0, "no history": 0,
              "streak too short": 0, "SETUP": 0}
