@@ -739,6 +739,9 @@ def connect():
         "issuer_facts": (("derived_v", "INTEGER"), ("public_float", "REAL"),
                          ("float_as_of", "TEXT")),
         "issuer_buybacks": (("derived_v", "INTEGER"),),
+        # n_docs alone cannot answer the only question anyone asks of this
+        # table. See log_run().
+        "run_log": (("n_candidates", "INTEGER"), ("n_skipped", "INTEGER")),
     }
     for table, columns in wanted.items():
         present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -1567,11 +1570,31 @@ def format_bps(bps):
 # ---------------------------------------------------------------- run
 
 
-def log_run(conn, day, status, n_docs, n_events, started):
+def log_run(conn, day, status, n_docs, n_events, started,
+            n_candidates=0, n_skipped=0):
+    """Record what a day's pass did, in terms that survive being read later.
+
+    n_docs counts NEWLY fetched documents, and the workflow rescans a three-day
+    window twice a day, so the second pass over a day legitimately fetches
+    nothing. Stored alone that is indistinguishable from a collector that found
+    nothing at all -- both read `docs=0 events=0` against status `ok` -- and
+    the two call for opposite responses. Every row in this table looked like a
+    dead pipeline, and at least once was read as one.
+
+    The denominators settle it. n_candidates is how many filings in the day's
+    index were of a form we collect; n_skipped is how many of those were
+    already in the documents table. docs=0 with candidates=1300 skipped=1300 is
+    a day fully collected; docs=0 with candidates=0 is a day with nothing in it;
+    docs=0 with candidates=1300 skipped=0 is the pipeline actually being dry.
+    """
     conn.execute(
-        """INSERT OR REPLACE INTO run_log VALUES (?,?,?,?,?,?,?)""",
+        """INSERT OR REPLACE INTO run_log
+           (run_date, source, status, n_docs, n_events, started_at, finished_at,
+            n_candidates, n_skipped)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
         (day.isoformat(), "edgar_daily", status, n_docs, n_events, started,
-         datetime.utcnow().isoformat(timespec="seconds")),
+         datetime.utcnow().isoformat(timespec="seconds"),
+         n_candidates, n_skipped),
     )
     conn.commit()
 
@@ -1601,7 +1624,8 @@ def run_day(conn, day, tickers, limit=None):
     if not rows:
         print(f"{day}  WARNING: index fetched ({len(body):,} bytes) but parsed "
               f"to 0 rows — the file format may have changed")
-    n_docs = n_events = refused = 0
+    n_docs = n_events = refused = n_skipped = 0
+    seen = set()          # accessions this pass recorded
     status = "ok"
     # Unique accessions, not index rows. EDGAR lists a filing once per filer,
     # so a Form 4 appears under both the issuer and the reporting owner -- about
@@ -1630,6 +1654,14 @@ def run_day(conn, day, tickers, limit=None):
         if (is_ma or is_periodic) and not listed:
             continue
         if already_processed(conn, row["accession"]):
+            # Only count it as skipped if an EARLIER pass collected it. EDGAR
+            # lists a Form 4 under both the issuer and the reporting owner, so
+            # the second row for an accession this pass just recorded would
+            # otherwise register as "already collected" -- putting skips on a
+            # day that was in fact freshly collected, which is exactly the
+            # confusion this column exists to remove.
+            if row["accession"] not in seen:
+                n_skipped += 1
             continue
 
         if is_form4:
@@ -1661,11 +1693,29 @@ def run_day(conn, day, tickers, limit=None):
              day.isoformat(), row["path"],
              datetime.utcnow().isoformat(timespec="seconds")),
         )
+        seen.add(row["accession"])
         n_docs += 1
 
-    log_run(conn, day, status, n_docs, n_events, started)
+    log_run(conn, day, status, n_docs, n_events, started,
+            n_candidates=n_candidates, n_skipped=n_skipped)
+
+    # n_skipped counts index ROWS, n_candidates counts unique accessions, and
+    # EDGAR lists a Form 4 under both the issuer and the reporting owner. So a
+    # fully-collected day skips more rows than it had candidates, and comparing
+    # the two directly would read as a miscount. Nothing new and nothing
+    # refused is what "already collected" actually looks like.
+    if n_docs == 0:
+        if n_candidates == 0:
+            why = " — nothing of interest filed"
+        elif n_skipped and not refused:
+            why = f" — all {n_candidates} already collected on an earlier pass"
+        else:
+            why = " — NOTHING COLLECTED, and not because it was already done"
+    else:
+        why = ""
+
     print(f"{day}  {len(rows):,} filings in index, {n_candidates} of interest, "
-          f"{n_docs} processed, {n_events} events"
+          f"{n_docs} processed, {n_events} events{why}"
           + ("  [partial: refused]" if status == "partial" else ""))
     return "ok"
 
@@ -3068,7 +3118,10 @@ def write_html(conn, path="dashboard.html"):
     sections = [render_controls(grouped)] + sections
 
     covered = ", ".join(r["run_date"] for r in runs) or "no runs yet"
-    docs = sum(r["n_docs"] or 0 for r in runs)
+    # Candidates, not n_docs. n_docs counts what a pass newly fetched, which is
+    # zero on every rescan of a day already collected -- so the line read
+    # "0 filings scanned" on a dashboard built from 3,900 of them.
+    docs = sum(r["n_candidates"] or 0 for r in runs)
 
     watched = watchlist_rows(conn)
     if watched:
