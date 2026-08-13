@@ -741,7 +741,8 @@ def connect():
         "issuer_buybacks": (("derived_v", "INTEGER"),),
         # n_docs alone cannot answer the only question anyone asks of this
         # table. See log_run().
-        "run_log": (("n_candidates", "INTEGER"), ("n_skipped", "INTEGER")),
+        "run_log": (("n_candidates", "INTEGER"), ("n_skipped", "INTEGER"),
+                    ("n_refused", "INTEGER")),
     }
     for table, columns in wanted.items():
         present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -834,6 +835,28 @@ def usd(value):
     return f"${value / 1e12:,.1f}T"
 
 
+# Failures that are correct to survive individually and alarming in bulk.
+#
+# An issuer whose XBRL will not load is reported without a denominator, which
+# is the right call for one filing -- the purchase still happened and is still
+# worth seeing. But nothing anywhere counted them, so the difference between
+# "three issuers tag nothing" and "data.sec.gov refused four hundred times"
+# was a dashboard with more unscored cards than usual and no way to tell which
+# it was. Tallied here and printed once at the end of a run.
+DEGRADED = collections.Counter()
+
+
+def note_degraded(kind):
+    DEGRADED[kind] += 1
+
+
+def report_degraded():
+    """One line per kind of survivable failure, or silence if there were none."""
+    for kind, n in sorted(DEGRADED.items(), key=lambda kv: -kv[1]):
+        print(f"  degraded: {n} × {kind}")
+    DEGRADED.clear()
+
+
 # ---------------------------------------------------------------- significance
 
 
@@ -855,13 +878,17 @@ def company_facts(cik):
         body = fetch(url)
     except RuntimeError:
         # A refusal on an optional enrichment must not end the run; the filing
-        # is still worth reporting without its denominator.
+        # is still worth reporting without its denominator. Counted, though --
+        # one is weather, four hundred is the SEC shutting us out, and until
+        # now both looked like issuers that simply tag nothing.
+        note_degraded("issuer XBRL unavailable (companyfacts)")
         return None
     if not body:
         return None
     try:
         return json.loads(body)
     except json.JSONDecodeError:
+        note_degraded("issuer XBRL unreadable (companyfacts)")
         return None
 
 
@@ -1012,12 +1039,14 @@ def xbrl_concept(cik, taxonomy, tag):
     try:
         body = fetch(url)
     except RuntimeError:
+        note_degraded("issuer XBRL unavailable (companyconcept)")
         return None
     if not body:
         return None
     try:
         return json.loads(body)
     except json.JSONDecodeError:
+        note_degraded("issuer XBRL unreadable (companyconcept)")
         return None
 
 
@@ -1571,7 +1600,7 @@ def format_bps(bps):
 
 
 def log_run(conn, day, status, n_docs, n_events, started,
-            n_candidates=0, n_skipped=0):
+            n_candidates=0, n_skipped=0, n_refused=0):
     """Record what a day's pass did, in terms that survive being read later.
 
     n_docs counts NEWLY fetched documents, and the workflow rescans a three-day
@@ -1586,15 +1615,19 @@ def log_run(conn, day, status, n_docs, n_events, started,
     already in the documents table. docs=0 with candidates=1300 skipped=1300 is
     a day fully collected; docs=0 with candidates=0 is a day with nothing in it;
     docs=0 with candidates=1300 skipped=0 is the pipeline actually being dry.
+
+    n_refused is the day's TOTAL refusals. run_day also keeps a consecutive
+    count for the circuit breaker, but that one resets on every success, so a
+    day quietly losing every third filing tripped nothing and recorded nothing.
     """
     conn.execute(
         """INSERT OR REPLACE INTO run_log
            (run_date, source, status, n_docs, n_events, started_at, finished_at,
-            n_candidates, n_skipped)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+            n_candidates, n_skipped, n_refused)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (day.isoformat(), "edgar_daily", status, n_docs, n_events, started,
          datetime.utcnow().isoformat(timespec="seconds"),
-         n_candidates, n_skipped),
+         n_candidates, n_skipped, n_refused),
     )
     conn.commit()
 
@@ -1624,7 +1657,7 @@ def run_day(conn, day, tickers, limit=None):
     if not rows:
         print(f"{day}  WARNING: index fetched ({len(body):,} bytes) but parsed "
               f"to 0 rows — the file format may have changed")
-    n_docs = n_events = refused = n_skipped = 0
+    n_docs = n_events = refused = n_skipped = n_refused = 0
     seen = set()          # accessions this pass recorded
     status = "ok"
     # Unique accessions, not index rows. EDGAR lists a filing once per filer,
@@ -1671,7 +1704,14 @@ def run_day(conn, day, tickers, limit=None):
                 # retries it, and watch for a run of them: once the SEC starts
                 # saying no, asking three thousand more times is the wrong
                 # thing to do. Tripping the breaker keeps what we already have.
+                #
+                # Two counters, because they answer different questions.
+                # `refused` is CONSECUTIVE and resets below on any success, so
+                # it only ever describes a stretch -- which meant a day losing
+                # every third filing reported nothing at all, forever. n_refused
+                # is the day's total and is what gets written down.
                 refused += 1
+                n_refused += 1
                 if refused >= MAX_CONSECUTIVE_REFUSALS:
                     status = "partial"
                     print(f"  (stopped after {refused} consecutive refusals; "
@@ -1697,7 +1737,8 @@ def run_day(conn, day, tickers, limit=None):
         n_docs += 1
 
     log_run(conn, day, status, n_docs, n_events, started,
-            n_candidates=n_candidates, n_skipped=n_skipped)
+            n_candidates=n_candidates, n_skipped=n_skipped,
+            n_refused=n_refused)
 
     # n_skipped counts index ROWS, n_candidates counts unique accessions, and
     # EDGAR lists a Form 4 under both the issuer and the reporting owner. So a
@@ -1716,6 +1757,7 @@ def run_day(conn, day, tickers, limit=None):
 
     print(f"{day}  {len(rows):,} filings in index, {n_candidates} of interest, "
           f"{n_docs} processed, {n_events} events{why}"
+          + (f", {n_refused} refused" if n_refused else "")
           + ("  [partial: refused]" if status == "partial" else ""))
     return "ok"
 
@@ -3294,6 +3336,10 @@ def main():
         days = [market_today()]
 
     outcomes = [run_day(conn, day, tickers, limit=args.limit) for day in days]
+    # Printed after the days rather than inside them: these are enrichment
+    # failures, they cross day boundaries via the issuer cache, and a per-day
+    # tally would read as noise where a single total reads as a symptom.
+    report_degraded()
     if outcomes and all(o == "unavailable" for o in outcomes):
         # One refused index is a publication gap; every index refused is us.
         sys.exit(
