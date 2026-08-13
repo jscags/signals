@@ -203,6 +203,38 @@ FUND_VEHICLE = re.compile(
     re.IGNORECASE,
 )
 
+# The second family: non-traded REITs, BDCs and commodity trusts. Same category
+# error as an ETF and a different set of names, so a separate pattern.
+#
+# These run a continuous share repurchase programme as a standing liquidity
+# feature -- it is how an investor gets money out of a vehicle with no
+# secondary market. The quarterly figure is a redemption queue clearing, not a
+# board deciding the stock is cheap, and it turns up looking enormous because
+# the denominator is small: Hashdex Commodities Trust at "31.8% of public
+# float", Starwood at 4.8% of shares outstanding, every quarter, forever.
+#
+# The right discriminator is the SEC's SIC code, which needs one request per
+# issuer against data.sec.gov/submissions and belongs in the same later pass as
+# the ETF version of this. Measured offline instead, over the 250 issuers then
+# holding a buyback event: 9 matched (3.6%), every one a non-traded vehicle.
+#
+# One candidate pattern was tried and DROPPED: \bPROPERT\w+ TRUST\b would have
+# caught Medical Properties Trust, which is NYSE-listed and buys back stock for
+# the ordinary reason. That is the whole hazard here -- listed REITs and
+# non-traded REITs share most of their vocabulary, and only the specific
+# constructions below separate them.
+#
+# Known to fall through: Franklin BSP Capital Corp, a non-traded BDC whose name
+# carries no marker at all. Left alone rather than guessed at.
+NONTRADED_VEHICLE = re.compile(
+    r"\bREIT\b"                       # Lightstone Value Plus REIT IV
+    r"|\bBDC\b"                       # Kayne Anderson BDC
+    r"|\bINCOME\s+TRUST\b"            # Ares / Blackstone / Starwood Real Estate
+    r"|\bCOMMODIT\w*\s+TRUST\b"       # Hashdex Commodities Trust
+    r"|\bTRUST\s+(?:I{1,3}|IV|VI{0,3}|IX|XI{0,3})\b",   # Strategic Storage VI
+    re.IGNORECASE,
+)
+
 BUYBACK_MAX_AGE_DAYS = 400
 
 # Reported periods are fiscal year-to-date, not discrete quarters -- one filer
@@ -1294,8 +1326,16 @@ def buyback_pct(activity, shares_out):
 
 
 def is_fund_vehicle(name):
-    """True for a pooled vehicle whose "repurchases" are share redemptions."""
-    return bool(name and FUND_VEHICLE.search(name))
+    """True for a pooled vehicle whose "repurchases" are share redemptions.
+
+    Covers both families: exchange-traded funds and commodity pools, and
+    non-traded REITs and BDCs. They differ in how they are named and not at all
+    in why they are wrong here -- neither is a company whose board decided its
+    own stock was cheap.
+    """
+    if not name:
+        return False
+    return bool(FUND_VEHICLE.search(name) or NONTRADED_VEHICLE.search(name))
 
 
 def buyback_band(pct):
