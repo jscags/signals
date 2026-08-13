@@ -367,36 +367,67 @@ def http_text(url, agent=None):
 
 def load_ticker_map():
     """CIK -> (ticker, title). Doubles as the listed-company filter: any CIK
-    absent from this file is a fund, private filer, or foreign entity."""
+    absent from this file is a fund, private filer, or foreign entity.
+
+    This map is load-bearing in a way that is easy to miss. M&A and buyback
+    detection both gate on the filer being in it, so an EMPTY map does not
+    produce an empty run -- it produces a run that quietly drops two of the
+    three collectors and keeps going, because Form 4 resolves its issuer after
+    parsing and carries on regardless. The old code returned {} when the fetch
+    failed and there was no cache, which is exactly that: about a third of the
+    normal output, no error anywhere, and a log that reads like a quiet day.
+
+    So the three outcomes are now separated. A usable cache is used. A stale
+    cache that could not be refreshed is used, loudly. Nothing usable at all is
+    fatal, because every downstream answer would be a lie of omission.
+    """
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, "company_tickers.json")
+    cached = os.path.exists(path)
 
-    stale = (
-        not os.path.exists(path)
-        or time.time() - os.path.getmtime(path) > 7 * 86400
-    )
+    stale = not cached or time.time() - os.path.getmtime(path) > 7 * 86400
     if stale:
         try:
             body = fetch(TICKER_MAP_URL)
-        except RuntimeError:
-            # Same reasoning as the document fetch: a refusal here degrades
-            # M&A filtering, which main() already warns about, and is not
-            # worth ending the run over.
-            body = None
-        if body:
+            if not body:
+                raise FetchError(f"{TICKER_MAP_URL} returned nothing")
             with open(path, "w") as fh:
                 fh.write(body)
+        except RuntimeError as exc:
+            if not cached:
+                raise FetchError(
+                    f"could not load the ticker map and no cached copy exists: {exc}\n"
+                    "Without it every M&A and buyback filing is discarded as "
+                    "unlisted, so the run would silently collect insider buys "
+                    "only. Refusing to run rather than under-report."
+                ) from exc
+            age = (time.time() - os.path.getmtime(path)) / 86400
+            print(f"WARNING: ticker map refresh failed ({exc}); "
+                  f"falling back to the cached copy, {age:.0f} days old")
 
-    if not os.path.exists(path):
-        return {}
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        # A half-written cache from an interrupted run reads as valid JSON far
+        # less often than it reads as a truncated file. Either way it is not a
+        # ticker map, and pretending otherwise is the silent path again.
+        raise FetchError(f"the cached ticker map at {path} is unreadable: {exc}\n"
+                         "Delete it and rerun to fetch a fresh copy.") from exc
 
-    with open(path) as fh:
-        data = json.load(fh)
+    tickers = {}
+    for row in data.values():
+        try:
+            tickers[int(row["cik_str"])] = (row["ticker"], row["title"])
+        except (KeyError, TypeError, ValueError):
+            continue
 
-    return {
-        int(row["cik_str"]): (row["ticker"], row["title"])
-        for row in data.values()
-    }
+    if not tickers:
+        raise FetchError(
+            f"the ticker map at {path} parsed to zero companies.\n"
+            "The SEC's schema for company_tickers.json has probably changed."
+        )
+    return tickers
 
 
 # ---------------------------------------------------------------- daily index
@@ -461,9 +492,31 @@ def accession_from_path(path):
 # ---------------------------------------------------------------- form 4
 
 
+class MalformedFiling(RuntimeError):
+    """The document arrived but could not be read.
+
+    Distinct from FetchError, which means it never arrived, and distinct from
+    a filing that simply holds nothing we want. This one is a defect -- ours,
+    or a schema change at the SEC -- and the caller must not record the
+    accession as processed on the strength of it.
+    """
+
+
 def extract_ownership_xml(submission_text):
-    """A full submission .txt bundles several <DOCUMENT> blocks. The ownership
-    XML is the one whose root is <ownershipDocument>."""
+    """The ownership XML out of a full submission .txt, or None if it has none.
+
+    A submission bundles several <DOCUMENT> blocks and only one of them is the
+    Form 4 itself. Returning None means "this submission carries no ownership
+    document" -- a real and unremarkable answer, since the caller fetches by
+    form type and EDGAR occasionally files something else under it.
+
+    A block that announces itself as an ownershipDocument and then fails to
+    parse is a different matter and now raises. Swallowing it returned None,
+    which parse_form4 turned into [], which handle_form4 returned as 0 -- and 0
+    means "read it, nothing there", so the accession was recorded as processed
+    and the filing was never fetched again. One unreadable byte and a purchase
+    disappeared permanently, silently, with no way to find it afterwards.
+    """
     for block in re.findall(r"<XML>(.*?)</XML>", submission_text, re.S):
         block = block.strip()
         if "<ownershipDocument" not in block:
@@ -472,8 +525,8 @@ def extract_ownership_xml(submission_text):
         start = block.find("<ownershipDocument")
         try:
             return ElementTree.fromstring(block[start:])
-        except ElementTree.ParseError:
-            continue
+        except ElementTree.ParseError as exc:
+            raise MalformedFiling(f"ownership XML did not parse: {exc}") from exc
     return None
 
 
@@ -1754,7 +1807,17 @@ def handle_form4(conn, row, tickers):
     if not text:
         return 0
 
-    buys = parse_form4(extract_ownership_xml(text))
+    try:
+        buys = parse_form4(extract_ownership_xml(text))
+    except MalformedFiling as exc:
+        # Says nothing about the contents, so it takes the same lane as a
+        # refusal: unrecorded, retried next run, and counted toward the breaker
+        # -- which is what makes a schema change stop the run instead of
+        # quietly emptying it one filing at a time. Printed here rather than
+        # left to the breaker, because a single one of these is already a fact
+        # worth seeing and the breaker only speaks at twenty.
+        print(f"  MALFORMED {row['accession']} ({row['company']}): {exc}")
+        return None
     if not buys:
         return 0
 
@@ -3164,10 +3227,11 @@ def main():
         print(f"wrote {path} ({n} open events)")
         return
 
+    # No emptiness check here any more: load_ticker_map() either returns a
+    # populated map or raises. The warning that used to sit here called the
+    # situation "degraded", which undersold it -- an empty map does not degrade
+    # M&A filtering, it discards every M&A and buyback filing as unlisted.
     tickers = load_ticker_map()
-    if not tickers:
-        print("warning: ticker map unavailable; M&A filtering degraded",
-              file=sys.stderr)
 
     if args.backfill:
         days = business_days_back(args.backfill)
