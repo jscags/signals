@@ -1148,7 +1148,7 @@ def _period_days(point):
 
 
 def recent_flow(payload, today=None):
-    """The most recent usable period from a flow concept, annualised.
+    """The most recent usable period from a flow concept, as reported.
 
     Picks one observation rather than summing: the reported periods are fiscal
     year-to-date and overlap each other, so adding them would count the same
@@ -1178,19 +1178,22 @@ def recent_flow(payload, today=None):
     if not point["val"]:
         return None  # a tagged zero is not a buyback
 
-    # Only scale a genuine part-year. An XBRL period counts both endpoints, so
-    # a full fiscal year measures 364 days start-to-end, and scaling that by
-    # 365/364 would inflate every annual figure by a quarter of a percent for
-    # no reason. The threshold matches the annualised flag below, so the number
-    # and the label can never disagree.
-    part_year = span < 300
+    # NOT annualised. Scaling a half-year by two asserts the company will keep
+    # repurchasing at the same rate, which the filing does not say and the data
+    # cannot support -- a board authorisation is a ceiling, not a run-rate, and
+    # programmes are routinely front-loaded or paused. Grindr's six months at
+    # 21.9% of its shares became "annualised 43.9%", a figure no company has
+    # ever posted, and the doubling was ours.
+    #
+    # The period is reported instead, so a reader can do the extrapolation
+    # themselves if they want it and can see what they are extrapolating from.
     return {
-        "value": point["val"] * 365.0 / span if part_year else point["val"],
+        "value": point["val"],
         "reported": point["val"],
         "start": point["start"],
         "end": point["end"],
         "period_days": span,
-        "annualised": part_year,
+        "annualised": 0,   # retired; kept so old rows and the schema still read
         "unit": point["unit"],
     }
 
@@ -1239,7 +1242,7 @@ def _first_flow_from(facts, concepts):
 
 
 def buyback_activity(conn, cik):
-    """Annualised repurchases for an issuer, cached like any other slow fact.
+    """Repurchases for an issuer as reported, cached like any other slow fact.
 
     Both this and the share count come out of one companyfacts document, so
     whichever is asked for first pays the single request and the other is
@@ -1259,7 +1262,49 @@ def buyback_activity(conn, cik):
 
     if not row or not (row["shares"] or row["value"]):
         return None
-    return dict(row)
+    activity = dict(row)
+    # Derived rather than stored: the reporting period is already here as two
+    # dates, and the length is what the headline needs now that the figure is
+    # no longer scaled to a year. Deriving it also reaches rows written before
+    # anything wanted it.
+    activity["period_days"] = _span_days(row["period_start"], row["period_end"])
+    return activity
+
+
+def _span_days(start, end):
+    try:
+        return (date.fromisoformat(end) - date.fromisoformat(start)).days
+    except (TypeError, ValueError):
+        return None
+
+
+def unannualise_buybacks(conn):
+    """Undo the scaling on cached rows written while it was still applied.
+
+    Exact arithmetic, no refetch: a part-year figure was multiplied by
+    365/span, so dividing by the same factor recovers what the issuer actually
+    filed. Doing it this way rather than by bumping XBRL_DERIVATION matters --
+    that would force a fresh companyfacts request for every issuer, and the
+    number needed to change today.
+    """
+    fixed = 0
+    for row in conn.execute(
+        "SELECT cik, shares, value, period_start, period_end FROM issuer_buybacks "
+        "WHERE annualised = 1"
+    ).fetchall():
+        span = _span_days(row["period_start"], row["period_end"])
+        if not span or span >= 300:
+            continue
+        factor = 365.0 / span
+        conn.execute(
+            "UPDATE issuer_buybacks SET shares = ?, value = ?, annualised = 0 "
+            "WHERE cik = ?",
+            (row["shares"] / factor if row["shares"] else row["shares"],
+             row["value"] / factor if row["value"] else row["value"],
+             row["cik"]),
+        )
+        fixed += 1
+    return fixed
 
 
 def public_float(conn, cik):
@@ -2218,11 +2263,12 @@ def refresh_stale_facts(conn, budget=STALE_REFRESH_BUDGET):
 def buyback_headline(entity, detail):
     """The one place a buyback headline is written, so it cannot fork."""
     pct, basis = detail.get("pct_of_shares"), detail.get("pct_basis")
-    rate = "annualised " if detail.get("annualised") else ""
+    days = detail.get("period_days")
+    over = f" over {days} days" if days else ""
     if pct is not None:
-        scale = f" — {rate}{pct:.1f}% of {basis}"
+        scale = f" — {pct:.1f}% of {basis}{over}"
     elif detail.get("value"):
-        scale = f" — {rate}{usd(detail['value'])}, share of company unknown"
+        scale = f" — {usd(detail['value'])}{over}, share of company unknown"
     else:
         scale = ""
     return (f"{entity}: repurchased stock{scale}"
@@ -2388,7 +2434,13 @@ def rescore_buybacks(conn):
         pct, basis = buyback_measure(
             activity, shares_outstanding(conn, cik), public_float(conn, cik)
         )
-        if pct == detail.get("pct_of_shares") and basis == detail.get("pct_basis"):
+        # period_days joins the skip test because the figure is no longer
+        # annualised, so the period is what tells a reader whether 30% is a
+        # year of buying or six months of it. A row whose percentage happens to
+        # be unchanged still needs it merged in the first time.
+        if (pct == detail.get("pct_of_shares")
+                and basis == detail.get("pct_basis")
+                and detail.get("period_days") == (activity or {}).get("period_days")):
             continue
 
         band = buyback_band(pct)
@@ -3668,6 +3720,7 @@ def main():
     # repair its own output. Cheap after the first pass -- sane scores are
     # skipped, and share counts come from the cache.
     drained = refresh_stale_facts(conn)
+    unscaled = unannualise_buybacks(conn)
     flagged = flag_suspect_transactions(conn)
     renamed, retired_funds = repair_placeholder_tickers(conn, tickers)
     fixed, newly_promoted = rescore(conn)
@@ -3678,6 +3731,8 @@ def main():
     conn.commit()
     if drained:
         print(f"re-derived {drained} stale issuer(s)")
+    if unscaled:
+        print(f"un-annualised {unscaled} cached buyback figure(s)")
     if flagged:
         print(f"flagged {flagged} transaction(s) above the plausible ceiling")
     if renamed or retired_funds:

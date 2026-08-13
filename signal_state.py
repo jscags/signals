@@ -443,15 +443,16 @@ def evaluate(conn, cik, ticker=None, as_of=None,
       2. meaningful insider selling        -> DISTRIBUTING
       3. two or more insiders buying       -> EXTENDED
       4. any open-market purchase          -> CONFIRMED
-      5. a precursor without confirmation  -> SETUP
-      6. nothing                           -> DORMANT
+      5. a definitive deal document        -> CONFIRMED
+      6. a buyback, or another precursor   -> SETUP
+      7. nothing                           -> DORMANT
 
     has_setup_signal and is_crowded are parameters rather than lookups because
     the work that would compute them is deliberately deferred -- the XBRL
-    deferred-revenue lane, and crowding. They default to False, which makes
-    SETUP unreachable until the first is built. That is the honest shape: the
-    state exists in the machine, nothing currently produces it, and when the
-    lane lands it flips on at one call site instead of needing a new state.
+    deferred-revenue lane, and crowding. They default to False. SETUP is
+    reachable regardless, because a buyback now produces it; when the lane
+    lands it becomes a second producer of the same state, which is right,
+    since both mean "something happened and no insider has backed it".
 
     Returns a dict: state, reason, and the evidence the reason was drawn from.
     """
@@ -514,12 +515,33 @@ def evaluate(conn, cik, ticker=None, as_of=None,
     corporate = _corporate_events(conn, ticker, as_of)
     if corporate:
         top = corporate[0]
-        kind = ("repurchasing stock" if top["event_type"] == "buyback"
-                else f"deal filing ({top['event_type'][3:].upper()})")
         more = f" (+{len(corporate) - 1} more)" if len(corporate) > 1 else ""
+        # A deal document and a buyback are not the same strength of claim, and
+        # collapsing them into one state was the reason 431 of 804 issuers --
+        # 54% of the universe -- sat in CONFIRMED, most of them megacaps running
+        # a standing repurchase programme.
+        #
+        # A definitive merger document is a dated, consequential, largely
+        # irreversible act, so it CONFIRMS. A board-authorised repurchase is a
+        # ceiling on future buying, not a purchase anyone was obliged to make,
+        # and nobody committed personal money to it -- which is precisely what
+        # SETUP already means here: a precursor with no confirming action.
+        #
+        # SETUP was unreachable until now because the only thing meant to
+        # produce it was deferred. It has two producers when that lands; both
+        # say the same thing, which is that something happened and no insider
+        # has yet backed it.
+        if top["event_type"] == "buyback":
+            return {
+                "state": SETUP,
+                "reason": f"repurchasing stock, filed {top['filed_date']}{more}"
+                          " — no insider buying",
+                "evidence": {"events": [dict(e) for e in corporate]},
+            }
         return {
             "state": CONFIRMED,
-            "reason": f"{kind} filed {top['filed_date']}{more}",
+            "reason": f"deal filing ({top['event_type'][3:].upper()}) "
+                      f"filed {top['filed_date']}{more}",
             "evidence": {"events": [dict(e) for e in corporate]},
         }
 
