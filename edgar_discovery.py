@@ -1578,6 +1578,85 @@ def probe_setup(cik=1069183, start_year=2013, end_year=2018):
                   f"{q['revenue_growth_pct']:>8.1f} {q['gap_pp']:>8.1f}")
 
 
+def probe_setup_population(sample=150):
+    """How selective is Lane A across the universe, not just on its poster child?
+
+    The Axon backtest answers "does the condition fire on a company we know
+    changed shape". It cannot answer "does it fire on everyone", and those are
+    different failures: a metric true for 23 consecutive quarters on Axon is
+    either a business turning into a subscription company or a threshold set so
+    low that half the market clears it. Only counting tells the two apart.
+
+    SETUP is the bottom rung -- it promotes a quiet issuer out of DORMANT so a
+    later insider buy lands on a name already being watched -- so it is allowed
+    to be a state rather than an event, and allowed to persist. What it is not
+    allowed to be is most of the market, because a watchlist that holds
+    everything holds nothing.
+
+    Deterministic stride sample over sorted CIKs rather than a random one, so
+    two runs of the same size are comparable and a threshold change can be read
+    against the same companies rather than against sampling noise.
+    """
+    tickers = load_ticker_map()
+    ciks = sorted(tickers)
+    stride = max(1, len(ciks) // sample)
+    picked = ciks[::stride][:sample]
+    print(f"universe: {len(ciks)} CIKs, sampling every {stride}th -> {len(picked)}")
+    print("thresholds in force: "
+          f"{setup_signal.MIN_CONSECUTIVE_QUARTERS} consecutive quarters, "
+          f"{setup_signal.MIN_GROWTH_GAP_PP}pp gap, "
+          f"${setup_signal.MIN_QUARTERLY_REVENUE_USD:,.0f} revenue floor\n")
+
+    tally = {"no facts": 0, "no liability tag": 0, "no history": 0,
+             "streak too short": 0, "SETUP": 0}
+    hits, streaks = [], []
+    for n, cik in enumerate(picked, 1):
+        symbol, title = tickers[cik]
+        facts = company_facts(cik)
+        if not facts:
+            tally["no facts"] += 1
+            continue
+        if not setup_signal.tag_family(facts):
+            tally["no liability tag"] += 1
+            continue
+        verdict = setup_signal.evaluate_setup(facts)
+        streak = verdict.get("streak", 0)
+        if verdict["setup"]:
+            tally["SETUP"] += 1
+            worst = min(q["gap_pp"] for q in verdict["quarters"][:streak])
+            hits.append((symbol, title, streak, worst))
+        elif not verdict.get("quarters"):
+            tally["no history"] += 1
+        else:
+            tally["streak too short"] += 1
+            streaks.append(streak)
+        if n % 25 == 0:
+            print(f"  ... {n}/{len(picked)}", flush=True)
+
+    print(f"\n{'outcome':>20}  count   share")
+    for key, count in tally.items():
+        print(f"{key:>20}  {count:>5}  {count / len(picked) * 100:>5.1f}%")
+
+    reporting = tally["SETUP"] + tally["streak too short"]
+    if reporting:
+        print(f"\nof the {reporting} issuers with enough history to judge, "
+              f"{tally['SETUP'] / reporting * 100:.0f}% are SETUP")
+
+    # The list itself is the check the counts cannot make. If it reads as banks
+    # and REITs, the metric is measuring float and not deferred revenue.
+    if hits:
+        print(f"\n{'ticker':>8}  {'streak':>6}  {'min gap':>8}  company")
+        for symbol, title, streak, worst in sorted(hits, key=lambda h: -h[2]):
+            print(f"{symbol:>8}  {streak:>6}  {worst:>8.1f}  {title[:44]}")
+
+    # Where the near-misses sit says which way the threshold should move: a pile
+    # at 2 means 3 is cutting real cases, a pile at 0 means it is nowhere close.
+    if streaks:
+        print("\nnear misses by streak length:")
+        for length in range(0, setup_signal.MIN_CONSECUTIVE_QUARTERS):
+            print(f"  {length} quarter(s): {streaks.count(length)}")
+
+
 def probe_contracts(days=30, sample=200):
     """Measure whether federal award data can be tied to listed companies.
 
@@ -3798,6 +3877,10 @@ def main():
                     const=1069183,
                     help="diagnostic: backtest Lane A against one issuer "
                          "(default 1069183, Axon)")
+    ap.add_argument("--probe-setup-population", type=int, metavar="N", nargs="?",
+                    const=150,
+                    help="diagnostic: what share of a sample of N issuers "
+                         "clears the Lane A condition today")
     ap.add_argument("--rescore", action="store_true",
                     help="backfill significance onto events stored before the scale")
     args = ap.parse_args()
@@ -3848,6 +3931,10 @@ def main():
 
     if args.probe_setup:
         probe_setup(cik=args.probe_setup)
+        return
+
+    if args.probe_setup_population:
+        probe_setup_population(sample=args.probe_setup_population)
         return
 
     if args.probe_buybacks:

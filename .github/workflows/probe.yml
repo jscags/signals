@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Which probe: buybacks, contracts or setup'
+        description: 'Which probe: buybacks, contracts, setup or setup-population'
         default: 'buybacks'
       sample:
         description: 'Sample size, or a CIK for the setup probe (Axon = 1069183)'

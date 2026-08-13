@@ -71,6 +71,13 @@ QUARTER_MATCH_TOLERANCE_DAYS = 45
 # before the first comparison can be made at all.
 LOOKBACK_QUARTERS = 8
 
+# Two balances this close together are one quarter reported twice. Adopting a
+# new standard restates the opening balance sheet, so Axon carries both
+# 2017-12-31 (70.4m, old basis) and 2018-01-01 (71.3m, ASC 606 basis) -- the
+# same instant under two rules. Left alone the pair burns two of the eight
+# window slots on one quarter and compares that quarter against itself.
+ADJACENT_BALANCE_DAYS = 5
+
 
 def _as_date(text):
     try:
@@ -100,7 +107,23 @@ def instant_series(facts, concepts):
                 when = _as_date(fact["end"])
                 if when and when not in by_date:
                     by_date[when] = float(fact["val"])
-    return sorted(by_date.items())
+    return _collapse_adjacent(sorted(by_date.items()))
+
+
+def _collapse_adjacent(series, within=ADJACENT_BALANCE_DAYS):
+    """One point per instant, keeping the earliest date of any close cluster.
+
+    Earliest rather than latest because the quarter end is the date the rest of
+    the series is spaced on: the year-ago lookup and the revenue join both aim
+    at calendar quarter ends, and a restatement stamped on the first of the
+    next month drifts a point off that grid for no gain.
+    """
+    kept = []
+    for when, value in series:
+        if kept and (when - kept[-1][0]).days <= within:
+            continue
+        kept.append((when, value))
+    return kept
 
 
 def flow_series(facts, concepts, max_days=115):
