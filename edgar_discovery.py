@@ -1609,7 +1609,7 @@ def probe_setup_population(sample=150):
 
     tally = {"no facts": 0, "no liability tag": 0, "no history": 0,
              "streak too short": 0, "SETUP": 0}
-    hits, streaks = [], []
+    hits, streaks, judged = [], [], []
     for n, cik in enumerate(picked, 1):
         symbol, title = tickers[cik]
         facts = company_facts(cik)
@@ -1621,6 +1621,13 @@ def probe_setup_population(sample=150):
             continue
         verdict = setup_signal.evaluate_setup(facts)
         streak = verdict.get("streak", 0)
+        if verdict.get("quarters"):
+            # Scale, recorded for every issuer the metric was able to judge --
+            # not just the ones it liked. A floor can only be set from the
+            # distribution it has to cut, and the hits alone do not show it.
+            recent = verdict["quarters"][0]
+            judged.append((symbol, title, streak, verdict["setup"],
+                           recent["revenue"], recent["liability"]))
         if verdict["setup"]:
             tally["SETUP"] += 1
             worst = min(q["gap_pp"] for q in verdict["quarters"][:streak])
@@ -1655,6 +1662,21 @@ def probe_setup_population(sample=150):
         print("\nnear misses by streak length:")
         for length in range(0, setup_signal.MIN_CONSECUTIVE_QUARTERS):
             print(f"  {length} quarter(s): {streaks.count(length)}")
+
+    # The scale distribution, which is the thing the first population run could
+    # not show. Its four hits were an antimony miner, a micro-cap e-commerce
+    # roll-up and a near-pre-revenue device company -- companies where a single
+    # contract moves the balance sheet, not companies changing shape. Axon in
+    # the years that mattered ran ~$80m a quarter against a liability worth
+    # around 60% of it, and the revenue floor sits thirty times below that.
+    if judged:
+        print(f"\n{'ticker':>8}  {'setup':>5}  {'streak':>6}  {'revenue $m':>10}  "
+              f"{'liab/rev':>8}  company")
+        for symbol, title, streak, is_setup, revenue, liability in sorted(
+                judged, key=lambda j: -j[4]):
+            ratio = liability / revenue if revenue else 0.0
+            print(f"{symbol:>8}  {'YES' if is_setup else '-':>5}  {streak:>6}  "
+                  f"{revenue / 1e6:>10,.1f}  {ratio:>8.2f}  {title[:36]}")
 
 
 def probe_contracts(days=30, sample=200):
