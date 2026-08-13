@@ -71,6 +71,18 @@ DISQUALIFIER_TTL_DAYS = 180
 # dispositions. DISTRIBUTING should mean insiders leaving, not housekeeping.
 MIN_MEANINGFUL_SALE_USD = 100_000
 
+# And the same on the buy side, which had no floor at all. "Starr Gayle P
+# bought $288", "bought $212", and Horizon Kinetics buying ONE share of TPL at
+# $352.62 on three consecutive days were all drawing cards. Those are dividend
+# reinvestments and fractional accruals -- a plan executing, not a person
+# deciding. An order of magnitude below the sale floor because a purchase is
+# the rarer and more informative act, so it earns a lower bar.
+#
+# Applied to the window total, not to each row: five deliberate $5,000
+# purchases are a position being built and should clear, while one $353
+# accrual should not.
+MIN_MEANINGFUL_BUY_USD = 10_000
+
 # ---------------------------------------------------------------- disqualifiers
 
 # Form types that mean trouble and that cost NOTHING to detect, because the
@@ -442,7 +454,7 @@ def evaluate(conn, cik, ticker=None, as_of=None,
       1. an active disqualifier            -> DISTRESSED
       2. meaningful insider selling        -> DISTRIBUTING
       3. two or more insiders buying       -> EXTENDED
-      4. any open-market purchase          -> CONFIRMED
+      4. open-market buying above the floor -> CONFIRMED
       5. a definitive deal document        -> CONFIRMED
       6. a buyback, or another precursor   -> SETUP
       7. nothing                           -> DORMANT
@@ -482,8 +494,8 @@ def evaluate(conn, cik, ticker=None, as_of=None,
         }
 
     buys = _buys(conn, cik, as_of)
-    if buys:
-        bought = sum(b["value"] or 0 for b in buys)
+    bought = sum(b["value"] or 0 for b in buys)
+    if buys and bought >= MIN_MEANINGFUL_BUY_USD:
         buyers = {b["owner"] for b in buys if b["owner"]}
         # A cluster is distinct buyers inside the tight window, not merely
         # several purchases -- one director buying weekly is conviction, but it

@@ -142,6 +142,22 @@ MAX_PLAUSIBLE_VALUE_USD = 1_000_000_000
 # flags rather than converts.
 MAX_PLAUSIBLE_TXN_USD = 2_000_000_000
 
+# A Form 4 is due within two business days. Beyond this, the transaction is
+# being reported so long after the fact that it says nothing about now, and the
+# card should say so rather than printing an eight-year-old date unremarked.
+#
+# Not treated as a parse error, because it is not one. The Cheesecake Factory
+# filing that prompted this reports a 2018 purchase at $49.51 alongside 2026
+# transactions at $106-110 -- and CAKE really did trade near $49 in March 2018,
+# so the price corroborates the date. Genuinely late reports are rare (2 of 516
+# rows here) and legal under Rule 16a-3; they are a fact about the filer, not a
+# fault in the parser.
+#
+# Set well beyond the 45-day scoring window, so anything flagged here was
+# already outside the state machine's reach and this only affects what is said
+# on the card.
+MAX_REPORTING_LAG_DAYS = 180
+
 # Cover-page share count first, the us-gaap balance-sheet tag as a fallback for
 # issuers that do not tag the dei concept.
 XBRL_CONCEPTS = (
@@ -470,12 +486,19 @@ def load_ticker_map():
         raise FetchError(f"the cached ticker map at {path} is unreadable: {exc}\n"
                          "Delete it and rerun to fetch a fresh copy.") from exc
 
-    tickers = {}
+    # company_tickers.json is one row per SYMBOL, and a company with warrants,
+    # units or preferred series appears several times under one CIK. Keying the
+    # dict directly let whichever row came last win, which is how a Bakkt 10-Q
+    # buyback came to be filed under BKKT-WT instead of BKKT.
+    candidates = {}
     for row in data.values():
         try:
-            tickers[int(row["cik_str"])] = (row["ticker"], row["title"])
+            candidates.setdefault(int(row["cik_str"]), []).append(
+                (row["ticker"], row["title"]))
         except (KeyError, TypeError, ValueError):
             continue
+    tickers = {cik: min(pairs, key=lambda p: (derivative_rank(p[0]), len(p[0]), p[0]))
+               for cik, pairs in candidates.items()}
 
     if not tickers:
         raise FetchError(
@@ -2321,10 +2344,19 @@ def repair_placeholder_tickers(conn, tickers):
 
     for row in rows:
         cik, stored = row["cik"], row["ticker"]
-        if not cik or real_ticker(stored):
+        if not cik:
             continue
-        resolved = (tickers.get(int(cik)) or (None,))[0]
-        resolved = real_ticker(resolved)
+        preferred = real_ticker((tickers.get(int(cik)) or (None,))[0])
+        # Two reasons to re-resolve: no usable symbol at all, or a symbol that
+        # is a claim on the common when the common is also listed. A Bakkt 10-Q
+        # buyback belongs under BKKT; it was filed under BKKT-WT because the
+        # ticker map was collapsed by whichever row happened to come last.
+        needs_name = not real_ticker(stored)
+        outranked = bool(preferred and preferred != stored
+                         and derivative_rank(stored) > derivative_rank(preferred))
+        if not (needs_name or outranked):
+            continue
+        resolved = preferred
 
         if resolved:
             for sql in (
@@ -2339,6 +2371,9 @@ def repair_placeholder_tickers(conn, tickers):
                 conn.execute(sql, (resolved, key))
             renamed += 1
             continue
+
+        if outranked:
+            continue   # a derivative with no common to move to: leave it be
 
         # Untradeable. Off the dashboard, out of the state machine, ledger kept.
         #
@@ -3040,6 +3075,34 @@ YAHOO_QUOTE = "https://finance.yahoo.com/quote/{}"
 NON_TICKERS = {"", "-", "—", "none", "n/a", "na", "null"}
 
 
+# Symbol shapes that are a claim on the common rather than the common itself.
+# Applied ONLY to choose between symbols that share a CIK, never to reject one:
+# if a company's sole listed symbol is a warrant then a warrant is what it
+# trades as, and calling it something else would be an invention. Used as a
+# tiebreak the heuristic cannot do damage, which is what makes the loose
+# trailing-letter rules below safe to have.
+_DERIVATIVE_SUFFIX = (
+    (re.compile(r"[-.](WT|WS|RT|U)$", re.I), 3),        # explicit: BKKT-WT
+    (re.compile(r"[-.]P[A-Z]$", re.I), 3),              # preferred: SCHW-PJ
+    (re.compile(r"^[A-Z]{4}[WUR]$"), 2),                # Nasdaq 5-letter warrant/unit/right
+    (re.compile(r"^[A-Z]{4}[LMNOP]$"), 1),              # Nasdaq 5-letter preferred/notes
+)
+
+
+def derivative_rank(symbol):
+    """0 for common stock, higher the further from it. Lower sorts first.
+
+    Deliberately ordinal rather than boolean: given BKKT, BKKT-WT and nothing
+    else, the plain symbol wins on 0; given only BKKT-WT it still wins its own
+    comparison and is used, because it is what that CIK trades as.
+    """
+    text = (symbol or "").strip().upper()
+    for pattern, rank in _DERIVATIVE_SUFFIX:
+        if pattern.search(text):
+            return rank
+    return 0
+
+
 def real_ticker(symbol):
     """The symbol, or None when it is a placeholder standing in for one.
 
@@ -3248,7 +3311,10 @@ def render_company(entity, events, conn=None, order=0):
         first, last = detail.get("first_txn_date"), detail.get("txn_date")
         if last:
             span = f"{first} → {last}" if first and first != last else last
-            bits.append(f"traded {html.escape(span)}")
+            lag = _span_days(first or last, primary["filed_date"])
+            late = (f" — reported {lag:,} days late"
+                    if lag and lag > MAX_REPORTING_LAG_DAYS else "")
+            bits.append(f"traded {html.escape(span)}{late}")
     else:
         bits.append(html.escape(detail.get("form_type", "")))
     bits.append(html.escape(primary["source_id"]))
@@ -3376,7 +3442,8 @@ def render_controls(grouped):
 <div class="dist" id="dist" role="group" aria-label="Filter by significance">{rows}</div>"""
 
 
-def render_state_panel(counts, n_moves, window_days, truncated=False):
+def render_state_panel(counts, n_moves, window_days, truncated=False,
+                       n_decayed=0):
     """Where every issuer stands, beside how many moved. Both are needed.
 
     The counts are standing state and the list below is change, so a run where
@@ -3397,6 +3464,7 @@ def render_state_panel(counts, n_moves, window_days, truncated=False):
         f'<div class="kpis">{tiles}</div>'
         f'<div class="tier-head"><b>Moved in the last {window_days} days</b>'
         f"<span>{n_moves}{' (showing the most recent)' if truncated else ''}"
+        f"{f' · {n_decayed} decayed, not shown' if n_decayed else ''}"
         f"</span></div>"
     )
 
@@ -3464,6 +3532,15 @@ def write_html(conn, path="dashboard.html", window_days=14):
     # not a thing to tell anyone. The history stays in the table either way.
     moves = [m for m in net.values() if m["from_state"] != m["to_state"]]
 
+    # Decay is bookkeeping, not news. An issuer returning to DORMANT means its
+    # purchases aged past the window -- nobody did anything, and the feed was
+    # filling with "no activity in window" over the stale filing that had
+    # stopped counting. Still written to state_transitions, because the arc
+    # going backwards is exactly what two tiers could never express and it
+    # matters when reading an issuer's history; just not surfaced as an item.
+    decayed = [m for m in moves if m["to_state"] == signal_state.DORMANT]
+    moves = [m for m in moves if m["to_state"] != signal_state.DORMANT]
+
     body = []
     for order, move in enumerate(moves):
         entity = real_ticker(move["ticker"]) or f"CIK {move['cik']}"
@@ -3508,7 +3585,8 @@ def write_html(conn, path="dashboard.html", window_days=14):
                     'being tracked; the panel above shows where they stand.</p>')
 
     sections = [
-        render_state_panel(counts, len(moves), window_days, truncated),
+        render_state_panel(counts, len(moves), window_days, truncated,
+                           len(decayed)),
         f'<section id="list">{"".join(body)}</section>',
         '<p class="empty none" id="nohits">No company matches these filters.</p>',
     ]
