@@ -1516,6 +1516,68 @@ def handle_periodic(conn, row, listed):
     )
 
 
+def probe_setup(cik=1069183, start_year=2013, end_year=2018):
+    """Backtest Lane A against one issuer with a known outcome.
+
+    Runs on the GitHub runner rather than here, because this sandbox's egress
+    policy denies sec.gov and the runner's does not. One companyfacts fetch
+    carries the issuer's whole history, so the condition can be evaluated at
+    successive as-of dates from a single request -- which is what makes a
+    walk-forward backtest cost one call rather than twenty.
+
+    Default CIK is Axon (TASR/AXON), the worked example: the filing stream is
+    silent from 2005 to 2016 and the entry sits in the middle of that silence,
+    so if Lane A cannot see 2016 here it cannot see anything.
+
+    Writes nothing. Prints a quarter-by-quarter table so the thresholds can be
+    read off real numbers instead of reasoned at.
+    """
+    facts = company_facts(cik)
+    if not facts:
+        print(f"no companyfacts for CIK {cik}")
+        return
+    print(f"entity      : {facts.get('entityName')}  (CIK {cik})")
+    print(f"tags present: {', '.join(setup_signal.tag_family(facts)) or 'NONE'}")
+
+    liabilities = setup_signal.instant_series(facts, setup_signal.LIABILITY_CONCEPTS)
+    revenues = setup_signal.flow_series(facts, setup_signal.REVENUE_CONCEPTS)
+    print(f"liability points: {len(liabilities)}"
+          + (f"  {liabilities[0][0]} .. {liabilities[-1][0]}" if liabilities else ""))
+    print(f"revenue points  : {len(revenues)}"
+          + (f"  {revenues[0][0]} .. {revenues[-1][0]}" if revenues else ""))
+
+    # Walk forward. The question is not "is it true today" but "when did it
+    # first become true", which is the only version of the question a backtest
+    # can answer usefully.
+    print(f"\n{'as of':>12}  {'state':>7}  streak  reason")
+    first_true = None
+    for year in range(start_year, end_year + 1):
+        for month, day in ((3, 31), (6, 30), (9, 30), (12, 31)):
+            as_of = date(year, month, day)
+            v = setup_signal.evaluate_setup(facts, today=as_of)
+            flag = "SETUP" if v["setup"] else "-"
+            if v["setup"] and first_true is None:
+                first_true = as_of
+            print(f"{as_of.isoformat():>12}  {flag:>7}  {v.get('streak', 0):>6}  "
+                  f"{v['reason'][:64]}")
+
+    print(f"\nfirst true: {first_true or 'never in window'}")
+    print("thresholds in force: "
+          f"{setup_signal.MIN_CONSECUTIVE_QUARTERS} consecutive quarters, "
+          f"{setup_signal.MIN_GROWTH_GAP_PP}pp gap, "
+          f"${setup_signal.MIN_QUARTERLY_REVENUE_USD:,.0f} revenue floor")
+
+    # The evidence, so a threshold can be moved on numbers rather than feel.
+    latest = setup_signal.evaluate_setup(facts, today=date(end_year, 12, 31))
+    if latest.get("quarters"):
+        print(f"\n{'quarter':>12} {'liability':>16} {'revenue':>16} "
+              f"{'liab %':>8} {'rev %':>8} {'gap pp':>8}")
+        for q in reversed(latest["quarters"]):
+            print(f"{q['quarter_end']:>12} {q['liability']:>16,.0f} "
+                  f"{q['revenue']:>16,.0f} {q['liability_growth_pct']:>8.1f} "
+                  f"{q['revenue_growth_pct']:>8.1f} {q['gap_pp']:>8.1f}")
+
+
 def probe_contracts(days=30, sample=200):
     """Measure whether federal award data can be tied to listed companies.
 
@@ -3732,6 +3794,10 @@ def main():
     ap.add_argument("--probe-buybacks", type=int, metavar="N", nargs="?", const=60,
                     help="diagnostic: how many recent 10-Q/10-K filers tag "
                          "repurchase data (sample size N)")
+    ap.add_argument("--probe-setup", type=int, metavar="CIK", nargs="?",
+                    const=1069183,
+                    help="diagnostic: backtest Lane A against one issuer "
+                         "(default 1069183, Axon)")
     ap.add_argument("--rescore", action="store_true",
                     help="backfill significance onto events stored before the scale")
     args = ap.parse_args()
@@ -3778,6 +3844,10 @@ def main():
 
     if args.probe_contracts:
         probe_contracts(sample=args.probe_contracts)
+        return
+
+    if args.probe_setup:
+        probe_setup(cik=args.probe_setup)
         return
 
     if args.probe_buybacks:
