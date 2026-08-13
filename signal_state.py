@@ -201,6 +201,19 @@ CREATE TABLE IF NOT EXISTS insider_sales (
     UNIQUE(accession, owner, txn_date, shares, price)
 );
 CREATE INDEX IF NOT EXISTS idx_sales_issuer ON insider_sales(issuer_cik, txn_date);
+
+-- Issuers that must never be evaluated again, whatever their ledger says.
+--
+-- Deleting an issuer's state is not enough to remove it: the ledger rows are
+-- kept on purpose as a record of what was filed, so the very next pass finds
+-- them again and re-creates everything. Nine non-traded funds were retired and
+-- resurrected inside a single run that way, coming back as cards headed
+-- "CIK 2089975" because the rename had nothing to rename them to.
+CREATE TABLE IF NOT EXISTS retired_issuers (
+    cik        INTEGER PRIMARY KEY,
+    reason     TEXT,
+    retired_at TEXT
+);
 """
 
 
@@ -345,6 +358,21 @@ def scan_index_row_for_disqualifiers(conn, row, watched_ciks=None):
 # than imported because this module must run standalone for its self-test, and a
 # circular import to fetch one integer is a worse trade than restating it here.
 MAX_PLAUSIBLE_TXN_USD = 2_000_000_000
+
+
+def retire_issuer(conn, cik, reason):
+    """Take an issuer out of the state machine permanently. Idempotent."""
+    conn.execute(
+        "INSERT OR IGNORE INTO retired_issuers (cik, reason, retired_at) "
+        "VALUES (?,?,?)", (int(cik), reason, _now()))
+    conn.execute("DELETE FROM state_transitions WHERE cik = ?", (int(cik),))
+    conn.execute("DELETE FROM issuer_state WHERE cik = ?", (int(cik),))
+    return 1
+
+
+def is_retired(conn, cik):
+    return conn.execute("SELECT 1 FROM retired_issuers WHERE cik = ?",
+                        (int(cik),)).fetchone() is not None
 
 
 def record_insider_sales(conn, sales):
@@ -660,7 +688,12 @@ def issuers_to_evaluate(conn, as_of=None):
     for cik, ticker in _corporate_issuers(conn, since):
         if ticker or cik not in out:
             out[cik] = ticker or out.get(cik)
-    return sorted(out.items())
+
+    # Retired issuers are dropped last, so nothing upstream has to remember to
+    # check. Their ledger rows stay and keep finding their way into the unions
+    # above; this is the one place that has to say no.
+    retired = {r[0] for r in conn.execute("SELECT cik FROM retired_issuers")}
+    return sorted((cik, t) for cik, t in out.items() if cik not in retired)
 
 
 def _corporate_issuers(conn, since):

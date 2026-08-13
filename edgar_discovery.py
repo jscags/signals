@@ -2382,18 +2382,19 @@ def repair_placeholder_tickers(conn, tickers):
         # issuers come back round on every run -- and a count that incremented
         # regardless would report retiring the same nine funds twice a day
         # forever, which is a made-up number in a status line.
+        already = signal_state.is_retired(conn, cik)
         touched = 0
         touched += conn.execute(
             "UPDATE events SET reviewed_at = ? WHERE entity = ? AND reviewed_at IS NULL",
             (datetime.utcnow().isoformat(timespec="seconds"), stored),
         ).rowcount
         touched += conn.execute(
-            "DELETE FROM state_transitions WHERE cik = ?", (cik,)).rowcount
-        touched += conn.execute(
-            "DELETE FROM issuer_state WHERE cik = ?", (cik,)).rowcount
-        touched += conn.execute(
             "DELETE FROM watchlist WHERE ticker = ?", (stored,)).rowcount
-        if touched:
+        # Recorded, not just deleted. Deleting the state left the ledger rows
+        # in place -- which is correct, they are the record -- and the next
+        # classification pass read them straight back and rebuilt everything.
+        signal_state.retire_issuer(conn, cik, f"no trading symbol ({stored})")
+        if touched or not already:
             retired += 1
 
     return renamed, retired
