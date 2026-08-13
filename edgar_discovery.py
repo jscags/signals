@@ -36,6 +36,8 @@ from datetime import date, datetime, timedelta
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
+import signal_state
+
 # ---------------------------------------------------------------- config
 
 DB_PATH = os.environ.get("EDGAR_DB", "discovery.db")
@@ -545,7 +547,7 @@ def _num(node, path):
         return None
 
 
-def parse_form4(root):
+def parse_form4(root, want_code="P", want_direction="A"):
     """Return open-market purchases only.
 
     This is where most naive screeners go wrong. Code P is an actual
@@ -598,7 +600,7 @@ def parse_form4(root):
         direction = _text(
             txn, "transactionAmounts/transactionAcquiredDisposedCode/value"
         )
-        if code != "P" or direction != "A":
+        if code != want_code or direction != want_direction:
             continue
 
         shares = _num(txn, "transactionAmounts/transactionShares/value")
@@ -762,6 +764,11 @@ def connect():
         "WHERE filed_date GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'"
     )
     conn.commit()
+    # The state machine's tables belong to the connection, not to main(): the
+    # dashboard reads state_transitions, and leaving the migration in the
+    # command path meant any other caller -- a script, a test, anything
+    # importing this module -- got a connection whose schema was half there.
+    signal_state.migrate(conn)
     return conn
 
 
@@ -1671,7 +1678,20 @@ def run_day(conn, day, tickers, limit=None):
         or r["form_type"] in PERIODIC_FORMS
     })
 
+    # Watchlist CIKs, resolved once per day rather than per row. The scanner
+    # is free -- the form type is already in hand -- but the disqualifier table
+    # would cover the whole market if it were left ungated, and every
+    # evaluate() scans it.
+    watched_ciks = {
+        r["cik"] for r in watchlist_rows(conn) if r["cik"] is not None
+    }
+
     for row in rows:
+        # Before the form-type filter below: NT 10-K, Form 25 and Form 15 are
+        # not forms this collector wants, so gating this behind it would mean
+        # the scanner never saw one.
+        signal_state.scan_index_row_for_disqualifiers(conn, row, watched_ciks)
+
         if limit is not None and n_docs >= limit:
             print(f"  (stopped at --limit {limit}; index had {len(rows)} filings)")
             break
@@ -1900,7 +1920,13 @@ def handle_form4(conn, row, tickers):
         return 0
 
     try:
-        buys = parse_form4(extract_ownership_xml(text))
+        root = extract_ownership_xml(text)
+        buys = parse_form4(root)
+        # The mirror of the purchase path: code S, disposed D. Stored in its own
+        # ledger so none of the tiering, clustering or scoring that reads
+        # insider_buys starts quietly seeing sales.
+        signal_state.record_insider_sales(
+            conn, parse_form4(root, want_code="S", want_direction="D"))
     except MalformedFiling as exc:
         # Says nothing about the contents, so it takes the same lane as a
         # refusal: unrecorded, retried next run, and counted toward the breaker
@@ -2404,7 +2430,6 @@ h1 {
 .tier-head span {
   font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--muted);
 }
-.tier-head[data-head="1"] b { color: var(--signal); }
 .row {
   display: grid; grid-template-columns: 88px 1fr; gap: 16px;
   background: var(--card); border-left: 3px solid var(--rule);
@@ -2556,6 +2581,17 @@ h1 {
   border: 1px solid var(--rule); border-radius: 2px; padding: 1px 5px;
   margin-left: 8px; vertical-align: 1px; white-space: nowrap;
 }
+/* The move itself. Specificity is deliberate: .row[data-tier="1"] .tag also
+   sets a colour, and at equal weight it won -- painting the badge's text the
+   same blue as its own background. */
+.row .tag.state-confirmed    { border-color: var(--r3); color: var(--r3); }
+.row .tag.state-extended     { border-color: var(--r5); background: var(--r5);
+                               color: var(--on-r5); }
+.row .tag.state-distributing { border-color: var(--muted); color: var(--muted); }
+.row .tag.state-distressed   { border-color: #D03B3B; background: #D03B3B;
+                               color: #FFFFFF; font-weight: 700; }
+.row .tag.state-setup        { border-color: var(--r1); color: var(--ink); }
+.row .tag[class*="state-"]   { margin-left: 0; margin-right: 8px; }
 .none { display: none !important; }
 /* Secondary filings for a company already shown above. Subordinate to the
    headline on purpose: the card is the story, these are its other filings. */
@@ -2624,6 +2660,8 @@ SCRIPT = """
 
   var origin = [].slice.call(list.children);   // server order, headings included
   var heads = [].slice.call(list.querySelectorAll('.tier-head'));
+  // The transition list has no per-tier headings -- the order is recency, not
+  // conviction -- so these are absent and the sort branch below must cope.
   var allHead = document.querySelector('[data-head="all"]');
   var allCount = document.getElementById('allcount');
   var nohits = document.getElementById('nohits');
@@ -2691,11 +2729,11 @@ SCRIPT = """
     var cmp = SORTS[sort.value];
     if (cmp) {
       heads.forEach(function (h) { h.classList.add('none'); });
-      allHead.classList.toggle('none', shown === 0);
-      allCount.textContent = shown.toLocaleString();
+      if (allHead) { allHead.classList.toggle('none', shown === 0); }
+      if (allCount) { allCount.textContent = shown.toLocaleString(); }
       cards.slice().sort(cmp).forEach(function (card) { list.appendChild(card); });
     } else {
-      allHead.classList.add('none');
+      if (allHead) { allHead.classList.add('none'); }
       // Back to the order Python wrote, headings and all.
       origin.forEach(function (node) { list.appendChild(node); });
       heads.forEach(function (head) {
@@ -3064,16 +3102,6 @@ def render_controls(grouped):
     cards = [
         (entity, evs, json.loads(evs[0]["detail"] or "{}")) for entity, evs in grouped
     ]
-    tier1 = sum(1 for _, evs, _ in cards if evs[0]["tier"] == 1)
-
-    tiles = "".join(
-        f'<div class="kpi{cls}"><b>{value:,}</b><span>{label}</span></div>'
-        for value, label, cls in (
-            (tier1, "to act on", " lead"),
-            (len(cards), "companies", ""),
-            (sum(len(evs) for _, evs, _ in cards), "filings", ""),
-        )
-    )
 
     chips = "".join(
         f'<button class="chipbtn" type="button" data-fam="{key}" aria-pressed="false">'
@@ -3093,8 +3121,7 @@ def render_controls(grouped):
         for band in tuple(reversed(BAND_RUNGS)) + ("unscored",)
     )
 
-    return f"""<div class="kpis">{tiles}</div>
-<div class="controls" id="controls" hidden>
+    return f"""<div class="controls" id="controls" hidden>
   <input id="q" type="search" placeholder="Ticker, company or person"
          aria-label="Filter by ticker, company or person" autocomplete="off">
   <div class="chipset">{chips}
@@ -3112,7 +3139,44 @@ def render_controls(grouped):
 <div class="dist" id="dist" role="group" aria-label="Filter by significance">{rows}</div>"""
 
 
-def write_html(conn, path="dashboard.html"):
+def render_state_panel(counts, n_moves, window_days):
+    """Where every issuer stands, beside how many moved. Both are needed.
+
+    The counts are standing state and the list below is change, so a run where
+    nothing moved shows a full panel over an empty list -- which is the correct
+    reading of a quiet week, and is exactly what a page built only from
+    standing state could never say.
+    """
+    tiles = "".join(
+        f'<div class="kpi{" lead" if name == signal_state.EXTENDED else ""}">'
+        f"<b>{counts.get(name, 0):,}</b>"
+        f'<span>{html.escape(name.lower())}</span></div>'
+        for name in signal_state.STATES
+        if counts.get(name, 0) or name in (signal_state.CONFIRMED,
+                                           signal_state.EXTENDED,
+                                           signal_state.DISTRESSED)
+    )
+    return (
+        f'<div class="kpis">{tiles}</div>'
+        f'<div class="tier-head"><b>Moved in the last {window_days} days</b>'
+        f"<span>{n_moves}</span></div>"
+    )
+
+
+def write_html(conn, path="dashboard.html", window_days=14):
+    """The page is built from TRANSITIONS, not from standing state.
+
+    An issuer that has been CONFIRMED for three weeks is not news on day
+    twenty-two, and the previous version -- a list of every open event, rebuilt
+    twice a day -- said it was. The same names reappeared every twelve hours
+    whether or not anything had happened to them, which is the fastest way to
+    train someone to stop reading a dashboard.
+
+    Each transition is still drawn with the filing detail behind it, because
+    "GBFH moved to EXTENDED" is a fact about the state machine and "two
+    directors bought $400K" is the fact a person acts on. The card body is the
+    one render_company() already produces; the state is what earns it a place.
+    """
     events = conn.execute(
         """SELECT * FROM events WHERE reviewed_at IS NULL
            ORDER BY tier, filed_date DESC, id DESC"""
@@ -3121,43 +3185,55 @@ def write_html(conn, path="dashboard.html"):
         "SELECT * FROM run_log ORDER BY run_date DESC LIMIT 5"
     ).fetchall()
 
-    # Grouped once over everything, then split by the tier each company earned,
-    # so a ticker with filings in both tiers gets one card rather than two.
-    grouped = group_by_company(events)
+    since = market_today() - timedelta(days=window_days)
+    moves = signal_state.transitions_since(conn, since=since)
+    counts = signal_state.state_counts(conn)
 
-    # One list rather than two sections. Sorting by anything other than
-    # conviction cuts across the tiers, and a card cannot be in two places at
-    # once -- so the tier is a heading the script hides when it stops being the
-    # thing the order means, and a tag on the card that is always true.
-    heads = {}
-    for tier, label in ((1, "Act on these"), (2, "Everything else")):
-        companies = [g for g in grouped if g[1][0]["tier"] == tier]
-        n_filings = sum(len(evs) for _, evs in companies)
-        count = f"{len(companies)}"
-        if n_filings != len(companies):
-            count += f" · {n_filings} filings"
-        heads[tier] = (
-            f'<div class="tier-head" data-head="{tier}">'
-            f"<b>Tier {tier} — {label}</b><span>{count}</span></div>"
-        )
+    # Filings for the issuers that moved, so a transition card can show what
+    # was actually filed. Grouped by ticker the same way as before.
+    by_entity = dict(group_by_company(events))
 
-    body, seen_tiers = [], set()
-    for order, (entity, evs) in enumerate(grouped):
-        tier = evs[0]["tier"]
-        if tier not in seen_tiers:
-            seen_tiers.add(tier)
-            body.append(heads[tier])
-        body.append(render_company(entity, evs, conn, order))
-    if not grouped:
-        body.append('<p class="empty">Nothing yet. Run a collection to populate this.</p>')
+    body = []
+    for order, move in enumerate(moves):
+        entity = move["ticker"] or f"CIK {move['cik']}"
+        evs = by_entity.get(move["ticker"]) if move["ticker"] else None
+        if evs:
+            card = render_company(entity, evs, conn, order)
+        else:
+            # Moved on evidence that is not an open event -- a disqualifier, or
+            # selling, or a purchase already reviewed away. Still a transition,
+            # so it still gets a card; the reason string carries it.
+            card = (
+                f'<div class="row" data-ord="{order}" data-tier="2" '
+                f'data-fam="state" data-band="unscored" data-rung="0" '
+                f'data-mag="-1" data-usd="-1" '
+                f'data-filed="{html.escape(move["observed_on"])}" '
+                f'data-find="{html.escape(entity.lower())}">'
+                f'<div class="ticker">{ticker_link(entity)}</div>'
+                f'<div><p class="headline">{html.escape(move["reason"])}</p>'
+                f'<div class="detail"><span>observed '
+                f'{html.escape(move["observed_on"])}</span></div></div></div>'
+            )
+        # The move itself, stamped onto the card that explains it.
+        badge = (f'<span class="tag state-{move["to_state"].lower()}">'
+                 f'{html.escape(move["from_state"].lower())} → '
+                 f'{html.escape(move["to_state"].lower())}</span>')
+        card = card.replace('<p class="headline">', f'<p class="headline">{badge} ', 1)
+        body.append(card)
+
+    if not moves:
+        body.append('<p class="empty">Nothing changed state in the last '
+                    f'{window_days} days. {sum(counts.values()):,} issuers are '
+                    'being tracked; the panel above shows where they stand.</p>')
 
     sections = [
-        f'<div class="tier-head none" data-head="all"><b>All companies</b>'
-        f'<span id="allcount">{len(grouped)}</span></div>',
+        render_state_panel(counts, len(moves), window_days),
         f'<section id="list">{"".join(body)}</section>',
         '<p class="empty none" id="nohits">No company matches these filters.</p>',
     ]
-    sections = [render_controls(grouped)] + sections
+    grouped = [(m["ticker"] or f"CIK {m['cik']}",
+                by_entity.get(m["ticker"]) or []) for m in moves]
+    sections = [render_controls([g for g in grouped if g[1]])] + sections
 
     covered = ", ".join(r["run_date"] for r in runs) or "no runs yet"
     # Candidates, not n_docs. n_docs counts what a pass newly fetched, which is
@@ -3203,7 +3279,7 @@ def write_html(conn, path="dashboard.html"):
 <style>{CSS}</style>
 </head><body><div class="wrap">
 <h1>EDGAR Discovery</h1>
-<p class="meta">days covered: {covered}{f" &nbsp;·&nbsp; {docs} filings scanned" if docs else ""}</p>
+<p class="meta">{len(moves)} transition{"" if len(moves) == 1 else "s"} &nbsp;·&nbsp; {sum(counts.values()):,} issuers tracked &nbsp;·&nbsp; days covered: {covered}{f" &nbsp;·&nbsp; {docs} filings scanned" if docs else ""}</p>
 {"".join(sections)}
 {watch_html}
 </div><div id="tip" role="status" aria-live="polite"></div>
@@ -3247,6 +3323,7 @@ def main():
     args = ap.parse_args()
 
     conn = connect()
+    signal_state.set_user_agent(USER_AGENT)
 
     if args.watch:
         promote(conn, args.watch.upper(), None, "pinned manually", manual=True)
@@ -3374,6 +3451,14 @@ def main():
         print(f"retired {aged} events past their shelf life")
     if retired:
         print(f"retired {retired} expired watchlist entries")
+
+    # Both prints stay. They separate "the collector produced nothing" from
+    # "classification found nothing", which no other line in this run can tell
+    # apart -- the first is a broken pipeline, the second is a quiet week, and
+    # for a long time they looked identical from the outside.
+    n_issuers, moves = signal_state.classify_all(conn, as_of=days[-1])
+    print(f"CLASSIFIED {n_issuers} issuer(s), {len(moves)} transition(s)")
+    print(f"STATE COUNTS {signal_state.state_counts(conn)}")
 
     watched = watchlist_rows(conn)
     print(f"watchlist: {len(watched)} active")
