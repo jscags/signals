@@ -36,6 +36,7 @@ from datetime import date, datetime, timedelta
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
+import setup_signal
 import signal_state
 
 # ---------------------------------------------------------------- config
@@ -764,6 +765,21 @@ CREATE TABLE IF NOT EXISTS issuer_facts (
     float_as_of  TEXT
 );
 
+-- Lane A: the setup condition. Cached alongside the buyback figures because it
+-- is derived from the SAME companyfacts document -- the fetch that already
+-- happens for every listed 10-Q/10-K filer carries revenue and contract
+-- liabilities in it, so this costs no additional request.
+CREATE TABLE IF NOT EXISTS issuer_setup (
+    cik         INTEGER PRIMARY KEY,
+    setup       INTEGER,
+    streak      INTEGER,
+    reason      TEXT,
+    quarters    TEXT,
+    tags        TEXT,
+    fetched_at  TEXT,
+    derived_v   INTEGER
+);
+
 -- Annualised repurchase activity per issuer, cached on the same terms as the
 -- share count: slow-moving, one small request, and worth surviving between
 -- runs on a fresh runner.
@@ -1057,7 +1073,39 @@ def refresh_issuer_xbrl(conn, cik):
          int(bool((best or {}).get("annualised"))),
          date.today().isoformat(), XBRL_DERIVATION),
     )
+
+    # Lane A, off the same payload. The design memo treats this as a second
+    # pipeline needing its own universe, and the reasoning is right about the
+    # WATCHLIST -- which is populated by catalysts and therefore only contains
+    # companies that already did something loud. But the periodic lane does not
+    # read the watchlist: handle_periodic fires on every listed 10-Q/10-K filer
+    # in the daily index, which is 1,102 issuers here that are on no watchlist
+    # at all. The universe and the quarterly clock already exist; a 10-Q IS the
+    # quarterly tick. So this rides them rather than duplicating them.
+    verdict = setup_signal.evaluate_setup(facts)
+    conn.execute(
+        """INSERT INTO issuer_setup
+             (cik, setup, streak, reason, quarters, tags, fetched_at, derived_v)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(cik) DO UPDATE SET
+             setup=excluded.setup, streak=excluded.streak,
+             reason=excluded.reason, quarters=excluded.quarters,
+             tags=excluded.tags, fetched_at=excluded.fetched_at,
+             derived_v=excluded.derived_v""",
+        (cik, int(bool(verdict["setup"])), verdict.get("streak") or 0,
+         verdict["reason"], json.dumps(verdict.get("quarters") or []),
+         ",".join(setup_signal.tag_family(facts)),
+         date.today().isoformat(), XBRL_DERIVATION),
+    )
     return shares_out
+
+
+def setup_condition(conn, cik):
+    """The cached Lane A verdict for an issuer, or None if never derived."""
+    if not cik:
+        return None
+    row = conn.execute("SELECT * FROM issuer_setup WHERE cik = ?", (cik,)).fetchone()
+    return dict(row) if row else None
 
 
 def _fresh(row):

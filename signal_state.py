@@ -422,6 +422,22 @@ def _has_table(conn, name):
     ).fetchone() is not None
 
 
+def _setup_condition(conn, cik):
+    """The collector's cached Lane A verdict, or None.
+
+    Read rather than computed here: the metric needs a companyfacts payload,
+    the collector already fetches one per periodic filer, and a second fetch
+    for the same document would double the request cost of the whole lane.
+    Absent when the table does not exist, which is the standalone self-test.
+    """
+    if not cik or not _has_table(conn, "issuer_setup"):
+        return None
+    row = conn.execute(
+        "SELECT setup, streak, reason FROM issuer_setup WHERE cik = ?",
+        (int(cik),)).fetchone()
+    return dict(row) if row else None
+
+
 def _corporate_events(conn, ticker, as_of, days=BUY_WINDOW_DAYS):
     """Open buyback and M&A events for this issuer, strongest first.
 
@@ -484,15 +500,14 @@ def evaluate(conn, cik, ticker=None, as_of=None,
       3. two or more insiders buying       -> EXTENDED
       4. open-market buying above the floor -> CONFIRMED
       5. a definitive deal document        -> CONFIRMED
-      6. a buyback, or another precursor   -> SETUP
-      7. nothing                           -> DORMANT
+      6. the Lane A balance-sheet setup    -> SETUP
+      7. a buyback                         -> SETUP
+      8. nothing                           -> DORMANT
 
-    has_setup_signal and is_crowded are parameters rather than lookups because
-    the work that would compute them is deliberately deferred -- the XBRL
-    deferred-revenue lane, and crowding. They default to False. SETUP is
-    reachable regardless, because a buyback now produces it; when the lane
-    lands it becomes a second producer of the same state, which is right,
-    since both mean "something happened and no insider has backed it".
+    has_setup_signal is now an OVERRIDE rather than the only route: passing
+    True forces SETUP, and leaving it False lets the cached Lane A verdict
+    decide. That keeps the parameter useful for testing a state directly while
+    the real signal comes from the collector. is_crowded remains deferred.
 
     Returns a dict: state, reason, and the evidence the reason was drawn from.
     """
@@ -552,6 +567,21 @@ def evaluate(conn, cik, ticker=None, as_of=None,
     # not: buybacks and M&A produce no insider ledger rows, so an issuer known
     # only for those never left DORMANT and never reached a page built from
     # transitions. Two of the collector's three signals, invisible.
+    # Lane A, before the corporate branch. Both land in SETUP, and when an
+    # issuer has each of them the balance-sheet condition is the one worth
+    # naming: a repurchase authorisation is one board meeting, while contract
+    # liabilities compounding past revenue for three quarters is the shape of
+    # the business changing. Checked here rather than at the has_setup_signal
+    # line below so it cannot be buried by the buyback.
+    setup = _setup_condition(conn, cik) if has_setup_signal is False else None
+    if has_setup_signal or (setup and setup.get("setup")):
+        return {
+            "state": SETUP,
+            "reason": (setup or {}).get("reason")
+                      or "setup signal present, no confirming purchase",
+            "evidence": {"setup": setup},
+        }
+
     corporate = _corporate_events(conn, ticker, as_of)
     if corporate:
         top = corporate[0]
@@ -583,13 +613,6 @@ def evaluate(conn, cik, ticker=None, as_of=None,
             "reason": f"deal filing ({top['event_type'][3:].upper()}) "
                       f"filed {top['filed_date']}{more}",
             "evidence": {"events": [dict(e) for e in corporate]},
-        }
-
-    if has_setup_signal:
-        return {
-            "state": SETUP,
-            "reason": "setup signal present, no confirming purchase",
-            "evidence": {},
         }
 
     return {"state": DORMANT, "reason": "no activity in window", "evidence": {}}
