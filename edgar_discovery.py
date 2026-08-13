@@ -93,7 +93,13 @@ SHARES_TTL_DAYS = 30
 # stale however recent it is -- otherwise a corrected rule sits inert behind a
 # thirty-day TTL, which is exactly how the multi-year buyback periods survived
 # the fix that was supposed to remove them.
-XBRL_DERIVATION = 3
+# Bumped to 4 for Lane A. Every cached row was written by rules that did not
+# compute the setup condition, and _fresh() would have gone on serving them for
+# the full 30-day TTL -- so the new lane would have produced nothing at all for
+# a month while looking perfectly healthy. Sixth time in this file that a rule
+# has shipped without reaching what was already stored; the version exists
+# precisely so it does not have to be a seventh.
+XBRL_DERIVATION = 4
 
 # How many stale issuers a single run re-derives. Bumping XBRL_DERIVATION
 # invalidates every cached row at once, and refetching them all in one run
