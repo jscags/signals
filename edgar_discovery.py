@@ -1942,11 +1942,19 @@ def handle_form4(conn, row, tickers):
     # The ledger stays per-transaction; only the emitted event is aggregated.
     by_ticker = {}
     for buy in buys:
-        # Fall back to the ticker map when the XML omits the symbol.
-        if not buy["ticker"] and buy["issuer_cik"] in tickers:
-            buy["ticker"] = tickers[buy["issuer_cik"]][0]
-        if not buy["ticker"]:
-            continue  # not a listed issuer
+        # Fall back to the ticker map when the XML has no usable symbol.
+        #
+        # "No usable symbol" is not the same as "empty". Wilson Bank Holding
+        # really does report its trading symbol as the string "none", and since
+        # that is truthy the fallback never ran -- so the ledger, the events,
+        # the state machine and the card all carried a company called NONE,
+        # sitting on the dashboard above a $27M purchase at 8.47% of the
+        # company. The placeholders were already enumerated for link rendering;
+        # they just were not consulted this early.
+        if not real_ticker(buy["ticker"]):
+            buy["ticker"] = (tickers.get(buy["issuer_cik"]) or (None,))[0]
+        if not real_ticker(buy["ticker"]):
+            continue  # not a listed issuer, or no symbol we can name it by
 
         conn.execute(
             """INSERT OR IGNORE INTO insider_buys
@@ -2149,6 +2157,75 @@ def buyback_headline(entity, detail):
         scale = ""
     return (f"{entity}: repurchased stock{scale}"
             + (f" — {detail['company']}" if detail.get("company") else ""))
+
+
+def repair_placeholder_tickers(conn, tickers):
+    """Re-resolve issuers stored under a placeholder symbol.
+
+    Guarding handle_form4 stops new ones; this reaches what is already stored,
+    which is the half that has been forgotten four times in this file.
+
+    Two outcomes, because the placeholders turn out to mean two different
+    things. A listed company that simply reports its symbol oddly resolves from
+    the ticker map and is renamed everywhere -- Wilson Bank Holding files as
+    "none" and is WBHC. Everything else with no symbol has none because it does
+    not trade: interval funds, BDCs, private credit vehicles. Those are retired
+    rather than renamed. Insiders buying into a fund nobody can buy is not a
+    signal, and leaving it on the page as a company called NONE was worse.
+
+    The ledger rows are kept in both cases. It is a record of what was filed,
+    and deleting history to tidy a display is how you lose the ability to
+    explain a number later.
+    """
+    renamed = retired = 0
+    rows = conn.execute(
+        "SELECT DISTINCT issuer_cik AS cik, ticker FROM insider_buys "
+        "UNION SELECT cik, ticker FROM issuer_state"
+    ).fetchall()
+
+    for row in rows:
+        cik, stored = row["cik"], row["ticker"]
+        if not cik or real_ticker(stored):
+            continue
+        resolved = (tickers.get(int(cik)) or (None,))[0]
+        resolved = real_ticker(resolved)
+
+        if resolved:
+            for sql in (
+                "UPDATE insider_buys SET ticker = ? WHERE issuer_cik = ?",
+                "UPDATE insider_sales SET ticker = ? WHERE issuer_cik = ?",
+                "UPDATE OR IGNORE events SET entity = ? WHERE entity = ?",
+                "UPDATE issuer_state SET ticker = ? WHERE cik = ?",
+                "UPDATE state_transitions SET ticker = ? WHERE cik = ?",
+                "UPDATE OR IGNORE watchlist SET ticker = ? WHERE ticker = ?",
+            ):
+                key = stored if "entity = ?" in sql or "watchlist" in sql else cik
+                conn.execute(sql, (resolved, key))
+            renamed += 1
+            continue
+
+        # Untradeable. Off the dashboard, out of the state machine, ledger kept.
+        #
+        # Counted by what actually changed, not by how many issuers were
+        # examined. The ledger rows keep the placeholder on purpose, so these
+        # issuers come back round on every run -- and a count that incremented
+        # regardless would report retiring the same nine funds twice a day
+        # forever, which is a made-up number in a status line.
+        touched = 0
+        touched += conn.execute(
+            "UPDATE events SET reviewed_at = ? WHERE entity = ? AND reviewed_at IS NULL",
+            (datetime.utcnow().isoformat(timespec="seconds"), stored),
+        ).rowcount
+        touched += conn.execute(
+            "DELETE FROM state_transitions WHERE cik = ?", (cik,)).rowcount
+        touched += conn.execute(
+            "DELETE FROM issuer_state WHERE cik = ?", (cik,)).rowcount
+        touched += conn.execute(
+            "DELETE FROM watchlist WHERE ticker = ?", (stored,)).rowcount
+        if touched:
+            retired += 1
+
+    return renamed, retired
 
 
 def refresh_headlines(conn):
@@ -2820,6 +2897,16 @@ YAHOO_QUOTE = "https://finance.yahoo.com/quote/{}"
 NON_TICKERS = {"", "-", "—", "none", "n/a", "na", "null"}
 
 
+def real_ticker(symbol):
+    """The symbol, or None when it is a placeholder standing in for one.
+
+    EDGAR carries these verbatim from the filing, so they are data, not gaps --
+    which is why `if not ticker` never caught them.
+    """
+    text = (symbol or "").strip()
+    return text if text.lower() not in NON_TICKERS else None
+
+
 def yahoo_url(ticker):
     """Quote-page URL for a symbol, or None when it is not one.
 
@@ -3454,6 +3541,7 @@ def main():
     # repair its own output. Cheap after the first pass -- sane scores are
     # skipped, and share counts come from the cache.
     drained = refresh_stale_facts(conn)
+    renamed, retired_funds = repair_placeholder_tickers(conn, tickers)
     fixed, newly_promoted = rescore(conn)
     fixed_buybacks, dropped_funds = rescore_buybacks(conn)
     reworded = refresh_headlines(conn)
@@ -3462,6 +3550,9 @@ def main():
     conn.commit()
     if drained:
         print(f"re-derived {drained} stale issuer(s)")
+    if renamed or retired_funds:
+        print(f"resolved {renamed} placeholder ticker(s); "
+              f"retired {retired_funds} untradeable issuer(s)")
     if dropped_funds:
         print(f"dropped {dropped_funds} fund redemption(s) miscounted as buybacks")
     if fixed_buybacks:
