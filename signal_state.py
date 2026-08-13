@@ -355,6 +355,39 @@ def _window(as_of, days):
     return (as_of - timedelta(days=days)).isoformat(), as_of.isoformat()
 
 
+def _has_table(conn, name):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def _corporate_events(conn, ticker, as_of, days=BUY_WINDOW_DAYS):
+    """Open buyback and M&A events for this issuer, strongest first.
+
+    These live in the collector's events table, which this module reads but
+    does not own -- and which is absent when the module runs standalone (the
+    self-test), so its absence is an ordinary answer rather than an error.
+
+    Without this, two of the collector's three signals never reached the state
+    machine at all: an issuer known only for a buyback or a merger document had
+    no insider ledger rows, so it never transitioned, so it never appeared on a
+    dashboard built from transitions. Measured on the live database the day the
+    dashboard switched over, that was 376 of 517 companies gone -- two thirds
+    of the page, dropped by an integration seam rather than by anyone's intent.
+    """
+    if not ticker or not _has_table(conn, "events"):
+        return []
+    since, until = _window(as_of, days)
+    return conn.execute(
+        """SELECT event_type, tier, headline, filed_date FROM events
+           WHERE entity = ? AND reviewed_at IS NULL
+             AND (event_type = 'buyback' OR event_type LIKE 'ma\\_%' ESCAPE '\\')
+             AND filed_date BETWEEN ? AND ?
+           ORDER BY tier ASC, filed_date DESC""",
+        (ticker, since, until),
+    ).fetchall()
+
+
 def _buys(conn, cik, as_of, days=BUY_WINDOW_DAYS):
     since, until = _window(as_of, days)
     return conn.execute(
@@ -449,6 +482,24 @@ def evaluate(conn, cik, ticker=None, as_of=None,
             "evidence": {"buyers": sorted(buyers), "value": bought},
         }
 
+    # The company acting on its own stock, or a deal document. Checked after
+    # the insider rules because an insider is a person putting their own money
+    # in and that is the stronger statement -- but checked at all, which it was
+    # not: buybacks and M&A produce no insider ledger rows, so an issuer known
+    # only for those never left DORMANT and never reached a page built from
+    # transitions. Two of the collector's three signals, invisible.
+    corporate = _corporate_events(conn, ticker, as_of)
+    if corporate:
+        top = corporate[0]
+        kind = ("repurchasing stock" if top["event_type"] == "buyback"
+                else f"deal filing ({top['event_type'][3:].upper()})")
+        more = f" (+{len(corporate) - 1} more)" if len(corporate) > 1 else ""
+        return {
+            "state": CONFIRMED,
+            "reason": f"{kind} filed {top['filed_date']}{more}",
+            "evidence": {"events": [dict(e) for e in corporate]},
+        }
+
     if has_setup_signal:
         return {
             "state": SETUP,
@@ -538,7 +589,39 @@ def issuers_to_evaluate(conn, as_of=None):
         cik = int(row["cik"])
         if row["ticker"] or cik not in out:
             out[cik] = row["ticker"] or out.get(cik)
+
+    # Issuers known only for a buyback or a deal document. They have no ledger
+    # rows, so none of the branches above sees them -- which is what silently
+    # kept two thirds of the collector's output off a transition-driven page.
+    #
+    # The CIK comes from two places because the two event types record it
+    # differently: a buyback carries it in its detail JSON, while a deal filing
+    # carries only the accession, which the documents table maps back. An
+    # issuer whose CIK resolves from neither is skipped rather than given a
+    # made-up one -- issuer_state is keyed on CIK and a fabricated key would
+    # collide with a real issuer sooner or later.
+    for cik, ticker in _corporate_issuers(conn, since):
+        if ticker or cik not in out:
+            out[cik] = ticker or out.get(cik)
     return sorted(out.items())
+
+
+def _corporate_issuers(conn, since):
+    """(cik, ticker) for issuers with an open buyback or deal filing."""
+    if not _has_table(conn, "events"):
+        return []
+    rows = conn.execute(
+        """SELECT e.entity AS ticker,
+                  COALESCE(json_extract(e.detail, '$.cik'), d.cik) AS cik
+             FROM events e
+             LEFT JOIN documents d ON d.accession = e.source_id
+            WHERE e.reviewed_at IS NULL
+              AND (e.event_type = 'buyback'
+                   OR e.event_type LIKE 'ma\\_%' ESCAPE '\\')
+              AND e.filed_date >= ?""",
+        (since,),
+    ).fetchall()
+    return [(int(r["cik"]), r["ticker"]) for r in rows if r["cik"]]
 
 
 def classify_all(conn, as_of=None):

@@ -2634,7 +2634,11 @@ h1 {
   .kpi.lead { flex-basis: 100%; }
 }
 @media (prefers-reduced-motion: no-preference) {
-  .row { animation: rise .3s ease-out backwards; }
+  /* Entry only. Sorting reorders by re-inserting every node, which restarts a
+     CSS animation -- so with the animation left on, changing the sort made all
+     500-odd cards fade in at once and the whole page flashed. The script adds
+     .settled once the first paint is done. */
+  #list:not(.settled) .row { animation: rise .3s ease-out backwards; }
   @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
 }
 """
@@ -2801,6 +2805,9 @@ SCRIPT = """
   });
 
   apply();
+  // First paint is over; stop the entry animation so re-sorting (which
+  // re-inserts every node) does not replay it across the whole list.
+  requestAnimationFrame(function () { list.classList.add('settled'); });
 })();
 """
 
@@ -3139,7 +3146,7 @@ def render_controls(grouped):
 <div class="dist" id="dist" role="group" aria-label="Filter by significance">{rows}</div>"""
 
 
-def render_state_panel(counts, n_moves, window_days):
+def render_state_panel(counts, n_moves, window_days, truncated=False):
     """Where every issuer stands, beside how many moved. Both are needed.
 
     The counts are standing state and the list below is change, so a run where
@@ -3159,7 +3166,8 @@ def render_state_panel(counts, n_moves, window_days):
     return (
         f'<div class="kpis">{tiles}</div>'
         f'<div class="tier-head"><b>Moved in the last {window_days} days</b>'
-        f"<span>{n_moves}</span></div>"
+        f"<span>{n_moves}{' (showing the most recent)' if truncated else ''}"
+        f"</span></div>"
     )
 
 
@@ -3186,7 +3194,14 @@ def write_html(conn, path="dashboard.html", window_days=14):
     ).fetchall()
 
     since = market_today() - timedelta(days=window_days)
-    moves = signal_state.transitions_since(conn, since=since)
+    # The cap is asked for explicitly and one over, so the page can tell the
+    # reader it was truncated rather than just ending. A first run transitions
+    # every issuer at once -- 544 of them here -- and silently drawing the
+    # first 200 of those would be the same silent-shortfall bug in a new place.
+    cap = 600
+    moves = signal_state.transitions_since(conn, since=since, limit=cap + 1)
+    truncated = len(moves) > cap
+    moves = moves[:cap]
     counts = signal_state.state_counts(conn)
 
     # Filings for the issuers that moved, so a transition card can show what
@@ -3227,7 +3242,7 @@ def write_html(conn, path="dashboard.html", window_days=14):
                     'being tracked; the panel above shows where they stand.</p>')
 
     sections = [
-        render_state_panel(counts, len(moves), window_days),
+        render_state_panel(counts, len(moves), window_days, truncated),
         f'<section id="list">{"".join(body)}</section>',
         '<p class="empty none" id="nohits">No company matches these filters.</p>',
     ]
@@ -3395,6 +3410,15 @@ def main():
         return
 
     if args.html and not (args.date or args.backfill):
+        # Classify before rendering. The page is built from transitions, so a
+        # rebuild that skipped this drew an empty dashboard over a full
+        # database -- which is precisely the "collector produced nothing" /
+        # "classification found nothing" confusion the two lines below exist to
+        # end, arrived at from the third direction: nothing had been asked.
+        # No network here; it reads the tables the collector already filled.
+        n_issuers, moves = signal_state.classify_all(conn, as_of=market_today())
+        print(f"CLASSIFIED {n_issuers} issuer(s), {len(moves)} transition(s)")
+        print(f"STATE COUNTS {signal_state.state_counts(conn)}")
         path, n = write_html(conn, args.html)
         print(f"wrote {path} ({n} open events)")
         return
