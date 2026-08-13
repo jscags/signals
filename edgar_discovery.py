@@ -121,6 +121,27 @@ MAX_PLAUSIBLE_BPS = 2_000.0
 # share-of-company score is unaffected, since price cancels out of that ratio.
 MAX_PLAUSIBLE_VALUE_USD = 1_000_000_000
 
+# Per-TRANSACTION ceiling, applied where a row enters the ledger.
+#
+# The aggregate ceiling above guards the emitted event; it does not guard the
+# ledger, and the state machine reads the ledger. So Reborn Coffee -- a
+# sub-dollar microcap whose Form 4 reported $180,000 a share -- had its event
+# correctly suppressed while the state machine went on saying "bought
+# $23,649,660,000", which is the figure that reached the page.
+#
+# Set above the largest legitimate figure the collector has seen by a wide
+# margin. Real sponsor block sales run to the hundreds of millions: Argon
+# Holdco's $491M in CRBG, Leonard Green's $221M in LTH, TPG's $145M in LFST.
+# Those are exactly the kind of thing this must NOT reject, so the bar sits an
+# order of magnitude above them.
+#
+# Form 4 does not carry a currency element -- transactionPricePerShare is a
+# bare number and the schema assumes USD -- so a foreign-currency price cannot
+# be detected from the XML. Prose footnotes sometimes say so. Until that is
+# parsed, an implausible figure is all the signal there is, which is why this
+# flags rather than converts.
+MAX_PLAUSIBLE_TXN_USD = 2_000_000_000
+
 # Cover-page share count first, the us-gaap balance-sheet tag as a fallback for
 # issuers that do not tag the dei concept.
 XBRL_CONCEPTS = (
@@ -656,6 +677,7 @@ CREATE TABLE IF NOT EXISTS insider_buys (
     shares       REAL,
     price        REAL,
     value        REAL,
+    suspect      INTEGER DEFAULT 0,
     UNIQUE(accession, owner, txn_date, shares, price)
 );
 CREATE INDEX IF NOT EXISTS idx_buys_issuer ON insider_buys(issuer_cik, txn_date);
@@ -745,6 +767,7 @@ def connect():
         # table. See log_run().
         "run_log": (("n_candidates", "INTEGER"), ("n_skipped", "INTEGER"),
                     ("n_refused", "INTEGER")),
+        "insider_buys": (("suspect", "INTEGER DEFAULT 0"),),
     }
     for table, columns in wanted.items():
         present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -1956,16 +1979,23 @@ def handle_form4(conn, row, tickers):
         if not real_ticker(buy["ticker"]):
             continue  # not a listed issuer, or no symbol we can name it by
 
+        suspect = int((buy["value"] or 0) > MAX_PLAUSIBLE_TXN_USD)
+        if suspect:
+            note_degraded("transaction above the plausible ceiling")
+            print(f"  SUSPECT {row['accession']} {buy['ticker']}: "
+                  f"{buy['shares']:,.0f} sh @ ${buy['price']:,.2f} = "
+                  f"{usd(buy['value'])} — held out of scoring for review")
         conn.execute(
             """INSERT OR IGNORE INTO insider_buys
                (accession, issuer_cik, ticker, issuer, owner, owner_title,
-                txn_date, shares, price, value)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                txn_date, shares, price, value, suspect)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (row["accession"], buy["issuer_cik"], buy["ticker"], buy["issuer"],
              buy["owner"], buy["owner_title"], buy["txn_date"], buy["shares"],
-             buy["price"], buy["value"]),
+             buy["price"], buy["value"], suspect),
         )
-        by_ticker.setdefault(buy["ticker"], []).append(buy)
+        if not suspect:
+            by_ticker.setdefault(buy["ticker"], []).append(buy)
 
     emitted = 0
     for ticker, group in by_ticker.items():
@@ -2157,6 +2187,26 @@ def buyback_headline(entity, detail):
         scale = ""
     return (f"{entity}: repurchased stock{scale}"
             + (f" — {detail['company']}" if detail.get("company") else ""))
+
+
+def flag_suspect_transactions(conn):
+    """Flag stored ledger rows above the per-transaction ceiling.
+
+    The guard at the write site only sees new rows. Reborn Coffee's
+    $23,649,660,000 was already in the ledger, and the state machine reads the
+    ledger -- so the event stayed correctly suppressed while the page went on
+    saying an insider bought twenty-three billion dollars of a coffee-shop
+    microcap. Fifth time a rule has shipped without reaching stored data.
+    """
+    flagged = 0
+    for table in ("insider_buys", "insider_sales"):
+        cur = conn.execute(
+            f"UPDATE {table} SET suspect = 1 "
+            "WHERE COALESCE(suspect, 0) = 0 AND value > ?",
+            (MAX_PLAUSIBLE_TXN_USD,),
+        )
+        flagged += cur.rowcount
+    return flagged
 
 
 def repair_placeholder_tickers(conn, tickers):
@@ -2669,6 +2719,7 @@ h1 {
                                color: #FFFFFF; font-weight: 700; }
 .row .tag.state-setup        { border-color: var(--r1); color: var(--ink); }
 .row .tag[class*="state-"]   { margin-left: 0; margin-right: 8px; }
+.because { color: var(--muted); }
 .none { display: none !important; }
 /* Secondary filings for a company already shown above. Subordinate to the
    headline on purpose: the card is the story, these are its other filings. */
@@ -3295,12 +3346,48 @@ def write_html(conn, path="dashboard.html", window_days=14):
     # was actually filed. Grouped by ticker the same way as before.
     by_entity = dict(group_by_company(events))
 
+    # One card per ISSUER, not per hop. An issuer can move twice in a day --
+    # DORMANT to CONFIRMED on a purchase, then CONFIRMED to EXTENDED when a
+    # second insider joins -- and both rows are correct history. Drawn as two
+    # cards they read as the page contradicting itself, which is how OVBC came
+    # to show "confirmed → extended" directly above "dormant → confirmed".
+    #
+    # Keyed on CIK rather than ticker, because a placeholder symbol is shared
+    # by every issuer that has one: eight distinct companies were all called
+    # NONE, and collapsing on the ticker merged them into a single card while
+    # collapsing on nothing drew eleven.
+    #
+    # The pair kept spans the whole day: the earliest from_state and the latest
+    # to_state, so a double hop reads as the net move it was.
+    net = {}
+    for move in moves:                       # newest first, from the query
+        seen = net.get(move["cik"])
+        if seen is None:
+            net[move["cik"]] = dict(move)
+        else:
+            seen["from_state"] = move["from_state"]   # older row, earlier state
+    # An issuer that went out and came back has not moved. REBN was CONFIRMED
+    # on a purchase, the purchase was flagged implausible, and it returned to
+    # DORMANT -- two true rows whose net is nothing, and "dormant → dormant" is
+    # not a thing to tell anyone. The history stays in the table either way.
+    moves = [m for m in net.values() if m["from_state"] != m["to_state"]]
+
     body = []
     for order, move in enumerate(moves):
-        entity = move["ticker"] or f"CIK {move['cik']}"
-        evs = by_entity.get(move["ticker"]) if move["ticker"] else None
+        entity = real_ticker(move["ticker"]) or f"CIK {move['cik']}"
+        evs = by_entity.get(move["ticker"]) if real_ticker(move["ticker"]) else None
         if evs:
             card = render_company(entity, evs, conn, order)
+            # The headline render_company picks is the loudest FILING on the
+            # card, which is not the same thing as the reason this issuer
+            # moved. STWI moved to DISTRIBUTING on a $414K sale and the card
+            # announced a purchase, because the purchase was the louder filing.
+            # The transition's own reason leads now; the filing stays beneath it
+            # as the evidence, which is the order a reader needs them in.
+            card = card.replace(
+                '<p class="headline">',
+                f'<p class="headline">{html.escape(move["reason"])}'
+                f'<span class="because"> — </span>', 1)
         else:
             # Moved on evidence that is not an open event -- a disqualifier, or
             # selling, or a purchase already reviewed away. Still a transition,
@@ -3541,6 +3628,7 @@ def main():
     # repair its own output. Cheap after the first pass -- sane scores are
     # skipped, and share counts come from the cache.
     drained = refresh_stale_facts(conn)
+    flagged = flag_suspect_transactions(conn)
     renamed, retired_funds = repair_placeholder_tickers(conn, tickers)
     fixed, newly_promoted = rescore(conn)
     fixed_buybacks, dropped_funds = rescore_buybacks(conn)
@@ -3550,6 +3638,8 @@ def main():
     conn.commit()
     if drained:
         print(f"re-derived {drained} stale issuer(s)")
+    if flagged:
+        print(f"flagged {flagged} transaction(s) above the plausible ceiling")
     if renamed or retired_funds:
         print(f"resolved {renamed} placeholder ticker(s); "
               f"retired {retired_funds} untradeable issuer(s)")

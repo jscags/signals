@@ -185,6 +185,7 @@ CREATE TABLE IF NOT EXISTS insider_sales (
     shares       REAL,
     price        REAL,
     value        REAL,
+    suspect      INTEGER DEFAULT 0,
     UNIQUE(accession, owner, txn_date, shares, price)
 );
 CREATE INDEX IF NOT EXISTS idx_sales_issuer ON insider_sales(issuer_cik, txn_date);
@@ -201,6 +202,15 @@ def migrate(conn):
     module promises never to produce.
     """
     conn.executescript(SCHEMA)
+
+    # CREATE TABLE IF NOT EXISTS will not add a column to a table that already
+    # exists, so a database written before `suspect` needs it grafted on. Same
+    # pattern the collector uses for its own tables; NULL reads as 0 via the
+    # COALESCE in the readers, so old rows behave as unflagged.
+    present = {r[1] for r in conn.execute("PRAGMA table_info(insider_sales)")}
+    if "suspect" not in present:
+        conn.execute("ALTER TABLE insider_sales ADD COLUMN suspect INTEGER DEFAULT 0")
+
     conn.commit()
     return conn
 
@@ -319,6 +329,12 @@ def scan_index_row_for_disqualifiers(conn, row, watched_ciks=None):
 # ---------------------------------------------------------------- insider sales
 
 
+# Mirrors edgar_discovery.MAX_PLAUSIBLE_TXN_USD. Duplicated as a literal rather
+# than imported because this module must run standalone for its self-test, and a
+# circular import to fetch one integer is a worse trade than restating it here.
+MAX_PLAUSIBLE_TXN_USD = 2_000_000_000
+
+
 def record_insider_sales(conn, sales):
     """Store code-S / disposed-D transactions. The mirror of the code-P path.
 
@@ -335,14 +351,19 @@ def record_insider_sales(conn, sales):
         value = sale.get("value")
         if value is None and sale.get("shares") and sale.get("price"):
             value = sale["shares"] * sale["price"]
+        # Same ceiling as the buy side. The sell path was mirrored from the
+        # buy parser but not from its guards, so nothing here checked a figure
+        # at all -- and DISTRIBUTING is driven by summed dollars.
+        suspect = int((value or 0) > MAX_PLAUSIBLE_TXN_USD)
         cur = conn.execute(
             """INSERT OR IGNORE INTO insider_sales
                (accession, issuer_cik, ticker, issuer, owner, owner_title,
-                txn_date, shares, price, value)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                txn_date, shares, price, value, suspect)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (sale.get("accession"), sale.get("issuer_cik"), sale.get("ticker"),
              sale.get("issuer"), sale.get("owner"), sale.get("owner_title"),
-             sale.get("txn_date"), sale.get("shares"), sale.get("price"), value),
+             sale.get("txn_date"), sale.get("shares"), sale.get("price"), value,
+             suspect),
         )
         n += cur.rowcount
     return n
@@ -392,7 +413,8 @@ def _buys(conn, cik, as_of, days=BUY_WINDOW_DAYS):
     since, until = _window(as_of, days)
     return conn.execute(
         """SELECT owner, txn_date, shares, price, value FROM insider_buys
-           WHERE issuer_cik = ? AND txn_date BETWEEN ? AND ?
+           WHERE issuer_cik = ? AND COALESCE(suspect, 0) = 0
+             AND txn_date BETWEEN ? AND ?
            ORDER BY txn_date DESC""",
         (int(cik), since, until),
     ).fetchall()
@@ -402,7 +424,8 @@ def _sales(conn, cik, as_of, days=SALE_WINDOW_DAYS):
     since, until = _window(as_of, days)
     return conn.execute(
         """SELECT owner, txn_date, shares, price, value FROM insider_sales
-           WHERE issuer_cik = ? AND txn_date BETWEEN ? AND ?
+           WHERE issuer_cik = ? AND COALESCE(suspect, 0) = 0
+             AND txn_date BETWEEN ? AND ?
            ORDER BY txn_date DESC""",
         (int(cik), since, until),
     ).fetchall()
@@ -695,7 +718,8 @@ def _selftest():
     conn.executescript("""
         CREATE TABLE insider_buys (accession TEXT, issuer_cik INTEGER,
           ticker TEXT, issuer TEXT, owner TEXT, owner_title TEXT,
-          txn_date TEXT, shares REAL, price REAL, value REAL);
+          txn_date TEXT, shares REAL, price REAL, value REAL,
+          suspect INTEGER DEFAULT 0);
     """)
     migrate(conn)
     set_user_agent("signal_state selftest selftest@example.com")
