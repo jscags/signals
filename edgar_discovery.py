@@ -3508,6 +3508,15 @@ FAMILIES = (
     ("ma", "M&A", lambda t: t.startswith("ma_")),
 )
 
+# Families for cards that exist because an issuer's STATE moved rather than
+# because it filed something. Keyed off the destination state rather than off
+# the reason text: the reason is prose written for a reader and parsing it back
+# out to decide a filter would break the first time it was reworded.
+EVIDENCE_FREE_FAMILIES = (
+    ("setup", "Setups"),
+    ("state", "Other state moves"),
+)
+
 
 def band_rung(band):
     """Position on the significance ladder, 1-5.
@@ -3690,8 +3699,16 @@ def render_company(entity, events, conn=None, order=0):
 </div>"""
 
 
-def render_controls(grouped):
+def render_controls(grouped, evidence_free=None):
     """The filter row, the significance distribution, and the KPI tiles.
+
+    `evidence_free` counts the cards drawn from a transition with no open
+    filing behind it, keyed by the family they carry. Lane A is the reason it
+    exists: a contract-liability setup is a statement about eight quarters of
+    balance sheet, so there is no filing to group it under, and a chipset built
+    only from filing families left those cards uncounted and unselectable --
+    present until any chip was pressed, then gone, with nothing to press to
+    bring them back.
 
     All three are one thing: a way through 400-odd cards. The distribution is
     both the overview and the band filter, which is why it is a chart rather
@@ -3705,15 +3722,27 @@ def render_controls(grouped):
         (entity, evs, json.loads(evs[0]["detail"] or "{}")) for entity, evs in grouped
     ]
 
+    evidence_free = evidence_free or {}
     chips = "".join(
         f'<button class="chipbtn" type="button" data-fam="{key}" aria-pressed="false">'
         f"{label}<small>{sum(1 for _, evs, _ in cards if any(test(e['event_type']) for e in evs)):,}</small>"
         f"</button>"
         for key, label, test in FAMILIES
     )
+    chips += "".join(
+        f'<button class="chipbtn" type="button" data-fam="{key}" aria-pressed="false">'
+        f"{label}<small>{evidence_free[key]:,}</small></button>"
+        for key, label in EVIDENCE_FREE_FAMILIES if evidence_free.get(key)
+    )
 
     counts = collections.Counter(d.get("significance") or "unscored" for _, _, d in cards)
-    widest = max(counts.values(), default=1)
+    # Those cards are drawn unscored, so the band they can be filtered by has
+    # to count them or the row says one number and shows another.
+    counts["unscored"] += sum(evidence_free.values())
+    # `or 1` because the line above can put a zero-valued key into an otherwise
+    # empty Counter, and max() then returns that 0 rather than the default --
+    # which divides by zero on a page with nothing on it.
+    widest = max(counts.values(), default=1) or 1
     rows = "".join(
         f'<button class="dist-row" type="button" data-band="{band}" aria-pressed="false">'
         f'<span class="dist-label">{band}</span>'
@@ -3841,6 +3870,7 @@ def write_html(conn, path="dashboard.html", window_days=14):
     moves = [m for m in moves if m["to_state"] != signal_state.DORMANT]
 
     body = []
+    evidence_free = collections.Counter()
     for order, move in enumerate(moves):
         entity = real_ticker(move["ticker"]) or f"CIK {move['cik']}"
         evs = by_entity.get(move["ticker"]) if real_ticker(move["ticker"]) else None
@@ -3858,11 +3888,14 @@ def write_html(conn, path="dashboard.html", window_days=14):
                 f'<span class="because"> — </span>', 1)
         else:
             # Moved on evidence that is not an open event -- a disqualifier, or
-            # selling, or a purchase already reviewed away. Still a transition,
+            # selling, or a purchase already reviewed away, or Lane A, whose
+            # whole point is an issuer that filed nothing. Still a transition,
             # so it still gets a card; the reason string carries it.
+            fam = "setup" if move["to_state"] == signal_state.SETUP else "state"
+            evidence_free[fam] += 1
             card = (
                 f'<div class="row" data-ord="{order}" data-tier="2" '
-                f'data-fam="state" data-band="unscored" data-rung="0" '
+                f'data-fam="{fam}" data-band="unscored" data-rung="0" '
                 f'data-mag="-1" data-usd="-1" '
                 f'data-filed="{html.escape(move["observed_on"])}" '
                 f'data-find="{html.escape(entity.lower())}">'
@@ -3891,7 +3924,8 @@ def write_html(conn, path="dashboard.html", window_days=14):
     ]
     grouped = [(m["ticker"] or f"CIK {m['cik']}",
                 by_entity.get(m["ticker"]) or []) for m in moves]
-    sections = [render_controls([g for g in grouped if g[1]])] + sections
+    sections = [render_controls([g for g in grouped if g[1]],
+                                evidence_free)] + sections
 
     covered = ", ".join(r["run_date"] for r in runs) or "no runs yet"
     # Candidates, not n_docs. n_docs counts what a pass newly fetched, which is
