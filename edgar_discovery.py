@@ -107,6 +107,20 @@ XBRL_DERIVATION = 4
 # rules first, while a normal run is unaffected because nothing is stale.
 STALE_REFRESH_BUDGET = 150
 
+# How many state transitions the dashboard will read before it stops and says
+# so. Transitions, not cards: the page collapses an issuer's moves into one
+# card, so 1,219 transitions here draw 575 cards.
+#
+# Measured rather than picked. At 600 the live page drew 378 cards in 352KB
+# and silently held back half the history; the whole of it is 575 cards in
+# 543KB, which is an ordinary size for a local file with no network fetch in
+# it. The ceiling that matters is the number of issuers that can move inside
+# the window -- bounded by the tracked universe, ~800 today and growing toward
+# the 10-Q filing population -- so this leaves room for that to roughly triple
+# before anything is held back again. The truncation note stays either way,
+# because a page that quietly ends is the failure this was built against.
+TRANSITION_CAP = 2500
+
 # Not every issuer tags the cover-page concept with a real number. Galaxy
 # Digital reports 100 shares outstanding, which values the whole company at
 # $1,963 -- so a $100K purchase came out as 51x the company, i.e. 5,100% of
@@ -3797,7 +3811,7 @@ def render_state_panel(counts, n_moves, window_days, truncated=False,
     )
 
 
-def write_html(conn, path="dashboard.html", window_days=14):
+def write_html(conn, path="dashboard.html", window_days=14, cap=None):
     """The page is built from TRANSITIONS, not from standing state.
 
     An issuer that has been CONFIRMED for three weeks is not news on day
@@ -3824,7 +3838,7 @@ def write_html(conn, path="dashboard.html", window_days=14):
     # reader it was truncated rather than just ending. A first run transitions
     # every issuer at once -- 544 of them here -- and silently drawing the
     # first 200 of those would be the same silent-shortfall bug in a new place.
-    cap = 600
+    cap = cap or TRANSITION_CAP
     moves = signal_state.transitions_since(conn, since=since, limit=cap + 1)
     truncated = len(moves) > cap
     moves = moves[:cap]
@@ -4018,6 +4032,10 @@ def main():
                     const=150,
                     help="diagnostic: what share of a sample of N issuers "
                          "clears the Lane A condition today")
+    ap.add_argument("--transition-cap", type=int, metavar="N",
+                    help=f"how many state transitions the dashboard reads "
+                         f"before truncating (default {TRANSITION_CAP}); "
+                         f"raise it when the page says it held moves back")
     ap.add_argument("--rescore", action="store_true",
                     help="backfill significance onto events stored before the scale")
     args = ap.parse_args()
@@ -4112,7 +4130,7 @@ def main():
         n_issuers, moves = signal_state.classify_all(conn, as_of=market_today())
         print(f"CLASSIFIED {n_issuers} issuer(s), {len(moves)} transition(s)")
         print(f"STATE COUNTS {signal_state.state_counts(conn)}")
-        path, n = write_html(conn, args.html)
+        path, n = write_html(conn, args.html, cap=args.transition_cap)
         print(f"wrote {path} ({n} open events)")
         return
 
@@ -4191,7 +4209,7 @@ def main():
     print(f"watchlist: {len(watched)} active")
 
     if args.html:
-        path, n = write_html(conn, args.html)
+        path, n = write_html(conn, args.html, cap=args.transition_cap)
         print(f"\nwrote {path} ({n} open events)")
     else:
         print()

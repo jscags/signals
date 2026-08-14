@@ -23,6 +23,9 @@ on:
       limit:
         description: 'Max documents per day for this manual run (scheduled runs use 500)'
         default: '40'
+      transition_cap:
+        description: 'State transitions the dashboard reads before truncating (blank = built-in default)'
+        default: ''
 
 permissions:
   contents: write
@@ -57,6 +60,7 @@ jobs:
           EDGAR_USER_AGENT: "edgar-discovery 52y9fp5njf@privaterelay.appleid.com"
           BACKFILL: ${{ inputs.backfill }}
           LIMIT: ${{ inputs.limit }}
+          TRANSITION_CAP: ${{ inputs.transition_cap }}
         run: |
           mkdir -p docs
           # A schedule event carries no inputs at all, so both arrive empty and
@@ -81,6 +85,13 @@ jobs:
           BACKFILL="${BACKFILL:-3}"
           LIMIT="${LIMIT:-500}"
           ARGS="--backfill $BACKFILL --html docs/index.html --limit $LIMIT"
+          # Left blank on a scheduled run and on a dispatch that does not set
+          # it, in which case the collector's own default stands. Only appended
+          # when a value was actually typed, so there is one default rather
+          # than two that can drift apart.
+          if [ -n "$TRANSITION_CAP" ]; then
+            ARGS="$ARGS --transition-cap $TRANSITION_CAP"
+          fi
           echo "running: python3 edgar_discovery.py $ARGS"
           python3 edgar_discovery.py $ARGS
 
