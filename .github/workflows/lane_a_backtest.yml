@@ -1,0 +1,56 @@
+# Lane A, Phase 1. Validation only: it fetches, measures and prints.
+#
+# Writes nothing, commits nothing, touches no database. Dispatch-only -- there
+# is deliberately no schedule, because nothing downstream depends on this and
+# the thesis it tests is unvalidated.
+#
+# It runs here rather than locally for one reason: data.sec.gov is reachable
+# from a GitHub runner and is not reachable from the development sandbox.
+
+name: lane-a-backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'all, axon, or control'
+        default: 'all'
+      sample:
+        description: 'Control set size (spec calls for 40)'
+        default: '40'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Parsing rules, before spending any requests on them
+        run: python3 lane_a_backtest.py --selftest
+
+      - name: Measure
+        env:
+          EDGAR_USER_AGENT: "edgar-discovery 52y9fp5njf@privaterelay.appleid.com"
+          STAGE: ${{ inputs.stage }}
+          SAMPLE: ${{ inputs.sample }}
+        run: |
+          STAGE="${STAGE:-all}"
+          SAMPLE="${SAMPLE:-40}"
+          case "$STAGE" in
+            axon)    ARGS="--axon" ;;
+            control) ARGS="--control --sample $SAMPLE" ;;
+            *)       ARGS="--sample $SAMPLE" ;;
+          esac
+          echo "running: python3 lane_a_backtest.py $ARGS"
+          python3 lane_a_backtest.py $ARGS
+
+      - name: Keep the control CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lane-a-control
+          path: lane_a_control.csv
+          if-no-files-found: ignore
