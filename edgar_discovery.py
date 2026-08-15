@@ -107,6 +107,12 @@ XBRL_DERIVATION = 4
 # rules first, while a normal run is unaffected because nothing is stale.
 STALE_REFRESH_BUDGET = 150
 
+# SIC lives behind a second endpoint the collector does not otherwise call, so
+# the backlog is worked off over several runs rather than all at once. Smaller
+# than the XBRL budget because it is a one-time backfill: once an issuer has a
+# code it is never asked again.
+SIC_REFRESH_BUDGET = 100
+
 # How many state transitions the dashboard will read before it stops and says
 # so. Transitions, not cards: the page collapses an issuer's moves into one
 # card, so 1,219 transitions here draw 575 cards.
@@ -337,6 +343,30 @@ MA_FORMS_TIER2 = {"S-4", "425", "SC TO-C", "SC 13E3"}
 MA_FORMS = MA_FORMS_TIER1 | MA_FORMS_TIER2
 
 TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+
+# Issuers whose "repurchase" is not a company buying its own stock. Enumerated
+# from the codes actually present in the lane, never as a range: the 6xxx block
+# is mostly real operating companies, and excluding it would have dropped
+# Schwab, Aflac, AIG, Brookfield, Carlyle and 36 banks.
+#
+#   6770  a SPAC redeeming shares out of trust. Mechanically unrelated to a
+#         buyback, and at these sizes it dominates the sort.
+#   6221  where the crypto vehicles sit -- Fidelity Solana Fund and Morgan
+#         Stanley Bitcoin Trust both carry it. A creation/redemption is not a
+#         capital-allocation decision by a company.
+#
+# Deliberately NOT excluded, having looked:
+#   6798  REITs. Real companies that really do repurchase; Medical Properties
+#         Trust was already established as a legitimate one here.
+#   6282  investment ADVISERS -- Brookfield, Carlyle, Virtus. Operating firms.
+#   6199  "Finance Services", which is a grab-bag holding OppFi, Consumer
+#         Portfolio Services and Security National beside several crypto
+#         treasury vehicles. Excluding it would take real companies with it, so
+#         it needs a discriminator this is not.
+EXCLUDED_SIC = {
+    "6770": "blank cheque",
+    "6221": "commodity or crypto trust",
+}
 
 # ---------------------------------------------------------------- http
 
@@ -915,6 +945,16 @@ CREATE TABLE IF NOT EXISTS run_log (
 -- promote a company into it; the stateful collectors (guidance, trials,
 -- contracts) will read from it. Manual entries never expire; auto ones do,
 -- so the list stays roughly the size of what is currently interesting.
+-- The issuer's SIC classification, fetched once from submissions and kept.
+-- Permanent rather than TTL'd: a company's industry code effectively never
+-- changes, and this is the only thing in the API that reports it.
+CREATE TABLE IF NOT EXISTS issuer_sic (
+    cik        INTEGER PRIMARY KEY,
+    sic        TEXT,
+    sic_desc   TEXT,
+    fetched_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS watchlist (
     ticker       TEXT PRIMARY KEY,
     cik          INTEGER,
@@ -1640,6 +1680,12 @@ def handle_periodic(conn, row, listed):
         shares_outstanding(conn, row["cik"]),
         public_float(conn, row["cik"]),
     )
+    # A SPAC redeeming out of trust, or a crypto vehicle creating and
+    # destroying units, is not a company buying its own stock. Checked before
+    # the size floor because the size is exactly what makes these loud.
+    if is_excluded_vehicle(conn, row["cik"]):
+        return 0
+
     # Housekeeping is not news. Below the floor the document is still recorded
     # as processed, so this is a decision not to publish rather than a filing
     # left to be rescanned every run.
@@ -1731,6 +1777,70 @@ def probe_setup(cik=1069183, start_year=2013, end_year=2018):
             print(f"{q['quarter_end']:>12} {q['liability']:>16,.0f} "
                   f"{q['revenue']:>16,.0f} {q['liability_growth_pct']:>8.1f} "
                   f"{q['revenue_growth_pct']:>8.1f} {q['gap_pp']:>8.1f}")
+
+
+def company_sic(conn, cik):
+    """The issuer's SIC code, fetched once and cached.
+
+    The classification effectively never changes, so this is a permanent cache
+    rather than a TTL. A miss is stored too -- an issuer the endpoint has
+    nothing for should not be re-asked on every run.
+
+    Returns None when it has never been fetched, which callers must treat as
+    "not known yet" rather than "not excluded". The difference matters while
+    the backfill drains: an unknown SIC cannot be used to drop anything.
+    """
+    if not cik:
+        return None
+    row = conn.execute("SELECT sic FROM issuer_sic WHERE cik = ?",
+                       (int(cik),)).fetchone()
+    return row["sic"] if row else None
+
+
+def refresh_issuer_sic(conn, cik):
+    """Fetch and store one issuer's SIC. Returns it, or None on a refusal."""
+    payload = fetch_json_submissions(cik)
+    if payload is None:
+        return None
+    sic = (payload.get("sic") or "").strip()
+    conn.execute(
+        """INSERT INTO issuer_sic (cik, sic, sic_desc, fetched_at)
+           VALUES (?,?,?,?)
+           ON CONFLICT(cik) DO UPDATE SET
+             sic = excluded.sic, sic_desc = excluded.sic_desc,
+             fetched_at = excluded.fetched_at""",
+        (int(cik), sic, (payload.get("sicDescription") or "").strip(),
+         date.today().isoformat()),
+    )
+    return sic
+
+
+def backfill_issuer_sic(conn, budget=SIC_REFRESH_BUDGET):
+    """Fetch SIC for issuers in the buyback lane that have none yet.
+
+    Budgeted like the XBRL drain: submissions is a second endpoint the
+    collector does not otherwise call, so this adds requests to a run and the
+    backlog is worked off over several rather than all at once.
+    """
+    pending = [
+        row["cik"] for row in conn.execute(
+            """SELECT DISTINCT b.cik FROM issuer_buybacks b
+               LEFT JOIN issuer_sic s ON s.cik = b.cik
+               WHERE s.cik IS NULL ORDER BY b.cik LIMIT ?""", (budget,))
+    ]
+    for cik in pending:
+        refresh_issuer_sic(conn, cik)
+    return len(pending)
+
+
+def is_excluded_vehicle(conn, cik):
+    """Is this issuer a vehicle rather than a company, by its SIC code?
+
+    False when the SIC is not known yet -- silence is not evidence, and while
+    the backfill drains an unfetched issuer must keep whatever the name
+    patterns already decided about it rather than being dropped on a blank.
+    """
+    return company_sic(conn, cik) in EXCLUDED_SIC
 
 
 def probe_sic(sample=0):
@@ -3027,7 +3137,9 @@ def rescore_buybacks(conn):
     for row in conn.execute(
         "SELECT id, detail FROM events WHERE event_type = 'buyback'"
     ).fetchall():
-        if is_fund_vehicle(json.loads(row["detail"] or "{}").get("company")):
+        detail = json.loads(row["detail"] or "{}")
+        if (is_fund_vehicle(detail.get("company"))
+                or is_excluded_vehicle(conn, detail.get("cik"))):
             conn.execute("DELETE FROM events WHERE id = ?", (row["id"],))
             dropped += 1
 
@@ -4523,6 +4635,7 @@ def main():
     # repair its own output. Cheap after the first pass -- sane scores are
     # skipped, and share counts come from the cache.
     drained = refresh_stale_facts(conn)
+    classified = backfill_issuer_sic(conn)
     unscaled = unannualise_buybacks(conn)
     flagged = flag_suspect_transactions(conn)
     renamed, retired_funds = repair_placeholder_tickers(conn, tickers)
