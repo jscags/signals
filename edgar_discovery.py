@@ -1779,13 +1779,27 @@ def probe_sic(sample=0):
               f"{(f'{rate:.1f}%/yr' if rate is not None else 'unscored'):>9}  "
               f"{'CAUGHT' if is_fund_vehicle(company) else '-':>12}  {company[:40]}")
 
-    print(f"\n{'sic':>6} {'issuers':>8}  description")
-    for sic, (desc, tickers) in sorted(by_sic.items(),
-                                       key=lambda kv: -len(kv[1][1])):
-        print(f"{sic:>6} {len(tickers):>8}  {desc[:52]}")
-        if len(tickers) <= 12:
-            print(f"         {' '.join(sorted(tickers))}")
-    print(f"\nunresolved: {unresolved}")
+    # Only the codes that could plausibly be excluded are listed in full. The
+    # operating-company tail is 100-odd codes with one issuer each and reading
+    # it proves nothing; what has to be read carefully is the financial range
+    # and anything whose description names a vehicle rather than a business.
+    def candidate(sic, desc):
+        d = desc.lower()
+        return (sic.startswith("6")
+                or any(w in d for w in ("blank check", "trust", "fund",
+                                        "investment", "commodity")))
+
+    print(f"\nEXCLUSION CANDIDATES -- financial range and vehicle descriptions")
+    print(f"{'sic':>6} {'n':>4}  description")
+    other = 0
+    for sic, (desc, tickers) in sorted(by_sic.items()):
+        if candidate(sic, desc):
+            print(f"{sic:>6} {len(tickers):>4}  {desc[:50]}")
+            print(f"        {' '.join(sorted(tickers))}")
+        else:
+            other += len(tickers)
+    print(f"\noperating companies in codes not listed above: {other}")
+    print(f"unresolved: {unresolved}")
 
 
 def fetch_json_submissions(cik):
