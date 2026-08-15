@@ -1679,19 +1679,20 @@ def probe_form4(accession):
     them, since the question is whether one transaction is being read twice or
     whether the filing genuinely carries both a purchase and a disposal.
     """
-    plain = accession.replace("-", "")
-    cik = None
-    for row in connect().execute(
-            "SELECT cik FROM documents WHERE accession = ?", (accession,)):
-        cik = row["cik"]
-    if cik is None:
-        print(f"accession {accession} is not in documents; trying the index")
+    doc = connect().execute(
+        "SELECT cik, path FROM documents WHERE accession = ?",
+        (accession,)).fetchone()
+    if doc is None:
+        print(f"accession {accession} is not in the documents table")
         return
-    path = (f"https://www.sec.gov/Archives/edgar/data/{cik}/{plain}/"
-            f"{accession}-index.htm")
-    print(f"accession : {accession}\nissuer cik: {cik}\nindex     : {path}")
+    # The master index already carries the path. Building one from the CIK and
+    # a de-hyphenated accession guesses at a directory layout EDGAR does not
+    # use for the full submission text, and guessing returned a 404 that read
+    # as "no document" rather than as "wrong URL".
+    url = f"https://www.sec.gov/Archives/{doc['path']}"
+    print(f"accession : {accession}\nissuer cik: {doc['cik']}\nurl       : {url}")
 
-    text = fetch(f"https://www.sec.gov/Archives/edgar/data/{cik}/{plain}.txt")
+    text = fetch(url)
     if not text:
         print("no document body returned")
         return
