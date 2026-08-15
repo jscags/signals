@@ -4057,12 +4057,33 @@ def render_company(entity, events, conn=None, order=0):
         )
         chips = f'<div class="chips">{marks}</div>'
 
+    # Collapse sub-lines that say the same thing. TONT drew "425 filed — Graf
+    # Global Corp." four times and THRM three, one per filing.
+    #
+    # NOT deduplicated on accession, which is what it looks like from the page:
+    # the four accessions are 0001104659-26-095888, -095896, -095897 and
+    # -095900, all different and all real. A company announcing a merger files
+    # several Rule 425 communications in a day -- the release, the deck, the
+    # transcript -- and each is its own filing. What repeats is the sentence,
+    # so the sentence is the key, and the count is kept rather than thrown away
+    # because "four filings" is a fact about the day and "one" would be a lie.
+    tally = {}
+    for event in events:
+        key = (_strip_ticker(event["headline"] or "", entity),
+               event["filed_date"] or "")
+        tally[key] = tally.get(key, 0) + 1
+    lead = (_strip_ticker(primary["headline"] or "", entity),
+            primary["filed_date"] or "")
+    if tally.get(lead, 0) > 1:
+        bits.append(f"{tally[lead]} filings this day")
+
     more = ""
-    if len(events) > 1:
+    rest = [(k, n) for k, n in tally.items() if k != lead]
+    if rest:
         items = "".join(
-            f"<li>{html.escape(_strip_ticker(e['headline'] or '', entity))}"
-            f"<span>{html.escape(e['filed_date'] or '')}</span></li>"
-            for e in events[1:]
+            f"<li>{html.escape(text)}{f' ×{n}' if n > 1 else ''}"
+            f"<span>{html.escape(when)}</span></li>"
+            for (text, when), n in rest
         )
         more = f'<ul class="more">{items}</ul>'
 
