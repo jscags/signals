@@ -1667,6 +1667,60 @@ def probe_setup(cik=1069183, start_year=2013, end_year=2018):
                   f"{q['revenue_growth_pct']:>8.1f} {q['gap_pp']:>8.1f}")
 
 
+def probe_form4(accession):
+    """Print every non-derivative transaction in one Form 4, unfiltered.
+
+    Read-only, writes nothing. Exists because the ledger cannot answer the
+    question: `parse_form4` returns no accession, so `record_insider_sales`
+    stores NULL for all 1,166 sale rows and a stored sale cannot be traced back
+    to the filing it came from. The document itself is the only witness.
+
+    Prints the codes and directions as filed rather than the parser's view of
+    them, since the question is whether one transaction is being read twice or
+    whether the filing genuinely carries both a purchase and a disposal.
+    """
+    plain = accession.replace("-", "")
+    cik = None
+    for row in connect().execute(
+            "SELECT cik FROM documents WHERE accession = ?", (accession,)):
+        cik = row["cik"]
+    if cik is None:
+        print(f"accession {accession} is not in documents; trying the index")
+        return
+    path = (f"https://www.sec.gov/Archives/edgar/data/{cik}/{plain}/"
+            f"{accession}-index.htm")
+    print(f"accession : {accession}\nissuer cik: {cik}\nindex     : {path}")
+
+    text = fetch(f"https://www.sec.gov/Archives/edgar/data/{cik}/{plain}.txt")
+    if not text:
+        print("no document body returned")
+        return
+    root = extract_ownership_xml(text)
+    if root is None:
+        print("no ownership XML in the submission")
+        return
+
+    print("\nreporting owners:")
+    for owner in root.findall("reportingOwner"):
+        print("   ", _text(owner, "reportingOwnerId/rptOwnerName", "UNKNOWN"))
+
+    print(f"\n{'code':>5} {'A/D':>4} {'date':>12} {'shares':>14} {'price':>10} "
+          f"{'value':>14}")
+    for txn in root.findall("nonDerivativeTable/nonDerivativeTransaction"):
+        code = _text(txn, "transactionCoding/transactionCode")
+        direction = _text(
+            txn, "transactionAmounts/transactionAcquiredDisposedCode/value")
+        shares = _num(txn, "transactionAmounts/transactionShares/value") or 0
+        price = _num(txn, "transactionAmounts/transactionPricePerShare/value") or 0
+        print(f"{code or '?':>5} {direction or '?':>4} "
+              f"{_text(txn, 'transactionDate/value') or '?':>12} "
+              f"{shares:>14,.0f} {price:>10,.4f} {shares * price:>14,.2f}")
+
+    print("\nparser's view:")
+    print(f"   buys  (P/A): {len(parse_form4(root))}")
+    print(f"   sales (S/D): {len(parse_form4(root, want_code='S', want_direction='D'))}")
+
+
 def probe_setup_population(sample=150):
     """How selective is Lane A across the universe, not just on its poster child?
 
@@ -4032,6 +4086,8 @@ def main():
                     const=150,
                     help="diagnostic: what share of a sample of N issuers "
                          "clears the Lane A condition today")
+    ap.add_argument("--probe-form4", metavar="ACCESSION",
+                    help="diagnostic: print one Form 4's transactions as filed")
     ap.add_argument("--transition-cap", type=int, metavar="N",
                     help=f"how many state transitions the dashboard reads "
                          f"before truncating (default {TRANSITION_CAP}); "
@@ -4086,6 +4142,10 @@ def main():
 
     if args.probe_setup:
         probe_setup(cik=args.probe_setup)
+        return
+
+    if args.probe_form4:
+        probe_form4(args.probe_form4)
         return
 
     if args.probe_setup_population:
