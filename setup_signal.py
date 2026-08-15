@@ -51,10 +51,13 @@ REVENUE_CONCEPTS = (
 
 # ---------------------------------------------------------------- thresholds
 
-# How many consecutive quarters the liability must outgrow revenue. One quarter
-# is a billing cycle; the condition is meant to describe a change in the shape
-# of the business, and that takes longer to show than a single period.
-MIN_CONSECUTIVE_QUARTERS = 3
+# How many consecutive quarters the liability must outgrow revenue.
+# Raised from 3 on the Phase 1 sweep. Three quarters is a billing cycle; the
+# thesis is about a change in the shape of a business, and eighteen months is
+# the shortest window that means it. Measured against 37 control companies
+# drawn from end-2015 with no survivorship filter, at a 0.40 materiality floor:
+# 3 quarters fires on 18.9%, 4 on 13.5%, 6 on 8.1%, 8 on 5.4%.
+MIN_CONSECUTIVE_QUARTERS = 6
 
 # By how much, in percentage points of year-over-year growth. A liability
 # growing 0.4pp faster than revenue is noise in the rounding.
@@ -74,11 +77,21 @@ MIN_QUARTERLY_REVENUE_USD = 10_000_000
 # Bristol Myers' is rebate and return accruals. A 5pp growth gap on a rounding
 # item is arithmetic, not a business changing shape.
 #
-# Measured, not guessed. Across a 250-issuer sample the hits split at almost
-# exactly this line -- customer prepayments above it, accounting residue below
-# -- and Axon over the quarters that mattered ran 0.63 to 0.93, so the floor
-# sits far below the case the metric was built to find.
-MIN_LIABILITY_TO_REVENUE = 0.15
+# The 250-issuer sample split at 0.15 between customer prepayments and
+# accounting residue, which is where this started. Axon ran 0.63 to 0.93.
+#
+# Raised to 0.40 on the Phase 1 sweep, where it does most of the work: at 3
+# quarters the control fire-rate runs 51.4% at no floor, 27.0% at 0.15, 18.9%
+# at 0.40, 10.8% at 0.60. Combined with 6 quarters this lands at 8.1% -- three
+# of 37 -- against 27.0% for the shipped setting.
+#
+# Read off a curve, not toward an answer. Axon fires in EVERY cell of the grid
+# with a streak of 12 here against a requirement of 6, so this is not a filter
+# tightened until one name survives -- the check the control set exists to make.
+# The companies that clear it alongside Axon are Tableau, PROS Holdings,
+# Benefitfocus and Quantum: subscription transitions, which is what the thesis
+# says the metric should find.
+MIN_LIABILITY_TO_REVENUE = 0.40
 
 # A balance more than this far from its quarter end is not that quarter's.
 QUARTER_MATCH_TOLERANCE_DAYS = 45
@@ -250,6 +263,8 @@ def evaluate_setup(facts, today=None):
         return {"setup": False, "reason": "not enough overlapping history",
                 "quarters": []}
 
+    streak, immaterial = streak_from_quarters(quarters)
+
     # Consecutive from the most recent quarter backwards. A gap that closed two
     # quarters ago is a condition that has stopped being true, and saying so
     # requires counting from the present rather than anywhere in the window.
@@ -258,17 +273,6 @@ def evaluate_setup(facts, today=None):
     # of the streak rather than a filter applied before it. Filtering first
     # would let a company whose liability used to matter keep a streak running
     # on quarters where it no longer does.
-    streak = 0
-    immaterial = False
-    for q in quarters:
-        if q["liability_to_revenue"] < MIN_LIABILITY_TO_REVENUE:
-            immaterial = streak == 0
-            break
-        if q["gap_pp"] >= MIN_GROWTH_GAP_PP:
-            streak += 1
-        else:
-            break
-
     if streak < MIN_CONSECUTIVE_QUARTERS:
         if immaterial:
             reason = (f"contract liability is only "
@@ -293,6 +297,28 @@ def evaluate_setup(facts, today=None):
         "quarters": quarters,
         "streak": streak,
     }
+
+
+def streak_from_quarters(quarters):
+    """Consecutive qualifying quarters from the most recent backwards.
+
+    Split out so the collector can re-derive a stored verdict under changed
+    thresholds from the evidence it already kept, without fetching anything --
+    and so the live path and that repair cannot drift into two rules.
+
+    Returns (streak, immaterial): the count, and whether it stopped because the
+    most recent quarter's liability is too small to matter rather than because
+    the growth gap closed. Those are different sentences on a card.
+    """
+    streak = 0
+    for q in quarters or ():
+        if (q.get("liability_to_revenue") or 0) < MIN_LIABILITY_TO_REVENUE:
+            return streak, streak == 0
+        if q.get("gap_pp", 0) >= MIN_GROWTH_GAP_PP:
+            streak += 1
+        else:
+            break
+    return streak, False
 
 
 def tag_family(facts):

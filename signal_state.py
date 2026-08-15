@@ -807,6 +807,18 @@ def issuers_to_evaluate(conn, as_of=None):
         if ticker or cik not in out:
             out[cik] = ticker or out.get(cik)
 
+    # Issuers known ONLY for the balance-sheet condition. Lane A exists to see
+    # a company on a day it filed nothing, and none of the branches above can:
+    # they all start from an event. Every Lane A hit on the live page so far
+    # also carried a buyback and arrived through the corporate branch, which
+    # hid this completely -- tightening the thresholds left two issuers
+    # qualifying on Lane A alone, and neither was ever evaluated.
+    if _has_table(conn, "issuer_setup"):
+        for row in conn.execute(
+                "SELECT cik FROM issuer_setup WHERE setup = 1").fetchall():
+            if row["cik"] and int(row["cik"]) not in out:
+                out[int(row["cik"])] = None
+
     # Retired issuers are dropped last, so nothing upstream has to remember to
     # check. Their ledger rows stay and keep finding their way into the unions
     # above; this is the one place that has to say no.

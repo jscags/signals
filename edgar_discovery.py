@@ -3048,6 +3048,71 @@ def drop_absence_phrasing(conn):
     return n
 
 
+def name_lane_a_issuers(conn, tickers):
+    """Put a ticker on issuers that reached the page through Lane A alone.
+
+    Every other route into issuer_state carries one: a Form 4 names the issuer,
+    a buyback event is keyed on it. Lane A starts from a CIK in issuer_setup and
+    nothing else, so its issuers arrive unnamed and render as "CIK 3197" --
+    which is the correct label for an unknown ticker and a poor one for CECO
+    Environmental.
+    """
+    named = 0
+    for row in conn.execute(
+        "SELECT cik FROM issuer_state WHERE ticker IS NULL OR ticker = ''"
+    ).fetchall():
+        pair = tickers.get(int(row["cik"]))
+        if pair:
+            conn.execute("UPDATE issuer_state SET ticker = ? WHERE cik = ?",
+                         (pair[0], row["cik"]))
+            named += 1
+    return named
+
+
+def rescore_setup(conn):
+    """Re-derive every stored Lane A verdict under the current thresholds.
+
+    Exact arithmetic on evidence already kept, with no request made. Each
+    issuer_setup row stores the quarters it was judged on -- their growth gap,
+    their liability-to-revenue ratio -- so a threshold change can be applied to
+    the stored series directly. Bumping XBRL_DERIVATION would have refetched
+    companyfacts for 1,462 issuers to arrive at the same numbers.
+
+    Which is why no bump accompanies this: the cached DERIVATION is unchanged.
+    What changed is the verdict read off it, and that is repaired in place.
+    """
+    changed = 0
+    for row in conn.execute(
+        "SELECT cik, setup, streak, quarters FROM issuer_setup"
+    ).fetchall():
+        try:
+            quarters = json.loads(row["quarters"] or "[]")
+        except json.JSONDecodeError:
+            continue
+        streak, immaterial = setup_signal.streak_from_quarters(quarters)
+        fires = int(streak >= setup_signal.MIN_CONSECUTIVE_QUARTERS)
+        if fires == row["setup"] and streak == row["streak"]:
+            continue
+        if fires:
+            worst = min(q["gap_pp"] for q in quarters[:streak])
+            reason = (f"contract liabilities outgrew revenue for {streak} "
+                      f"consecutive quarters, by at least {worst:.0f}pp "
+                      f"(through {quarters[0]['quarter_end']})")
+        elif immaterial and quarters:
+            reason = (f"contract liability is only "
+                      f"{quarters[0]['liability_to_revenue']:.0%} of quarterly "
+                      f"revenue, below the "
+                      f"{setup_signal.MIN_LIABILITY_TO_REVENUE:.0%} floor")
+        else:
+            reason = (f"liability outgrew revenue for {streak} quarter(s), "
+                      f"needs {setup_signal.MIN_CONSECUTIVE_QUARTERS}")
+        conn.execute(
+            "UPDATE issuer_setup SET setup = ?, streak = ?, reason = ? "
+            "WHERE cik = ?", (fires, streak, reason, row["cik"]))
+        changed += 1
+    return changed
+
+
 def backfill_transition_rules(conn):
     """Stamp the producing rule onto transitions recorded before it was stored.
 
@@ -4593,6 +4658,7 @@ def main():
         n, promoted = rescore(conn)
         fixed, dropped = rescore_buybacks(conn)
         reworded = refresh_headlines(conn)
+        rescore_setup(conn)
         stamped = backfill_transition_rules(conn)
         drop_absence_phrasing(conn)
         conn.commit()
@@ -4619,6 +4685,11 @@ def main():
         # end, arrived at from the third direction: nothing had been asked.
         # No network here; it reads the tables the collector already filled.
         n_issuers, moves = signal_state.classify_all(conn, as_of=market_today())
+        # Deliberately NOT naming Lane A issuers here. The only ticker source is
+        # load_ticker_map(), which fetches, and this path promises no network --
+        # a Lane A issuer has no event carrying its symbol, so there is nothing
+        # local to resolve from. It renders as "CIK 3197" until the next
+        # collection run names it, which is the true label meanwhile.
         print(f"CLASSIFIED {n_issuers} issuer(s), {len(moves)} transition(s)")
         print(f"STATE COUNTS {signal_state.state_counts(conn)}")
         path, n = write_html(conn, args.html, cap=args.transition_cap)
@@ -4663,6 +4734,7 @@ def main():
     fixed, newly_promoted = rescore(conn)
     fixed_buybacks, dropped_funds = rescore_buybacks(conn)
     reworded = refresh_headlines(conn)
+    rescore_setup(conn)
     stamped = backfill_transition_rules(conn)
     drop_absence_phrasing(conn)
     aged = prune_events(conn)
@@ -4696,6 +4768,7 @@ def main():
     # apart -- the first is a broken pipeline, the second is a quiet week, and
     # for a long time they looked identical from the outside.
     n_issuers, moves = signal_state.classify_all(conn, as_of=days[-1])
+    name_lane_a_issuers(conn, tickers)
     print(f"CLASSIFIED {n_issuers} issuer(s), {len(moves)} transition(s)")
     print(f"STATE COUNTS {signal_state.state_counts(conn)}")
 
