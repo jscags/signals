@@ -71,6 +71,12 @@ DISQUALIFIER_TTL_DAYS = 180
 # dispositions. DISTRIBUTING should mean insiders leaving, not housekeeping.
 MIN_MEANINGFUL_SALE_USD = 100_000
 
+# Buying above this multiple of the selling means DISTRIBUTING is the wrong
+# reading. Disqualifiers still outrank everything -- a forward split or a
+# restatement wins outright, unchanged -- but a lone sale against a buying
+# cluster was never a disqualifier, and the rule could not tell them apart.
+SELL_OVERRIDE_RATIO = 3.0
+
 # And the same on the buy side, which had no floor at all. "Starr Gayle P
 # bought $288", "bought $212", and Horizon Kinetics buying ONE share of TPL at
 # $352.62 on three consecutive days were all drawing cards. Those are dividend
@@ -375,7 +381,7 @@ def is_retired(conn, cik):
                         (int(cik),)).fetchone() is not None
 
 
-def record_insider_sales(conn, sales):
+def record_insider_sales(conn, sales, accession=None):
     """Store code-S / disposed-D transactions. The mirror of the code-P path.
 
     Deliberately a separate table and a separate call rather than a flag on
@@ -400,7 +406,13 @@ def record_insider_sales(conn, sales):
                (accession, issuer_cik, ticker, issuer, owner, owner_title,
                 txn_date, shares, price, value, suspect)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (sale.get("accession"), sale.get("issuer_cik"), sale.get("ticker"),
+            # parse_form4 works from the XML and never sees an accession, so
+            # sale.get("accession") was None on every row ever written -- all
+            # 1,166 of them -- and a stored sale could not be traced back to the
+            # filing it came from. The buy path takes it from the call site the
+            # same way; the sale path was mirrored without that argument.
+            (accession or sale.get("accession"),
+             sale.get("issuer_cik"), sale.get("ticker"),
              sale.get("issuer"), sale.get("owner"), sale.get("owner_title"),
              sale.get("txn_date"), sale.get("shares"), sale.get("price"), value,
              suspect),
@@ -465,6 +477,59 @@ def _corporate_events(conn, ticker, as_of, days=BUY_WINDOW_DAYS):
     ).fetchall()
 
 
+def _txn_key(row):
+    """What makes two ledger rows the same transaction.
+
+    Owner IS part of it, and the reason is worth recording. The live ledger has
+    48 sale groups and 24 buy groups where one (date, shares, price) appears
+    under several owner names, which looks like one event filed once per
+    co-filer -- and on the sale side, for ATTO, a 23-lot broker sequence
+    matching to the cent under two names, it certainly is.
+
+    But the buy side proves the same shape occurs for real: four HEPA directors
+    each bought 2,000,000 shares at $0.05 on one day, three TSMC directors each
+    bought 47 shares at $73.31, separate people, separate accessions. Keying
+    without the owner would have merged those into one buyer and quietly
+    dissolved every cluster EXTENDED depends on.
+
+    The two cases are not separable from the ledger as it stands, because
+    insider_sales.accession was NULL on all 1,166 rows -- and the UNIQUE
+    constraint on that table leads with accession, which is why SQLite, where
+    NULL never equals NULL, never deduplicated a single sale. Recording it (see
+    record_insider_sales) is what makes the question answerable at all; until
+    there is a measurement that separates them, nothing is collapsed.
+    """
+    return (row["owner"], row["txn_date"], row["shares"], row["price"])
+
+
+def _cancel_offsetting(buys, sales):
+    """Drop same-day purchases and disposals that undo each other.
+
+    STWI's Form 4 reports, on one day, under one owner, an S/D of 3,000,000
+    shares at $0.138 and a P/A of 3,000,000 shares at $0.138. Both are really
+    in the document -- the parser reads them correctly, one to each ledger --
+    and together they are a transfer between holdings rather than a decision
+    to buy or to sell. Counting either side made the card announce a purchase
+    and a sale of the same $414,000 in the same breath.
+
+    Matched on owner as well as the transaction, because an insider selling
+    while a different insider buys the same size on the same day is two
+    decisions, and that is exactly the case the D1 precedence rule is for.
+    """
+    sale_keys = {}
+    for sale in sales:
+        sale_keys.setdefault((sale["owner"],) + _txn_key(sale), []).append(sale)
+    washed = set()
+    for buy in buys:
+        key = (buy["owner"],) + _txn_key(buy)
+        if sale_keys.get(key):
+            sale_keys[key].pop()
+            washed.add(id(buy))
+    kept_sales = [s for group in sale_keys.values() for s in group]
+    kept_buys = [b for b in buys if id(b) not in washed]
+    return kept_buys, kept_sales
+
+
 def _buys(conn, cik, as_of, days=BUY_WINDOW_DAYS):
     since, until = _window(as_of, days)
     return conn.execute(
@@ -525,9 +590,22 @@ def evaluate(conn, cik, ticker=None, as_of=None,
             "evidence": {"disqualifiers": [dict(d) for d in disqualifiers]},
         }
 
-    sales = _sales(conn, cik, as_of)
+    # Both sides are read before either is judged. The sell rule used to return
+    # without ever calling _buys, so a single sale outranked any amount of
+    # contemporaneous buying: ATTO announced "1 insider sold $2,251,658" on a
+    # card that also showed six insiders buying $52m.
+    buys, sales = _cancel_offsetting(_buys(conn, cik, as_of),
+                                     _sales(conn, cik, as_of))
     sold = sum(s["value"] or 0 for s in sales)
-    if sales and sold >= MIN_MEANINGFUL_SALE_USD:
+    bought = sum(b["value"] or 0 for b in buys)
+
+    # Buying this far above the selling means the sale is not the story. The
+    # ratio is read off the live distribution rather than chosen: across the
+    # 266 DISTRIBUTING issuers only 9 had any buying at all, and their
+    # buy-to-sell ratios run 0.0, 0.1, 0.3, 0.5, 0.7 and then nothing whatever
+    # until 10.1, 11.4, 11.6. Anything from 2x to 5x separates those groups
+    # identically, so 3x sits in empty space and is insensitive to where in it.
+    if sales and sold >= MIN_MEANINGFUL_SALE_USD and bought < SELL_OVERRIDE_RATIO * sold:
         sellers = {s["owner"] for s in sales if s["owner"]}
         return {
             "state": DISTRIBUTING,
@@ -535,9 +613,6 @@ def evaluate(conn, cik, ticker=None, as_of=None,
                       f"since {(as_of - timedelta(days=SALE_WINDOW_DAYS)).isoformat()}",
             "evidence": {"sales": len(sales), "value": sold},
         }
-
-    buys = _buys(conn, cik, as_of)
-    bought = sum(b["value"] or 0 for b in buys)
     if buys and bought >= MIN_MEANINGFUL_BUY_USD:
         buyers = {b["owner"] for b in buys if b["owner"]}
         # A cluster is distinct buyers inside the tight window, not merely

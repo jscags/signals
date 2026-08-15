@@ -2424,7 +2424,8 @@ def handle_form4(conn, row, tickers):
         # ledger so none of the tiering, clustering or scoring that reads
         # insider_buys starts quietly seeing sales.
         signal_state.record_insider_sales(
-            conn, parse_form4(root, want_code="S", want_direction="D"))
+            conn, parse_form4(root, want_code="S", want_direction="D"),
+            accession=row["accession"])
     except MalformedFiling as exc:
         # Says nothing about the contents, so it takes the same lane as a
         # refusal: unrecorded, retried next run, and counted toward the breaker
