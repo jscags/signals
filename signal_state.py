@@ -155,7 +155,8 @@ CREATE TABLE IF NOT EXISTS issuer_state (
     state       TEXT NOT NULL,
     reason      TEXT NOT NULL,
     since       TEXT,
-    updated_at  TEXT
+    updated_at  TEXT,
+    rule        TEXT
 );
 
 -- What CHANGED, and when. The dashboard reads this rather than issuer_state,
@@ -171,6 +172,7 @@ CREATE TABLE IF NOT EXISTS state_transitions (
     reason      TEXT NOT NULL,
     observed_on TEXT NOT NULL,
     created_at  TEXT,
+    rule        TEXT,
     UNIQUE(cik, from_state, to_state, observed_on)
 );
 CREATE INDEX IF NOT EXISTS idx_transitions_on ON state_transitions(observed_on);
@@ -585,6 +587,7 @@ def evaluate(conn, cik, ticker=None, as_of=None,
         others = f" (+{len(disqualifiers) - 1} more)" if len(disqualifiers) > 1 else ""
         return {
             "state": DISTRESSED,
+            "rule": "disqualifier",
             "reason": f"{top['kind']} filed {top['filed']}"
                       f"{' — ' + top['form_type'] if top['form_type'] else ''}{others}",
             "evidence": {"disqualifiers": [dict(d) for d in disqualifiers]},
@@ -609,6 +612,7 @@ def evaluate(conn, cik, ticker=None, as_of=None,
         sellers = {s["owner"] for s in sales if s["owner"]}
         return {
             "state": DISTRIBUTING,
+            "rule": "selling",
             "reason": f"{len(sellers)} insider(s) sold ${sold:,.0f} "
                       f"since {(as_of - timedelta(days=SALE_WINDOW_DAYS)).isoformat()}",
             "evidence": {"sales": len(sales), "value": sold},
@@ -624,6 +628,7 @@ def evaluate(conn, cik, ticker=None, as_of=None,
         if len(cluster) >= EXTENDED_MIN_BUYERS:
             return {
                 "state": EXTENDED,
+                "rule": "cluster",
                 "reason": f"{len(cluster)} insiders bought ${bought:,.0f} "
                           f"within {CLUSTER_WINDOW_DAYS} days"
                           + (" — crowded" if is_crowded else ""),
@@ -632,6 +637,7 @@ def evaluate(conn, cik, ticker=None, as_of=None,
         who = sorted(buyers)[0] if buyers else "an insider"
         return {
             "state": CONFIRMED,
+            "rule": "purchase",
             "reason": f"{who} bought ${bought:,.0f} on {buys[0]['txn_date']}",
             "evidence": {"buyers": sorted(buyers), "value": bought},
         }
@@ -652,6 +658,11 @@ def evaluate(conn, cik, ticker=None, as_of=None,
     if has_setup_signal or (setup and setup.get("setup")):
         return {
             "state": SETUP,
+            # The rule is RECORDED, not inferred later from the reason string.
+            # Every Lane A hit on the live page also carries a buyback, so a
+            # renderer keying on words -- or on which filing is loudest -- draws
+            # all three as buyback cards and the balance-sheet lane disappears.
+            "rule": "lane_a",
             "reason": (setup or {}).get("reason")
                       or "setup signal present, no confirming purchase",
             "evidence": {"setup": setup},
@@ -679,18 +690,21 @@ def evaluate(conn, cik, ticker=None, as_of=None,
         if top["event_type"] == "buyback":
             return {
                 "state": SETUP,
+                "rule": "buyback",
                 "reason": f"repurchasing stock, filed {top['filed_date']}{more}"
                           " — no insider buying",
                 "evidence": {"events": [dict(e) for e in corporate]},
             }
         return {
             "state": CONFIRMED,
+            "rule": "deal",
             "reason": f"deal filing ({top['event_type'][3:].upper()}) "
                       f"filed {top['filed_date']}{more}",
             "evidence": {"events": [dict(e) for e in corporate]},
         }
 
-    return {"state": DORMANT, "reason": "no activity in window", "evidence": {}}
+    return {"state": DORMANT, "rule": "none",
+            "reason": "no activity in window", "evidence": {}}
 
 
 # ---------------------------------------------------------------- application
@@ -719,16 +733,19 @@ def apply_state(conn, cik, ticker, verdict, observed_on=None):
     now = verdict["state"]
 
     conn.execute(
-        """INSERT INTO issuer_state (cik, ticker, state, reason, since, updated_at)
-           VALUES (?,?,?,?,?,?)
+        """INSERT INTO issuer_state
+             (cik, ticker, state, reason, since, updated_at, rule)
+           VALUES (?,?,?,?,?,?,?)
            ON CONFLICT(cik) DO UPDATE SET
              ticker = excluded.ticker,
              state = excluded.state,
              reason = excluded.reason,
+             rule = excluded.rule,
              since = CASE WHEN issuer_state.state = excluded.state
                           THEN issuer_state.since ELSE excluded.since END,
              updated_at = excluded.updated_at""",
-        (int(cik), ticker, now, verdict["reason"], observed_on, _now()),
+        (int(cik), ticker, now, verdict["reason"], observed_on, _now(),
+         verdict.get("rule")),
     )
 
     if was == now:
@@ -736,15 +753,17 @@ def apply_state(conn, cik, ticker, verdict, observed_on=None):
 
     cur = conn.execute(
         """INSERT OR IGNORE INTO state_transitions
-           (cik, ticker, from_state, to_state, reason, observed_on, created_at)
-           VALUES (?,?,?,?,?,?,?)""",
-        (int(cik), ticker, was, now, verdict["reason"], observed_on, _now()),
+           (cik, ticker, from_state, to_state, reason, observed_on, created_at,
+            rule)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (int(cik), ticker, was, now, verdict["reason"], observed_on, _now(),
+         verdict.get("rule")),
     )
     if not cur.rowcount:
         return None
     return {"cik": int(cik), "ticker": ticker, "from_state": was,
             "to_state": now, "reason": verdict["reason"],
-            "observed_on": observed_on}
+            "observed_on": observed_on, "rule": verdict.get("rule")}
 
 
 def issuers_to_evaluate(conn, as_of=None):

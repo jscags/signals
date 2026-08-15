@@ -928,6 +928,11 @@ def connect():
         "issuer_facts": (("derived_v", "INTEGER"), ("public_float", "REAL"),
                          ("float_as_of", "TEXT")),
         "issuer_buybacks": (("derived_v", "INTEGER"),),
+        # Which RULE produced a state, not merely which words describe it. A
+        # NULL here reads as "recorded before the column existed", which is
+        # exactly what the old rows are.
+        "issuer_state": (("rule", "TEXT"),),
+        "state_transitions": (("rule", "TEXT"),),
         # n_docs alone cannot answer the only question anyone asks of this
         # table. See log_run().
         "run_log": (("n_candidates", "INTEGER"), ("n_skipped", "INTEGER"),
@@ -936,6 +941,12 @@ def connect():
     }
     for table, columns in wanted.items():
         present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if not present:
+            # signal_state owns issuer_state and state_transitions and creates
+            # them in its own migrate(), which has not run yet on a fresh
+            # database. An empty PRAGMA means the table is not there to graft
+            # onto; signal_state's CREATE already carries the column.
+            continue
         for name, kind in columns:
             if name not in present:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
@@ -2768,6 +2779,41 @@ def repair_placeholder_tickers(conn, tickers):
     return renamed, retired
 
 
+def backfill_transition_rules(conn):
+    """Stamp the producing rule onto transitions recorded before it was stored.
+
+    classify_all writes a transition only when the state CHANGES, so an issuer
+    already sitting in SETUP is re-evaluated, gets its rule recorded on
+    issuer_state, and produces no new row -- leaving the transition the page
+    actually draws with a NULL rule forever. Nine Lane A issuers rendered as
+    nothing at all on the first pass for exactly that reason.
+
+    Only the LATEST transition per issuer is filled, only when it landed on the
+    state the issuer is still in, and only when the two stored REASONS are
+    identical. That last condition is what makes the fill safe rather than
+    plausible: a rule can change without the state changing, and six issuers
+    here moved to SETUP on a buyback and only later had Lane A derived for
+    them. Their state never moved again, so the transition on the page is still
+    the buyback's -- and stamping it "lane_a" put the Lane A badge on a card
+    reading "repurchasing stock, filed 2026-08-10".
+
+    Comparing reasons is an equality test on a value this code wrote, not
+    pattern-matching on prose. Where they differ the rule that produced the row
+    is genuinely unknown, and it stays NULL.
+    """
+    return conn.execute(
+        """UPDATE state_transitions SET rule = (
+               SELECT s.rule FROM issuer_state s WHERE s.cik = state_transitions.cik)
+           WHERE rule IS NULL
+             AND id IN (SELECT MAX(t.id) FROM state_transitions t
+                        GROUP BY t.cik)
+             AND to_state = (SELECT s.state FROM issuer_state s
+                             WHERE s.cik = state_transitions.cik)
+             AND reason = (SELECT s.reason FROM issuer_state s
+                           WHERE s.cik = state_transitions.cik)""",
+    ).rowcount
+
+
 def refresh_headlines(conn):
     """Rewrite stored headlines with the current formatters.
 
@@ -3179,6 +3225,10 @@ h1 {
 .dist-row[data-band="minor"]       .dist-bar { background: var(--r2); }
 .dist-row[data-band="negligible"]  .dist-bar { background: var(--r1); }
 .dist-row[data-band="unscored"]    .dist-bar { background: var(--rule); }
+.tag.lane-a { background: var(--ink); color: var(--paper); }
+.kpi.lanea b { color: var(--ink); }
+.lanea-lane { border-left: 2px solid var(--ink); padding-left: 10px; }
+.row.lanea .ticker a { font-weight: 600; }
 #tip {
   position: fixed; z-index: 9; pointer-events: none; opacity: 0;
   background: var(--ink); color: var(--paper); border-radius: 3px;
@@ -3841,7 +3891,7 @@ def render_controls(grouped, evidence_free=None):
 
 
 def render_state_panel(counts, n_moves, window_days, truncated=False,
-                       n_decayed=0):
+                       n_decayed=0, n_lane_a=0):
     """Where every issuer stands, beside how many moved. Both are needed.
 
     The counts are standing state and the list below is change, so a run where
@@ -3858,6 +3908,13 @@ def render_state_panel(counts, n_moves, window_days, truncated=False,
                                            signal_state.EXTENDED,
                                            signal_state.DISTRESSED)
     )
+    # Its own counter in the header row. The setup tile counts every issuer in
+    # SETUP -- 267 of them, of which three were Lane A and the rest buybacks --
+    # so the tile that already existed could not answer "did the balance-sheet
+    # lane find anything today", which is the question this lane is for.
+    if n_lane_a:
+        tiles += (f'<div class="kpi lanea"><b>{n_lane_a:,}</b>'
+                  f'<span>lane A</span></div>')
     return (
         f'<div class="kpis">{tiles}</div>'
         f'<div class="tier-head"><b>Moved in the last {window_days} days</b>'
@@ -3939,12 +3996,18 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
     decayed = [m for m in moves if m["to_state"] == signal_state.DORMANT]
     moves = [m for m in moves if m["to_state"] != signal_state.DORMANT]
 
-    body = []
+    body, lane_a = [], []
     evidence_free = collections.Counter()
     for order, move in enumerate(moves):
         entity = real_ticker(move["ticker"]) or f"CIK {move['cik']}"
         evs = by_entity.get(move["ticker"]) if real_ticker(move["ticker"]) else None
-        if evs:
+        # Which RULE produced the move, taken from the record rather than
+        # guessed from the reason text. All three Lane A hits on the live page
+        # also carry a buyback, so an issuer with open events took the branch
+        # below and was drawn as a buyback card -- the balance-sheet lane, the
+        # one the project exists to surface, rendered as the thing it was not.
+        is_lane_a = move["rule"] == "lane_a" if "rule" in move.keys() else False
+        if evs and not is_lane_a:
             card = render_company(entity, evs, conn, order)
             # The headline render_company picks is the loudest FILING on the
             # card, which is not the same thing as the reason this issuer
@@ -3961,10 +4024,26 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
             # selling, or a purchase already reviewed away, or Lane A, whose
             # whole point is an issuer that filed nothing. Still a transition,
             # so it still gets a card; the reason string carries it.
-            fam = "setup" if move["to_state"] == signal_state.SETUP else "state"
-            evidence_free[fam] += 1
+            fam = ("lanea" if is_lane_a
+                   else "setup" if move["to_state"] == signal_state.SETUP
+                   else "state")
+            # Lane A cards are counted for their own section, not for the
+            # chipset: they live outside #list, which is what the filter and
+            # sort JS operates on, so they are never hidden by a chip and never
+            # need one to bring them back.
+            if not is_lane_a:
+                evidence_free[fam] += 1
+            # A Lane A card names the filings underneath it when there are any,
+            # because "this company also bought back stock" is context for the
+            # balance-sheet reading rather than a competing headline for it.
+            extra = ""
+            if evs:
+                extra = ("".join(
+                    f'<span>{html.escape(e["event_type"].replace("_", " "))}'
+                    f' {html.escape(e["filed_date"])}</span>' for e in evs[:3]))
             card = (
-                f'<div class="row" data-ord="{order}" data-tier="2" '
+                f'<div class="row{" lanea" if is_lane_a else ""}" '
+                f'data-ord="{order}" data-tier="2" '
                 f'data-fam="{fam}" data-band="unscored" data-rung="0" '
                 f'data-mag="-1" data-usd="-1" '
                 f'data-filed="{html.escape(move["observed_on"])}" '
@@ -3972,23 +4051,51 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
                 f'<div class="ticker">{ticker_link(entity)}</div>'
                 f'<div><p class="headline">{html.escape(move["reason"])}</p>'
                 f'<div class="detail"><span>observed '
-                f'{html.escape(move["observed_on"])}</span></div></div></div>'
+                f'{html.escape(move["observed_on"])}</span>{extra}</div>'
+                f'</div></div>'
             )
         # The move itself, stamped onto the card that explains it.
         badge = (f'<span class="tag state-{move["to_state"].lower()}">'
                  f'{html.escape(move["from_state"].lower())} → '
                  f'{html.escape(move["to_state"].lower())}</span>')
+        if is_lane_a:
+            # Its own badge treatment, ahead of the state badge, so the lane is
+            # legible without reading the sentence after it.
+            badge = '<span class="tag lane-a">Lane A</span>' + badge
         card = card.replace('<p class="headline">', f'<p class="headline">{badge} ', 1)
-        body.append(card)
+        # One card, one place. Drawn into both the lane and the feed it would
+        # appear twice under one ticker, match the search box twice, and carry
+        # a duplicate data-ord into the sort.
+        (lane_a if is_lane_a else body).append(card)
 
     if not moves:
         body.append('<p class="empty">Nothing changed state in the last '
                     f'{window_days} days. {sum(counts.values()):,} issuers are '
                     'being tracked; the panel above shows where they stand.</p>')
 
+    # Above the feed, not inside it. A Lane A hit is the one thing here that no
+    # filing announced -- it cannot be found by scrolling a list ordered by
+    # what was filed, because nothing was. Three of them sat among 264 buyback
+    # cards under an identical badge and were, in the work order's words,
+    # impossible to find without hunting.
+    # The tile counts issuers Lane A currently flags, not Lane A moves in the
+    # window -- every other tile beside it is a standing count, and an issuer
+    # that reached SETUP on a buyback before Lane A was derived for it is
+    # flagged now without ever having produced a Lane A transition.
+    lane_a_standing = conn.execute(
+        "SELECT COUNT(*) FROM issuer_state WHERE rule = 'lane_a'").fetchone()[0]
+    lane_a_html = ""
+    if lane_a:
+        lane_a_html = (
+            '<section class="lanea-lane"><div class="tier-head">'
+            '<b>Lane A — contract liabilities outgrowing revenue</b>'
+            f'<span>{len(lane_a)}</span></div>'
+            f'{"".join(lane_a)}</section>')
+
     sections = [
         render_state_panel(counts, len(moves), window_days, truncated,
-                           len(decayed)),
+                           len(decayed), lane_a_standing),
+        lane_a_html,
         f'<section id="list">{"".join(body)}</section>',
         '<p class="empty none" id="nohits">No company matches these filters.</p>',
     ]
@@ -4166,6 +4273,7 @@ def main():
         n, promoted = rescore(conn)
         fixed, dropped = rescore_buybacks(conn)
         reworded = refresh_headlines(conn)
+        stamped = backfill_transition_rules(conn)
         conn.commit()
         print(f"rescored {n} event(s)"
               + (f", {promoted} promoted to the watchlist" if promoted else ""))
@@ -4233,6 +4341,7 @@ def main():
     fixed, newly_promoted = rescore(conn)
     fixed_buybacks, dropped_funds = rescore_buybacks(conn)
     reworded = refresh_headlines(conn)
+    stamped = backfill_transition_rules(conn)
     aged = prune_events(conn)
     retired = prune_watchlist(conn)
     conn.commit()
