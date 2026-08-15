@@ -1733,6 +1733,78 @@ def probe_setup(cik=1069183, start_year=2013, end_year=2018):
                   f"{q['revenue_growth_pct']:>8.1f} {q['gap_pp']:>8.1f}")
 
 
+def probe_sic(sample=0):
+    """What SIC codes does the buyback lane actually contain?
+
+    The exclusion list is set from this rather than from a guess at which codes
+    a SPAC or a crypto trust carries. Blank cheques are said to be 6770, but
+    "trusts and funds have their own codes" covers several, and the only way to
+    know which ones are here is to read them off the issuers that are here.
+
+    Reads submissions, one request per issuer, and writes nothing.
+    """
+    rows = connect().execute(
+        "SELECT DISTINCT entity, detail FROM events WHERE event_type = 'buyback'"
+    ).fetchall()
+    issuers = {}
+    for row in rows:
+        detail = json.loads(row["detail"] or "{}")
+        cik = detail.get("cik")
+        if cik:
+            issuers[int(cik)] = (row["entity"], detail.get("company") or "",
+                                 detail.get("pct_of_shares"),
+                                 detail.get("period_days"))
+    if sample:
+        issuers = dict(sorted(issuers.items())[:sample])
+    print(f"{len(issuers)} issuers in the buyback lane\n")
+
+    by_sic, unresolved = {}, 0
+    print(f"{'ticker':>8} {'sic':>6}  {'rate':>9}  {'name-pattern':>12}  company")
+    for cik, (ticker, company, pct, days) in sorted(issuers.items(),
+                                                    key=lambda kv: kv[1][0]):
+        try:
+            payload = fetch_json_submissions(cik)
+        except FetchError as exc:
+            print(f"    ! {exc}")
+            unresolved += 1
+            continue
+        if not payload:
+            unresolved += 1
+            continue
+        sic = (payload.get("sic") or "").strip() or "-"
+        desc = (payload.get("sicDescription") or "").strip()
+        by_sic.setdefault(sic, [desc, []])[1].append(ticker)
+        rate = buyback_rate_per_year(pct, days)
+        print(f"{ticker:>8} {sic:>6}  "
+              f"{(f'{rate:.1f}%/yr' if rate is not None else 'unscored'):>9}  "
+              f"{'CAUGHT' if is_fund_vehicle(company) else '-':>12}  {company[:40]}")
+
+    print(f"\n{'sic':>6} {'issuers':>8}  description")
+    for sic, (desc, tickers) in sorted(by_sic.items(),
+                                       key=lambda kv: -len(kv[1][1])):
+        print(f"{sic:>6} {len(tickers):>8}  {desc[:52]}")
+        if len(tickers) <= 12:
+            print(f"         {' '.join(sorted(tickers))}")
+    print(f"\nunresolved: {unresolved}")
+
+
+def fetch_json_submissions(cik):
+    """The issuer's submissions document, which carries its SIC code.
+
+    A separate endpoint from companyfacts, and the only place in the API that
+    reports the classification. Costs one request per issuer and the answer
+    effectively never changes, so production caches it rather than asking twice.
+    """
+    body = fetch(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json")
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        note_degraded("issuer submissions unreadable")
+        return None
+
+
 def probe_form4(accession):
     """Print every non-derivative transaction in one Form 4, unfiltered.
 
@@ -4289,6 +4361,9 @@ def main():
                     const=150,
                     help="diagnostic: what share of a sample of N issuers "
                          "clears the Lane A condition today")
+    ap.add_argument("--probe-sic", type=int, metavar="N", nargs="?", const=0,
+                    help="diagnostic: SIC codes across the buyback lane "
+                         "(N limits the sample; 0 = all)")
     ap.add_argument("--probe-form4", metavar="ACCESSION",
                     help="diagnostic: print one Form 4's transactions as filed")
     ap.add_argument("--transition-cap", type=int, metavar="N",
@@ -4345,6 +4420,10 @@ def main():
 
     if args.probe_setup:
         probe_setup(cik=args.probe_setup)
+        return
+
+    if args.probe_sic is not None:
+        probe_sic(args.probe_sic)
         return
 
     if args.probe_form4:
