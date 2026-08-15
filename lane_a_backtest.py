@@ -321,6 +321,11 @@ def spread_series(cl, rev):
             "cl_yoy": cl_yoy,
             "rev_yoy": rev_yoy,
             "spread": cl_yoy - rev_yoy,
+            # Carried so a threshold sweep can apply the SHIPPED rule, which
+            # floors on both of these and which Phase 1 deliberately did not
+            # implement. Without them the control test measures the bare
+            # inequality -- a different thing from the rule in production.
+            "ratio": cl_now / rev_now if rev_now else None,
         })
     return rows
 
@@ -359,6 +364,37 @@ def first_run_of(rows, length, minimum=0.0):
         if run >= length:
             return row["quarter"]
     return None
+
+
+def fires_under(rows, quarters, gap, min_revenue, min_ratio):
+    """Would the SHIPPED rule have fired anywhere in this window?
+
+    The live condition is a conjunction held over consecutive quarters: the
+    liability material against revenue, revenue above a floor, and the growth
+    gap above a threshold, all in the same quarter, for N quarters running.
+
+    Contiguity is by calendar quarter, so a gap in the series breaks the run
+    rather than bridging it -- the same rule the raw backtest uses.
+    """
+    best = run = 0
+    previous = None
+    for row in rows:
+        ok = (row["spread"] >= gap
+              and row["rev"] >= min_revenue
+              and row["ratio"] is not None and row["ratio"] >= min_ratio)
+        contiguous = previous is None or row["quarter"] == next_quarter(previous)
+        run = (run + 1) if (ok and contiguous) else (1 if ok else 0)
+        previous = row["quarter"]
+        best = max(best, run)
+    return best >= quarters, best
+
+
+# The shipped thresholds, and the axes to move them along. Ratio first because
+# it is the one doing the work in production: it is what separates a business
+# whose customers pay ahead from one where deferred revenue is a rounding item.
+SHIPPED = {"quarters": 3, "gap": 5.0, "min_revenue": 10_000_000, "min_ratio": 0.15}
+SWEEP_RATIO = (0.0, 0.15, 0.25, 0.40, 0.60)
+SWEEP_QUARTERS = (3, 4, 6, 8)
 
 
 def percentile(values, pct):
@@ -565,6 +601,72 @@ def run_control(sample=CONTROL_SAMPLE, out_path="lane_a_control.csv"):
 # ---------------------------------------------------------------- report
 
 
+def run_sweep(sample=CONTROL_SAMPLE, cik=AXON_CIK):
+    """How selective is the SHIPPED rule, and where does Axon sit under it?
+
+    Phase 1 measured the bare inequality and found Axon at the median with 68%
+    of the control firing. That is a true statement about the thesis and a
+    false one about the rule, which floors on revenue and on the liability's
+    materiality and fires on 2% of the live universe. This measures the rule.
+
+    Prints a grid rather than a verdict. A threshold picked off a curve with
+    its selectivity stated is a decision; one picked because it happens to
+    isolate Axon is the failure this whole exercise exists to avoid, and the
+    grid makes the difference visible -- if Axon only fires where the control
+    also collapses to nothing, that is not discrimination, it is a filter
+    tightened until one name survives.
+    """
+    print("=" * 78)
+    print("THRESHOLD SWEEP -- the shipped rule, not the bare inequality")
+    print("=" * 78)
+    axon_rows = measure(cik)["rows"]
+    if not axon_rows:
+        print("no Axon history; nothing to sweep")
+        return
+
+    picked = build_control_set(sample)
+    control = []
+    for n, (control_cik, name, _revenue) in enumerate(picked, 1):
+        rows = measure(control_cik)["rows"]
+        if rows:
+            control.append((name, rows))
+        if n % 10 == 0:
+            print(f"  ... {n}/{len(picked)}", flush=True)
+    print(f"\ncontrol companies with usable history: {len(control)}")
+    print(f"shipped thresholds: {SHIPPED}\n")
+
+    print(f"{'quarters':>8} {'ratio':>7} {'control fires':>14} {'rate':>7}  Axon")
+    for quarters in SWEEP_QUARTERS:
+        for ratio in SWEEP_RATIO:
+            hits = sum(1 for _name, rows in control
+                       if fires_under(rows, quarters, SHIPPED["gap"],
+                                      SHIPPED["min_revenue"], ratio)[0])
+            axon_fires, axon_run = fires_under(
+                axon_rows, quarters, SHIPPED["gap"],
+                SHIPPED["min_revenue"], ratio)
+            rate = hits / len(control) * 100 if control else 0.0
+            print(f"{quarters:>8} {ratio:>7.2f} {hits:>10}/{len(control):<3} "
+                  f"{rate:>6.1f}%  {'YES' if axon_fires else 'no':>3}"
+                  f"  (run {axon_run})")
+        print()
+
+    # The names that survive at the tightest setting where Axon still fires --
+    # the check the rate alone cannot make. If they read as one industry, the
+    # rule is a sector screen wearing a metric's clothes.
+    for quarters in SWEEP_QUARTERS:
+        for ratio in reversed(SWEEP_RATIO):
+            if fires_under(axon_rows, quarters, SHIPPED["gap"],
+                           SHIPPED["min_revenue"], ratio)[0]:
+                survivors = [name for name, rows in control
+                             if fires_under(rows, quarters, SHIPPED["gap"],
+                                            SHIPPED["min_revenue"], ratio)[0]]
+                print(f"at {quarters} quarters / ratio {ratio:.2f}, Axon fires "
+                      f"alongside {len(survivors)} of {len(control)}:")
+                for name in sorted(survivors)[:20]:
+                    print(f"    {name[:60]}")
+                return
+
+
 def report(axon, control, unusable):
     print("\n" + "=" * 78)
     print("1.3  WHERE AXON SITS IN THE DISTRIBUTION")
@@ -731,12 +833,20 @@ def main():
                         help="control set size (default {0})".format(CONTROL_SAMPLE))
     parser.add_argument("--cik", type=int, default=AXON_CIK,
                         help="reference company (default Axon, {0})".format(AXON_CIK))
+    parser.add_argument("--sweep", action="store_true",
+                        help="measure the SHIPPED rule across a threshold grid")
     parser.add_argument("--selftest", action="store_true",
                         help="exercise the parsing rules offline, no network")
     args = parser.parse_args()
 
     if args.selftest:
         return selftest()
+
+    if args.sweep:
+        run_sweep(args.sample, args.cik)
+        print("\nrequests: {0} ok, {1} absent (404), {2} failed".format(
+            STATS["ok"], STATS["missing"], STATS["failed"]))
+        return 2 if STATS["ok"] == 0 else 0
 
     everything = not (args.axon or args.control)
     axon = run_axon(args.cik) if (everything or args.axon) else None

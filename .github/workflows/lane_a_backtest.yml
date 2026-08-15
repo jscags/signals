@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       stage:
-        description: 'all, axon, or control'
+        description: 'all, axon, control, or sweep'
         default: 'all'
       sample:
         description: 'Control set size (spec calls for 40)'
@@ -42,6 +42,7 @@ jobs:
           case "$STAGE" in
             axon)    ARGS="--axon" ;;
             control) ARGS="--control --sample $SAMPLE" ;;
+            sweep)   ARGS="--sweep --sample $SAMPLE" ;;
             *)       ARGS="--sample $SAMPLE" ;;
           esac
           echo "running: python3 lane_a_backtest.py $ARGS"
