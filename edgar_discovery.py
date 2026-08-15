@@ -302,6 +302,17 @@ BUYBACK_BANDS = (
 # decision rather than housekeeping, and promotes on its own.
 TIER1_BUYBACK_PCT = 5.0
 
+# Below this rate a repurchase is not an event at all. Measured, and set to a
+# line that already existed rather than a new one: it is the "notable" band
+# floor, and the bands were always written in annual terms.
+#
+# The lane was firing on 264 of 267 SETUP transitions -- UNH, NUE, SPG,
+# Aramark, Waters, Cardinal Health -- which detects "filed a 10-Q containing a
+# repurchase table", a form type rather than a signal. Across 454 scored events
+# the rate runs p25 0.72%/yr, p50 2.18%, p75 5.89%, and all six of those sit
+# between 0.07 and 3.00. A 3%/yr floor drops every one of them and keeps 190.
+MIN_BUYBACK_RATE_PCT_PER_YEAR = 3.0
+
 # Above this it is a tender offer or a bad denominator, not a buyback.
 MAX_PLAUSIBLE_BUYBACK_PCT = 50.0
 
@@ -1559,13 +1570,51 @@ def is_fund_vehicle(name):
     return bool(FUND_VEHICLE.search(name) or NONTRADED_VEHICLE.search(name))
 
 
-def buyback_band(pct):
+def buyback_rate_per_year(pct, period_days):
+    """The repurchase expressed as a rate, for COMPARISON only.
+
+    Never published as the company's own figure, and that distinction is the
+    whole point. Scaling a half-year to a year asserts the issuer will keep
+    buying at the same pace, which the filing does not say -- Grindr's six
+    months at 21.7% went out as "annualised 43.9%", a number nobody posted.
+    So the card still shows what was filed and over how long.
+
+    But a threshold has to compare like with like, and the periods here run
+    from 84 days to 454. Banding both against one number means a 3% quarter and
+    a 3% fifteen months land in the same place, which is the "over what
+    lookback" the whole D4 measurement turns on.
+    """
+    if pct is None or not period_days:
+        return None
+    return pct * 365.0 / period_days
+
+
+def buyback_band(pct, period_days=None):
+    """The significance band, measured on the rate when a period is known.
+
+    Falls back to the raw figure when the period is missing, which reads it as
+    though it covered a year -- understating rather than overstating, and the
+    only reading available.
+    """
     if pct is None:
         return None
+    rate = buyback_rate_per_year(pct, period_days)
+    rate = pct if rate is None else rate
     for floor, name in BUYBACK_BANDS:
-        if pct >= floor:
+        if rate >= floor:
             return name
     return "negligible"
+
+
+def buyback_is_reportable(pct, period_days):
+    """Is this a repurchase worth a card, or is it housekeeping?
+
+    An unscorable figure survives: no share count and no float means the size
+    is unknown, which is a different statement from small, and dropping it
+    would lose the loud ones that happen to tag nothing.
+    """
+    rate = buyback_rate_per_year(pct, period_days)
+    return rate is None or rate >= MIN_BUYBACK_RATE_PCT_PER_YEAR
 
 
 def handle_periodic(conn, row, listed):
@@ -1591,7 +1640,13 @@ def handle_periodic(conn, row, listed):
         shares_outstanding(conn, row["cik"]),
         public_float(conn, row["cik"]),
     )
-    band = buyback_band(pct)
+    # Housekeeping is not news. Below the floor the document is still recorded
+    # as processed, so this is a decision not to publish rather than a filing
+    # left to be rescanned every run.
+    if not buyback_is_reportable(pct, (activity or {}).get("period_days")):
+        return 0
+
+    band = buyback_band(pct, (activity or {}).get("period_days"))
     tier = 1 if (pct is not None and pct >= TIER1_BUYBACK_PCT) else 2
 
     if tier == 1:
@@ -2779,6 +2834,24 @@ def repair_placeholder_tickers(conn, tickers):
     return renamed, retired
 
 
+def drop_absence_phrasing(conn):
+    """Strike "no insider buying" from reasons already written.
+
+    Re-evaluating rewrites issuer_state, but state_transitions is history and
+    keeps the words it was recorded with -- and history is what the page draws,
+    so the phrase survived the rule change on every card already published.
+
+    An exact substring this code wrote, removed exactly. Not a reworder.
+    """
+    phrase = " \u2014 no insider buying"
+    n = 0
+    for table in ("state_transitions", "issuer_state"):
+        n += conn.execute(
+            f"UPDATE {table} SET reason = replace(reason, ?, '') "
+            f"WHERE reason LIKE '%no insider buying%'", (phrase,)).rowcount
+    return n
+
+
 def backfill_transition_rules(conn):
     """Stamp the producing rule onto transitions recorded before it was stored.
 
@@ -2888,12 +2961,18 @@ def rescore_buybacks(conn):
         # annualised, so the period is what tells a reader whether 30% is a
         # year of buying or six months of it. A row whose percentage happens to
         # be unchanged still needs it merged in the first time.
+        band = buyback_band(pct, (activity or {}).get("period_days"))
+        # The band joins the skip test. It is now measured on the RATE, so a
+        # figure that has not moved can still be banded differently -- 1.5%
+        # over 90 days was "minor" read raw and is "significant" read as
+        # 6.1%/yr. Comparing only the inputs left 57 events on the page
+        # carrying a band the current rule would never have given them.
         if (pct == detail.get("pct_of_shares")
                 and basis == detail.get("pct_basis")
+                and band == detail.get("significance")
                 and detail.get("period_days") == (activity or {}).get("period_days")):
             continue
 
-        band = buyback_band(pct)
         tier = 1 if (pct is not None and pct >= TIER1_BUYBACK_PCT) else 2
         merged = {**detail, **(activity or {}), "pct_of_shares": pct,
                   "pct_basis": basis, "significance": band}
@@ -2903,6 +2982,21 @@ def rescore_buybacks(conn):
              json.dumps(merged, default=str), row["id"]),
         )
         fixed += 1
+
+    # The floor is applied AFTER the rescore, not before it. An event stored
+    # before period_days existed has no period to measure a rate against, so it
+    # reads as unscorable and survives -- and is only dropped on the NEXT run,
+    # once the rescore above has merged the period in. One pass has to leave
+    # nothing behind, or "the repair ran" and "the repair finished" are
+    # different statements and a rerun is not a no-op.
+    for row in conn.execute(
+        "SELECT id, detail FROM events WHERE event_type = 'buyback'"
+    ).fetchall():
+        detail = json.loads(row["detail"] or "{}")
+        if not buyback_is_reportable(detail.get("pct_of_shares"),
+                                     detail.get("period_days")):
+            conn.execute("DELETE FROM events WHERE id = ?", (row["id"],))
+            dropped += 1
     return fixed, dropped
 
 
@@ -4274,6 +4368,7 @@ def main():
         fixed, dropped = rescore_buybacks(conn)
         reworded = refresh_headlines(conn)
         stamped = backfill_transition_rules(conn)
+        drop_absence_phrasing(conn)
         conn.commit()
         print(f"rescored {n} event(s)"
               + (f", {promoted} promoted to the watchlist" if promoted else ""))
@@ -4342,6 +4437,7 @@ def main():
     fixed_buybacks, dropped_funds = rescore_buybacks(conn)
     reworded = refresh_headlines(conn)
     stamped = backfill_transition_rules(conn)
+    drop_absence_phrasing(conn)
     aged = prune_events(conn)
     retired = prune_watchlist(conn)
     conn.commit()

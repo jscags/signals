@@ -691,8 +691,9 @@ def evaluate(conn, cik, ticker=None, as_of=None,
             return {
                 "state": SETUP,
                 "rule": "buyback",
-                "reason": f"repurchasing stock, filed {top['filed_date']}{more}"
-                          " — no insider buying",
+                # "no insider buying" stated an absence as though it were
+                # evidence. Nothing was observed; that is not an observation.
+                "reason": f"repurchasing stock, filed {top['filed_date']}{more}",
                 "evidence": {"events": [dict(e) for e in corporate]},
             }
         return {
