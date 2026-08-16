@@ -989,6 +989,11 @@ def connect():
         "run_log": (("n_candidates", "INTEGER"), ("n_skipped", "INTEGER"),
                     ("n_refused", "INTEGER")),
         "insider_buys": (("suspect", "INTEGER DEFAULT 0"),),
+        # The lane shows issuers below the firing threshold, and one of those
+        # has never entered issuer_state -- it never fired, so nothing put a
+        # symbol anywhere for it. Without somewhere to keep one it renders as
+        # a company name with no link, permanently.
+        "issuer_setup": (("ticker", "TEXT"),),
     }
     for table, columns in wanted.items():
         present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -3078,7 +3083,10 @@ def name_lane_a_issuers(conn, tickers):
     which is the correct label for an unknown ticker and a poor one for CECO
     Environmental.
     """
-    named = 0
+    # Counted as issuers, not as writes. An issuer missing a symbol in both
+    # tables is named in both, and reporting that as two named issuers would
+    # overstate what the run actually found.
+    named = set()
     for row in conn.execute(
         "SELECT cik FROM issuer_state WHERE ticker IS NULL OR ticker = ''"
     ).fetchall():
@@ -3086,8 +3094,22 @@ def name_lane_a_issuers(conn, tickers):
         if pair:
             conn.execute("UPDATE issuer_state SET ticker = ? WHERE cik = ?",
                          (pair[0], row["cik"]))
-            named += 1
-    return named
+            named.add(int(row["cik"]))
+
+    # An issuer below the firing threshold is on the page now -- the lane shows
+    # the rungs under the rule -- but it is not in issuer_state, because it
+    # never fired and nothing ever promoted it. Walking only issuer_state left
+    # ESCO Technologies and Perma-Fix as unlinked company names that no run
+    # could ever have fixed, so name them where they actually live.
+    for row in conn.execute(
+        "SELECT cik FROM issuer_setup WHERE ticker IS NULL OR ticker = ''"
+    ).fetchall():
+        pair = tickers.get(int(row["cik"]))
+        if pair:
+            conn.execute("UPDATE issuer_setup SET ticker = ? WHERE cik = ?",
+                         (pair[0], row["cik"]))
+            named.add(int(row["cik"]))
+    return len(named)
 
 
 def rescore_setup(conn):
@@ -4361,6 +4383,17 @@ def render_lane_a(conn, moved=(), rungs=LANE_A_RUNGS):
     nothing else on the page will ever show them.
     """
     floor = min(rungs)
+    # The lane reads issuer_setup, which is keyed on CIK and carries no symbol.
+    # The symbol lives in issuer_state, put there by name_lane_a_issuers on the
+    # networked run. Look it up rather than passing None: without this every
+    # lane card falls back to the company name, so an issuer whose ticker is
+    # known perfectly well still renders as unlinked text.
+    symbols = {row["cik"]: row["ticker"] for row in conn.execute(
+        "SELECT cik, ticker FROM issuer_setup WHERE ticker IS NOT NULL"
+        " AND ticker != ''")}
+    symbols.update({row["cik"]: row["ticker"] for row in conn.execute(
+        "SELECT cik, ticker FROM issuer_state WHERE ticker IS NOT NULL"
+        " AND ticker != ''")})
     rows = []
     for row in conn.execute(
             "SELECT cik, quarters FROM issuer_setup WHERE quarters IS NOT NULL"):
@@ -4377,7 +4410,7 @@ def render_lane_a(conn, moved=(), rungs=LANE_A_RUNGS):
     shipped = setup_signal.MIN_CONSECUTIVE_QUARTERS
     cards = []
     for streak, cik, q in rows:
-        label = issuer_label(conn, cik, None)
+        label = issuer_label(conn, cik, symbols.get(cik))
         below = streak < shipped
         cards.append(
             f'<div class="row lanea{" below" if below else ""}" '
