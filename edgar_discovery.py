@@ -4547,6 +4547,13 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- This page is rewritten twice a day and read on a phone, where a cached
+     copy is indistinguishable from a quiet day. GitHub Pages serves the real
+     cache headers and they cannot be set from here, so these are the only
+     lever available; the visible "built" stamp in the header is the backstop
+     that makes a stale copy obvious when they are ignored. -->
+<meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <title>Discovery — {date.today()}</title>
 <meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -4554,7 +4561,7 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
 <style>{CSS}</style>
 </head><body><div class="wrap">
 <h1>EDGAR Discovery</h1>
-<p class="meta">{len(moves)} transition{"" if len(moves) == 1 else "s"} &nbsp;·&nbsp; {sum(counts.values()):,} issuers tracked &nbsp;·&nbsp; days covered: {covered}{f" &nbsp;·&nbsp; {docs} filings scanned" if docs else ""}</p>
+<p class="meta">{len(moves)} transition{"" if len(moves) == 1 else "s"} &nbsp;·&nbsp; {sum(counts.values()):,} issuers tracked &nbsp;·&nbsp; days covered: {covered}{f" &nbsp;·&nbsp; {docs} filings scanned" if docs else ""} &nbsp;·&nbsp; built {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
 {"".join(sections)}
 {watch_html}
 </div><div id="tip" role="status" aria-live="polite"></div>
