@@ -3604,6 +3604,20 @@ h1 {
 .dist-row[data-band="negligible"]  .dist-bar { background: var(--r1); }
 .dist-row[data-band="unscored"]    .dist-bar { background: var(--rule); }
 .tag.lane-a { background: var(--ink); color: var(--paper); }
+.streakset { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 14px; }
+.streakbtn {
+  font-family: "IBM Plex Mono", monospace; font-size: 11px; font-weight: 600;
+  color: var(--muted); background: none; border: 1px solid var(--rule);
+  border-radius: 3px; padding: 5px 9px; cursor: pointer; letter-spacing: .04em;
+}
+.streakbtn small { color: var(--muted); margin-left: 6px; font-weight: 400; }
+.streakbtn[aria-pressed="true"] {
+  color: var(--paper); background: var(--ink); border-color: var(--ink);
+}
+.streakbtn[aria-pressed="true"] small { color: var(--paper); opacity: .7; }
+/* Below the shipped rule: shown because the rungs exist to show them, and
+   dimmed because the page should not imply they clear it. */
+.row.lanea.below .ticker a, .row.lanea.below .ticker { opacity: .72; }
 .kpi.lanea b { color: var(--ink); }
 .lanea-lane { border-left: 2px solid var(--ink); padding-left: 10px; }
 .row.lanea .ticker a { font-weight: 600; }
@@ -3723,6 +3737,37 @@ SCRIPT = """
   var nohits = document.getElementById('nohits');
   var dist = document.getElementById('dist');
   var distRows = [].slice.call(dist.querySelectorAll('.dist-row'));
+  // Lane A's own control. One rung at a time -- these are nested sets, so
+  // multi-select would mean "6Q+ or 3Q+", which is just 3Q+ and reads as a
+  // mistake. Operates only inside .lanea-lane, which sits outside #list, so it
+  // cannot collide with the feed's filters.
+  var streakBtns = [].slice.call(document.querySelectorAll('.streakbtn'));
+  var laneCards = [].slice.call(document.querySelectorAll('.lanea-lane .row'));
+  var laneCount = document.getElementById('laneacount');
+  function applyStreak(min) {
+    var shown = 0;
+    laneCards.forEach(function (card) {
+      var ok = parseInt(card.getAttribute('data-streak'), 10) >= min;
+      card.style.display = ok ? '' : 'none';
+      if (ok) { shown += 1; }
+    });
+    if (laneCount) { laneCount.textContent = shown; }
+    streakBtns.forEach(function (b) {
+      b.setAttribute('aria-pressed',
+        b.getAttribute('data-streak-min') === String(min) ? 'true' : 'false');
+    });
+  }
+  streakBtns.forEach(function (b) {
+    b.addEventListener('click', function () {
+      applyStreak(parseInt(b.getAttribute('data-streak-min'), 10));
+    });
+  });
+  if (streakBtns.length) {
+    var pressed = document.querySelector('.streakbtn[aria-pressed="true"]');
+    applyStreak(parseInt(
+      (pressed || streakBtns[0]).getAttribute('data-streak-min'), 10));
+  }
+
   var famBtns = [].slice.call(document.querySelectorAll('.chipbtn[data-fam]'));
   var t1 = document.getElementById('t1');
   var q = document.getElementById('q');
@@ -4289,6 +4334,91 @@ def render_controls(grouped, evidence_free=None):
 <div class="dist" id="dist" role="group" aria-label="Filter by significance">{rows}</div>"""
 
 
+# The rungs the filter offers, longest first. 8 is not a choice: LOOKBACK_QUARTERS
+# stores eight quarters, so eight is the longest run that can be observed and a
+# 9Q+ rung would be permanently empty for reasons that have nothing to do with
+# any company. 3 is the floor because a two-quarter run is a billing pattern
+# rather than a trend, and offering it would invite reading one.
+LANE_A_RUNGS = (8, 7, 6, 5, 4, 3)
+
+
+def render_lane_a(conn, moved=(), rungs=LANE_A_RUNGS):
+    """The Lane A lane, built from STANDING verdicts rather than transitions.
+
+    Everything else on this page answers "what changed". This one answers "what
+    is true", and it has to: a balance-sheet condition that has held for five
+    quarters did not happen on a day, so there is no transition to hang it on
+    once the day it started has scrolled out of the window.
+
+    Building it from transitions also aged badly. GAME and MIDD moved to SETUP
+    under the previous 3-quarter rule and kept saying so for a day after the
+    rule became 6, because a recorded transition is history and history does
+    not restate itself. Read from issuer_setup, a card is only ever the current
+    answer.
+
+    The rungs are the point. The shipped rule is one line through a continuum,
+    and the issuers just under it are the ones worth seeing precisely because
+    nothing else on the page will ever show them.
+    """
+    floor = min(rungs)
+    rows = []
+    for row in conn.execute(
+            "SELECT cik, quarters FROM issuer_setup WHERE quarters IS NOT NULL"):
+        quarters = json.loads(row["quarters"] or "[]")
+        if not quarters:
+            continue
+        streak, _ = setup_signal.streak_from_quarters(quarters)
+        if streak >= floor:
+            rows.append((streak, row["cik"], quarters[0]))
+    if not rows:
+        return "", 0, set()
+    rows.sort(key=lambda r: (-r[0], r[1]))
+
+    shipped = setup_signal.MIN_CONSECUTIVE_QUARTERS
+    cards = []
+    for streak, cik, q in rows:
+        label = issuer_label(conn, cik, None)
+        below = streak < shipped
+        cards.append(
+            f'<div class="row lanea{" below" if below else ""}" '
+            f'data-streak="{streak}" '
+            f'data-find="{html.escape(label.lower())}">'
+            f'<div class="ticker">{ticker_link(label)}</div>'
+            f'<div><p class="headline">'
+            f'<span class="tag lane-a">{streak}Q</span>'
+            + ('<span class="tag">new</span>' if cik in moved else "")
+            + (f'<span class="tag">below the {shipped}Q rule</span>' if below else "")
+            + f' contract liabilities outgrew revenue for {streak} consecutive '
+            f'quarters, by at least {q["gap_pp"]:.0f}pp '
+            f'(through {html.escape(q["quarter_end"])})</p>'
+            f'<div class="detail">'
+            f'<span>liability {q["liability_to_revenue"]:.2f}× quarterly revenue</span>'
+            f'<span>revenue {usd_scaled(q["revenue"])}</span>'
+            f'<span>CIK {cik}</span></div></div></div>')
+
+    counts = {n: sum(1 for streak, _c, _q in rows if streak >= n) for n in rungs}
+
+    # The lane opens on the shipped rule. If a retune ever moves the threshold
+    # off the rung list, fall to the nearest rung at or below it rather than
+    # leaving nothing pressed -- the JS would then default to the topmost rung
+    # and open the lane collapsed, which reads as "no Lane A issuers exist".
+    opens_at = shipped if shipped in counts else max(
+        [n for n in rungs if n <= shipped] or [floor])
+    buttons = "".join(
+        f'<button class="streakbtn" type="button" data-streak-min="{n}" '
+        f'aria-pressed="{"true" if n == opens_at else "false"}">'
+        f'{n}Q+<small>{counts[n]}</small></button>'
+        for n in rungs)
+
+    return (
+        '<section class="lanea-lane">'
+        '<div class="tier-head"><b>Lane A — contract liabilities outgrowing '
+        f'revenue</b><span id="laneacount">{counts[opens_at]}</span></div>'
+        f'<div class="streakset" role="group" aria-label="Minimum consecutive '
+        f'quarters">{buttons}</div>'
+        f'{"".join(cards)}</section>'), counts[opens_at], {c for _s, c, _q in rows}
+
+
 def render_state_panel(counts, n_moves, window_days, truncated=False,
                        n_decayed=0, n_lane_a=0):
     """Where every issuer stands, beside how many moved. Both are needed.
@@ -4395,7 +4525,7 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
     decayed = [m for m in moves if m["to_state"] == signal_state.DORMANT]
     moves = [m for m in moves if m["to_state"] != signal_state.DORMANT]
 
-    body, lane_a = [], []
+    body, lane_a_moved = [], {}
     evidence_free = collections.Counter()
     for order, move in enumerate(moves):
         entity = issuer_label(conn, move["cik"], move["ticker"])
@@ -4469,10 +4599,17 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
             # legible without reading the sentence after it.
             badge = '<span class="tag lane-a">Lane A</span>' + badge
         card = card.replace('<p class="headline">', f'<p class="headline">{badge} ', 1)
-        # One card, one place. Drawn into both the lane and the feed it would
-        # appear twice under one ticker, match the search box twice, and carry
-        # a duplicate data-ord into the sort.
-        (lane_a if is_lane_a else body).append(card)
+        # One card, one place. A Lane A issuer is drawn once, in the standing
+        # lane above; the feed records only that it moved, so the same ticker
+        # cannot appear twice, match the search box twice, or carry a duplicate
+        # data-ord into the sort. The card is kept either way and withdrawn
+        # below only if the lane actually drew it -- a move whose issuer_setup
+        # row is missing or no longer qualifying would otherwise be dropped
+        # from the page entirely, which is the one outcome worse than a
+        # duplicate.
+        body.append(card)
+        if is_lane_a:
+            lane_a_moved[move["cik"]] = card
 
     if not moves:
         body.append('<p class="empty">Nothing changed state in the last '
@@ -4484,19 +4621,33 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
     # what was filed, because nothing was. Three of them sat among 264 buyback
     # cards under an identical badge and were, in the work order's words,
     # impossible to find without hunting.
-    # The tile counts issuers Lane A currently flags, not Lane A moves in the
-    # window -- every other tile beside it is a standing count, and an issuer
-    # that reached SETUP on a buyback before Lane A was derived for it is
-    # flagged now without ever having produced a Lane A transition.
-    lane_a_standing = conn.execute(
-        "SELECT COUNT(*) FROM issuer_state WHERE rule = 'lane_a'").fetchone()[0]
-    lane_a_html = ""
-    if lane_a:
-        lane_a_html = (
-            '<section class="lanea-lane"><div class="tier-head">'
-            '<b>Lane A — contract liabilities outgrowing revenue</b>'
-            f'<span>{len(lane_a)}</span></div>'
-            f'{"".join(lane_a)}</section>')
+    # Built from standing verdicts, not from the transition cards collected
+    # above -- those are used only to mark which issuers moved recently.
+    lane_a_html, lane_a_standing, lane_a_drawn = render_lane_a(
+        conn, moved=set(lane_a_moved))
+
+    # Two different things look alike here, and only one of them is a data gap.
+    #
+    # An issuer the lane DREW is withdrawn from the feed so it is not on the
+    # page twice. An issuer that was scored and no longer clears the bar is
+    # withdrawn too -- that is GAME and MIDD, which moved under the 3-quarter
+    # rule and would otherwise go on announcing a move the current rule does
+    # not support. A recorded transition is history and history does not
+    # restate itself; the scored row is the live answer and it disagrees.
+    #
+    # What stays is the issuer with no scored quarters at all. There the
+    # transition is the only evidence anyone has, so dropping it would lose
+    # the move rather than correct it.
+    scored = {row["cik"] for row in conn.execute(
+        "SELECT cik FROM issuer_setup WHERE quarters IS NOT NULL"
+        " AND quarters NOT IN ('', '[]')")}
+    for cik, card in lane_a_moved.items():
+        if cik in lane_a_drawn or cik in scored:
+            body.remove(card)
+    if not body and moves:
+        body.append('<p class="empty">Everything that moved in the last '
+                    f'{window_days} days moved on the Lane A metric, and is '
+                    'drawn in the lane above.</p>')
 
     sections = [
         render_state_panel(counts, len(moves), window_days, truncated,
