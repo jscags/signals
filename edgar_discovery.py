@@ -3048,6 +3048,27 @@ def drop_absence_phrasing(conn):
     return n
 
 
+def issuer_label(conn, cik, ticker):
+    """What to call an issuer on a card when it has no ticker.
+
+    Lane A is the only route into issuer_state that carries no symbol: every
+    other one starts from an event that names the company. Falling back to the
+    bare CIK is accurate and useless -- "CIK 3197" tells a reader nothing, and
+    the two issuers Lane A found on its own are CECO Environmental and Spire
+    Global. The company name is in `documents`, put there by the same filing
+    that triggered the XBRL fetch, so no request is needed to say it.
+    """
+    symbol = real_ticker(ticker)
+    if symbol:
+        return symbol
+    row = conn.execute(
+        "SELECT company FROM documents WHERE cik = ? AND company IS NOT NULL "
+        "AND company != '' ORDER BY filed_date DESC LIMIT 1", (cik,)).fetchone()
+    if row and row["company"]:
+        return row["company"]
+    return f"CIK {cik}"
+
+
 def name_lane_a_issuers(conn, tickers):
     """Put a ticker on issuers that reached the page through Lane A alone.
 
@@ -4377,7 +4398,7 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
     body, lane_a = [], []
     evidence_free = collections.Counter()
     for order, move in enumerate(moves):
-        entity = real_ticker(move["ticker"]) or f"CIK {move['cik']}"
+        entity = issuer_label(conn, move["cik"], move["ticker"])
         evs = by_entity.get(move["ticker"]) if real_ticker(move["ticker"]) else None
         # Which RULE produced the move, taken from the record rather than
         # guessed from the reason text. All three Lane A hits on the live page
@@ -4429,7 +4450,14 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
                 f'<div class="ticker">{ticker_link(entity)}</div>'
                 f'<div><p class="headline">{html.escape(move["reason"])}</p>'
                 f'<div class="detail"><span>observed '
-                f'{html.escape(move["observed_on"])}</span>{extra}</div>'
+                f'{html.escape(move["observed_on"])}</span>'
+                # The CIK, when the label is a company name rather than a
+                # symbol. There is no ticker link on these cards to click
+                # through, so the identifier that reaches EDGAR has to be on
+                # the card itself or the name is a dead end.
+                + (f'<span>CIK {move["cik"]}</span>'
+                   if not real_ticker(move["ticker"]) else "")
+                + f'{extra}</div>'
                 f'</div></div>'
             )
         # The move itself, stamped onto the card that explains it.
