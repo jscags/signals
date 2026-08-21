@@ -4987,7 +4987,16 @@ def main():
     # apart -- the first is a broken pipeline, the second is a quiet week, and
     # for a long time they looked identical from the outside.
     n_issuers, moves = signal_state.classify_all(conn, as_of=days[-1])
-    name_lane_a_issuers(conn, tickers)
+    n_named = name_lane_a_issuers(conn, tickers)
+    # This commit is the point. Everything above it runs after the run's last
+    # commit, so the symbols were written into the connection, read back by
+    # write_html on the same connection -- making the page look correct -- and
+    # then discarded when the process exited. The published page had tickers
+    # the committed database did not, every run redid the same work, and
+    # anything reading the database afterwards saw none of it.
+    conn.commit()
+    if n_named:
+        print(f"named {n_named} issuer(s) that arrived without a ticker")
     print(f"CLASSIFIED {n_issuers} issuer(s), {len(moves)} transition(s)")
     print(f"STATE COUNTS {signal_state.state_counts(conn)}")
 
