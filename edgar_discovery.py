@@ -915,6 +915,25 @@ CREATE TABLE IF NOT EXISTS issuer_setup (
     derived_v   INTEGER
 );
 
+-- Market-wide context, one row per gauge. Nothing here is issuer-specific and
+-- nothing here feeds a verdict: these are the backdrop a reader wants before
+-- reading anything else on the page.
+--
+-- Stored rather than fetched at render time for the same reason everything
+-- else is: write_html makes no network calls, and the published page has to
+-- carry its numbers with it. `stale` records that the last refresh failed and
+-- the value below it is the previous good one -- so the page can say which it
+-- is instead of showing a number of unknown age.
+CREATE TABLE IF NOT EXISTS market_gauges (
+    name       TEXT PRIMARY KEY,
+    value      REAL,
+    label      TEXT,
+    as_of      TEXT,
+    detail     TEXT,
+    fetched_at TEXT,
+    stale      INTEGER DEFAULT 0
+);
+
 -- Annualised repurchase activity per issuer, cached on the same terms as the
 -- share count: slow-moving, one small request, and worth surviving between
 -- runs on a fresh runner.
@@ -2802,6 +2821,167 @@ def market_today():
     return datetime.now(ZoneInfo("America/New_York")).date()
 
 
+# ------------------------------------------------------- market context
+#
+# Two gauges, neither issuer-specific and neither feeding a verdict. They are
+# the backdrop: a cluster of insider buying reads differently at extreme fear
+# than at extreme greed, and an inverted curve is the context for every
+# catalyst below it.
+#
+# Both come from outside the SEC, so they do NOT go through fetch(): that
+# function carries the SEC's declared user agent, its pacing and its 429
+# ladder, none of which belong on someone else's host. One request each, per
+# run, with a short timeout and no retry ladder -- a gauge that misses a day
+# is a stale tile, not a broken run.
+
+FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+TREASURY_YIELD_URL = (
+    "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+    "pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={year}")
+GAUGE_TIMEOUT = 20
+
+# CNN's endpoint refuses a default urllib agent outright. This is a browser
+# string because that is what it will answer; there is no documented API to
+# declare a contact to, unlike the SEC.
+GAUGE_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def fetch_external(url, timeout=GAUGE_TIMEOUT):
+    """One GET to a host that is not the SEC. Raises FetchError on anything."""
+    request = urllib.request.Request(url, headers={
+        "User-Agent": GAUGE_USER_AGENT,
+        "Accept": "*/*",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError,
+            ValueError) as exc:
+        raise FetchError(f"{url}: {exc}") from exc
+
+
+FEAR_GREED_BANDS = ((25, "extreme fear"), (45, "fear"), (55, "neutral"),
+                    (75, "greed"), (101, "extreme greed"))
+
+
+def fear_greed_band(score):
+    """CNN's own five bands, so the label matches what they publish."""
+    for ceiling, name in FEAR_GREED_BANDS:
+        if score < ceiling:
+            return name
+    return "extreme greed"
+
+
+def parse_fear_greed(body):
+    """Score, band and the three lookbacks CNN publishes beside it."""
+    data = json.loads(body)
+    block = data.get("fear_and_greed") or {}
+    score = block.get("score")
+    if score is None:
+        raise FetchError("fear and greed payload carried no score")
+    score = float(score)
+    if not 0 <= score <= 100:
+        raise FetchError(f"fear and greed score out of range: {score}")
+    # CNN's own rating is used when present -- their bands are the published
+    # ones and a disagreement here would be ours, not theirs.
+    label = (block.get("rating") or fear_greed_band(score)).lower()
+    stamp = (block.get("timestamp") or "")[:10]
+    detail = {}
+    for key, name in (("previous_close", "prev close"),
+                      ("previous_1_week", "1 week"),
+                      ("previous_1_month", "1 month"),
+                      ("previous_1_year", "1 year")):
+        if block.get(key) is not None:
+            try:
+                detail[name] = round(float(block[key]), 1)
+            except (TypeError, ValueError):
+                pass
+    return {"value": round(score, 1), "label": label,
+            "as_of": stamp or market_today().isoformat(), "detail": detail}
+
+
+def parse_yield_curve(body):
+    """The 10-year minus 2-year par yield, in basis points.
+
+    Treasury publishes the whole curve for a year in one feed, so the newest
+    entry that carries BOTH tenors is the one wanted -- occasionally a row is
+    published with some tenors blank, and taking the last entry blindly would
+    read a partial row as a missing spread.
+    """
+    root = ElementTree.fromstring(body)
+    best = None
+    for entry in root.iter():
+        if not entry.tag.endswith("properties"):
+            continue
+        fields = {}
+        for child in entry:
+            tag = child.tag.rsplit("}", 1)[-1]
+            fields[tag] = (child.text or "").strip()
+        stamp, two, ten = (fields.get("NEW_DATE", "")[:10],
+                           fields.get("BC_2YEAR"), fields.get("BC_10YEAR"))
+        if not stamp or not two or not ten:
+            continue
+        try:
+            two, ten = float(two), float(ten)
+        except ValueError:
+            continue
+        if best is None or stamp > best["as_of"]:
+            best = {"as_of": stamp, "two": two, "ten": ten}
+    if best is None:
+        raise FetchError("yield curve feed carried no complete 2y/10y row")
+    spread_bp = round((best["ten"] - best["two"]) * 100)
+    if spread_bp < 0:
+        label = "inverted"
+    elif spread_bp < 10:
+        label = "flat"
+    else:
+        label = "normal"
+    return {"value": float(spread_bp), "label": label, "as_of": best["as_of"],
+            "detail": {"10y": best["ten"], "2y": best["two"]}}
+
+
+def refresh_market_gauges(conn, today=None):
+    """Refresh both gauges, keeping the last good value when one fails.
+
+    A failed gauge is never blanked and never zeroed. The previous row stays
+    and is marked stale, so the page can say "as of Tuesday, refresh failed"
+    rather than showing a number of unknown age or an empty box that reads as
+    a calm market.
+    """
+    today = today or market_today()
+    sources = (
+        ("fear_greed", FEAR_GREED_URL, parse_fear_greed),
+        ("yield_spread",
+         TREASURY_YIELD_URL.format(year=today.year), parse_yield_curve),
+    )
+    fresh, stale = [], []
+    for name, url, parse in sources:
+        try:
+            reading = parse(fetch_external(url))
+        except (FetchError, ElementTree.ParseError, json.JSONDecodeError,
+                KeyError, TypeError, ValueError) as exc:
+            print(f"WARNING: {name} gauge did not refresh: {exc}")
+            existing = conn.execute(
+                "SELECT 1 FROM market_gauges WHERE name = ?", (name,)).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE market_gauges SET stale = 1 WHERE name = ?", (name,))
+            stale.append(name)
+            continue
+        conn.execute(
+            "INSERT INTO market_gauges (name, value, label, as_of, detail,"
+            " fetched_at, stale) VALUES (?,?,?,?,?,?,0)"
+            " ON CONFLICT(name) DO UPDATE SET value=excluded.value,"
+            " label=excluded.label, as_of=excluded.as_of,"
+            " detail=excluded.detail, fetched_at=excluded.fetched_at, stale=0",
+            (name, reading["value"], reading["label"], reading["as_of"],
+             json.dumps(reading["detail"]), today.isoformat()))
+        fresh.append(name)
+    return fresh, stale
+
+
 def business_days_back(n):
     """The most recent n business days, today included when it is a weekday.
 
@@ -3462,6 +3642,15 @@ CSS = """
   --r1: #91AEF0; --r2: #6F94EE; --r3: #4E79EC; --r4: #305AE1; --r5: #1736D0;
   --on-r1: #14202B; --on-r2: #14202B; --on-r3: #FFFFFF;
   --on-r4: #FFFFFF; --on-r5: #FFFFFF;
+  /* The diverging pair, for the two gauges only. Everything else on this page
+     is one hue because everything else is a magnitude; sentiment and a yield
+     spread have two directions from a meaningful middle, and a single ramp
+     cannot say which side of it a reading sits on. Blue against amber rather
+     than the conventional red against green: the pair is separable under all
+     three CVD simulations (worst adjacent dE 31.5 protan on white, 29.2 on
+     the dark card) where red/green is not. The midpoint is grey on purpose --
+     a hue there would read as a third state. */
+  --warm: #B4630A; --cool: #1736D0;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -3471,6 +3660,9 @@ CSS = """
     --r1: #3561E8; --r2: #4F7BF2; --r3: #6C95F9; --r4: #8AADFF; --r5: #A7C5FF;
     --on-r1: #FFFFFF; --on-r2: #08101C; --on-r3: #08101C;
     --on-r4: #08101C; --on-r5: #08101C;
+    /* Re-stepped for the dark card, not inverted: both poles sit inside the
+       dark lightness band and clear 3:1 on #151C21. */
+    --warm: #CE7C21; --cool: #5A86F5;
   }
 }
 * { box-sizing: border-box; }
@@ -3650,6 +3842,66 @@ h1 {
   transition: opacity .12s; max-width: 240px;
 }
 #tip b { font-size: 13px; }
+/* ---- market gauges ---- */
+.gauges { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
+.gauge {
+  background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
+  padding: 12px 14px 10px; flex: 1 1 260px; min-width: 0;
+}
+.g-head {
+  font-family: "IBM Plex Mono", monospace; font-size: 10px;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--muted);
+}
+.g-hero { display: flex; align-items: baseline; gap: 4px; margin: 2px 0 10px; }
+.g-hero b {
+  font-size: 32px; font-weight: 600; letter-spacing: -.02em; line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.g-hero i { font-style: normal; font-size: 13px; color: var(--muted); }
+/* The band name is the encoding; the dot beside it is the redundant one. A
+   reader who cannot separate the hues still gets "inverted" in words. */
+.g-band {
+  margin-left: auto; font-size: 12.5px; color: var(--muted);
+  display: inline-flex; align-items: center; gap: 5px; text-align: right;
+}
+.g-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.g-dot.warm { background: var(--warm); }
+.g-dot.cool { background: var(--cool); }
+.g-track {
+  position: relative; height: 6px; background: var(--sunk);
+  border-radius: 3px; overflow: hidden;
+}
+.g-fill { position: absolute; top: 0; bottom: 0; border-radius: 2px; }
+.g-fill.warm { background: var(--warm); opacity: .35; }
+.g-fill.cool { background: var(--cool); opacity: .35; }
+/* The midpoint is grey and always drawn: the reading means nothing without
+   the line it is measured from. */
+.g-mid {
+  position: absolute; top: -1px; bottom: -1px; width: 1px;
+  background: var(--muted); opacity: .55;
+}
+.g-mark {
+  position: absolute; top: -2px; bottom: -2px; width: 3px;
+  margin-left: -1.5px; border-radius: 2px;
+}
+.g-mark.warm { background: var(--warm); }
+.g-mark.cool { background: var(--cool); }
+.g-scale, .g-detail, .g-foot {
+  font-family: "IBM Plex Mono", monospace; color: var(--muted);
+}
+.g-scale {
+  display: flex; justify-content: space-between; font-size: 9.5px;
+  margin-top: 4px; letter-spacing: .04em;
+}
+.g-detail {
+  display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; margin-top: 7px;
+}
+.g-foot { font-size: 9.5px; margin-top: 6px; letter-spacing: .04em; }
+.g-stale {
+  margin-left: 8px; color: var(--warm); border: 1px solid var(--warm);
+  border-radius: 2px; padding: 0 4px;
+}
+@media (max-width: 560px) { .gauge { flex: 1 1 100%; } }
 /* ---- KPI row ---- */
 .kpis { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
 .kpi {
@@ -4452,6 +4704,108 @@ def render_lane_a(conn, moved=(), rungs=LANE_A_RUNGS):
         f'{"".join(cards)}</section>'), counts[opens_at], {c for _s, c, _q in rows}
 
 
+# Both gauges diverge around a midpoint -- 50 on a 0-100 sentiment scale, zero
+# on a spread -- so the mark reads from that midpoint outwards rather than from
+# the left edge. A bar growing from the left would say "more is more", which is
+# wrong for both: 20 and 80 are equally far from neutral, in opposite senses.
+#
+# The spread's track needs a stated domain, and +/-150bp covers the ordinary
+# range without flattening it. A reading past either end is clamped and the
+# tile says so, because silently pinning a mark to the end of a scale invents
+# a number the data does not support.
+#
+# Colour carries polarity only. The value itself stays in ink: a number wearing
+# the mark's colour reads as a status, and neither of these is good or bad --
+# an inverted curve is a fact, not an alarm, and the tile should not
+# editorialise.
+GAUGE_SPREAD_DOMAIN = 150.0
+
+
+def _gauge_track(position, midpoint, warm):
+    """A track marked from its midpoint outwards, position and mid in percent."""
+    left, width = min(position, midpoint), abs(position - midpoint)
+    side = "warm" if warm else "cool"
+    return (
+        f'<div class="g-track"><div class="g-mid" style="left:{midpoint:.4g}%">'
+        f'</div><div class="g-fill {side}" style="left:{left:.4g}%;'
+        f'width:{width:.4g}%"></div>'
+        f'<div class="g-mark {side}" style="left:{position:.4g}%"></div></div>')
+
+
+def _gauge_tile(title, hero, unit, label, warm, track, scale, detail,
+                as_of, stale, note=""):
+    bits = "".join(f"<span>{html.escape(d)}</span>" for d in detail)
+    aging = ('<span class="g-stale">last refresh failed</span>' if stale else "")
+    return (
+        f'<div class="gauge">'
+        f'<div class="g-head">{html.escape(title)}</div>'
+        f'<div class="g-hero"><b>{html.escape(hero)}</b>'
+        f'<i>{html.escape(unit)}</i>'
+        f'<span class="g-band"><span class="g-dot '
+        f'{"warm" if warm else "cool"}"></span>{html.escape(label)}</span></div>'
+        f'{track}'
+        f'<div class="g-scale">{scale}</div>'
+        f'<div class="g-detail">{bits}</div>'
+        f'<div class="g-foot">as of {html.escape(as_of)}'
+        + (f' · {html.escape(note)}' if note else "")
+        + f'{aging}</div></div>')
+
+
+def render_gauges(conn):
+    """The two market gauges, above everything issuer-specific.
+
+    Read from the database rather than fetched here: write_html makes no
+    network calls, so the published page has to carry its numbers with it.
+
+    A gauge that has never been fetched is omitted -- a fresh database
+    legitimately has none, and an empty box is worse than no box. A gauge whose
+    last refresh failed is shown with its previous value, its real date, and a
+    note saying so. What must never happen is a stale number presented as
+    today's, which is the one reading that would quietly mislead.
+    """
+    rows = {row["name"]: row for row in conn.execute(
+        "SELECT name, value, label, as_of, detail, stale FROM market_gauges")}
+    if not rows:
+        return ""
+
+    tiles = []
+
+    row = rows.get("fear_greed")
+    if row is not None and row["value"] is not None:
+        score = float(row["value"])
+        detail = json.loads(row["detail"] or "{}")
+        order = ("prev close", "1 week", "1 month", "1 year")
+        tiles.append(_gauge_tile(
+            "CNN fear & greed", f"{score:.0f}", "/100",
+            row["label"] or fear_greed_band(score),
+            warm=score < 50,
+            track=_gauge_track(score, 50.0, score < 50),
+            scale='<span>0 fear</span><span>50</span><span>greed 100</span>',
+            detail=[f"{k} {detail[k]:.0f}" for k in order if k in detail],
+            as_of=row["as_of"] or "unknown", stale=bool(row["stale"])))
+
+    row = rows.get("yield_spread")
+    if row is not None and row["value"] is not None:
+        bp = float(row["value"])
+        detail = json.loads(row["detail"] or "{}")
+        clamped = max(-GAUGE_SPREAD_DOMAIN, min(GAUGE_SPREAD_DOMAIN, bp))
+        position = (clamped + GAUGE_SPREAD_DOMAIN) / (2 * GAUGE_SPREAD_DOMAIN) * 100
+        tiles.append(_gauge_tile(
+            "10-year minus 2-year", f"{bp:+.0f}", " bp", row["label"] or "",
+            warm=bp < 0,
+            track=_gauge_track(position, 50.0, bp < 0),
+            scale=(f'<span>−{GAUGE_SPREAD_DOMAIN:.0f}</span>'
+                   '<span>0 inverted ⟋ normal</span>'
+                   f'<span>+{GAUGE_SPREAD_DOMAIN:.0f}</span>'),
+            detail=[f"{k} {detail[k]:.2f}%" for k in ("10y", "2y") if k in detail],
+            as_of=row["as_of"] or "unknown", stale=bool(row["stale"]),
+            note=("beyond the scale" if abs(bp) > GAUGE_SPREAD_DOMAIN else "")))
+
+    if not tiles:
+        return ""
+    return f'<section class="gauges">{"".join(tiles)}</section>'
+
+
 def render_state_panel(counts, n_moves, window_days, truncated=False,
                        n_decayed=0, n_lane_a=0):
     """Where every issuer stands, beside how many moved. Both are needed.
@@ -4691,7 +5045,10 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
     ]
     grouped = [(m["ticker"] or f"CIK {m['cik']}",
                 by_entity.get(m["ticker"]) or []) for m in moves]
-    sections = [render_controls([g for g in grouped if g[1]],
+    # Above the controls, and above the state panel: this is the backdrop the
+    # rest of the page is read against, not another thing to filter.
+    sections = [render_gauges(conn),
+                render_controls([g for g in grouped if g[1]],
                                 evidence_free)] + sections
 
     covered = ", ".join(r["run_date"] for r in runs) or "no runs yet"
@@ -4986,6 +5343,14 @@ def main():
     # "classification found nothing", which no other line in this run can tell
     # apart -- the first is a broken pipeline, the second is a quiet week, and
     # for a long time they looked identical from the outside.
+    # Market context: two requests to hosts that are not the SEC, and neither
+    # feeds a verdict. A failure here is a stale tile, never a failed run.
+    gauges_fresh, gauges_stale = refresh_market_gauges(conn)
+    if gauges_fresh:
+        print(f"gauges refreshed: {', '.join(gauges_fresh)}")
+    if gauges_stale:
+        print(f"gauges STALE: {', '.join(gauges_stale)}")
+
     n_issuers, moves = signal_state.classify_all(conn, as_of=days[-1])
     n_named = name_lane_a_issuers(conn, tickers)
     # This commit is the point. Everything above it runs after the run's last
