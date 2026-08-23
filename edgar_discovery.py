@@ -2848,11 +2848,13 @@ GAUGE_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
-def fetch_external(url, timeout=GAUGE_TIMEOUT):
+def fetch_external(url, timeout=GAUGE_TIMEOUT, headers=None):
     """One GET to a host that is not the SEC. Raises FetchError on anything."""
     request = urllib.request.Request(url, headers={
         "User-Agent": GAUGE_USER_AGENT,
-        "Accept": "*/*",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        **(headers or {}),
     })
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -2952,14 +2954,20 @@ def refresh_market_gauges(conn, today=None):
     """
     today = today or market_today()
     sources = (
-        ("fear_greed", FEAR_GREED_URL, parse_fear_greed),
+        # CNN's endpoint is served behind bot protection that answers a bare
+        # client with 418. A Referer and Origin from their own site are what a
+        # browser on that page would send; if it still refuses, that is their
+        # answer and the gauge stays stale rather than being worked around.
+        ("fear_greed", FEAR_GREED_URL, parse_fear_greed,
+         {"Referer": "https://edition.cnn.com/markets/fear-and-greed",
+          "Origin": "https://edition.cnn.com"}),
         ("yield_spread",
-         TREASURY_YIELD_URL.format(year=today.year), parse_yield_curve),
+         TREASURY_YIELD_URL.format(year=today.year), parse_yield_curve, None),
     )
     fresh, stale = [], []
-    for name, url, parse in sources:
+    for name, url, parse, headers in sources:
         try:
-            reading = parse(fetch_external(url))
+            reading = parse(fetch_external(url, headers=headers))
         except (FetchError, ElementTree.ParseError, json.JSONDecodeError,
                 KeyError, TypeError, ValueError) as exc:
             print(f"WARNING: {name} gauge did not refresh: {exc}")
