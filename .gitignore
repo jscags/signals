@@ -11,3 +11,5 @@ dashboard.html
 
 # Note: discovery.db is deliberately tracked -- it is the collector's state
 # and the workflow commits it back after each run. Do not add it here.
+prices.db
+prices.db*

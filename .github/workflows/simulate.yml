@@ -1,0 +1,142 @@
+# Reconstruct historical signals and measure what they were worth.
+#
+# This deliberately does NOT touch discovery.db. Backfilling historical days
+# through the collector would drive the state machine with today's clock and
+# write transitions dated now for filings from months ago -- corrupting the
+# live state to answer a research question. So it builds a separate history.db
+# from scratch, and the live collection never sees it.
+#
+# The history database is carried between runs as an artifact rather than
+# committed: it is large, reproducible from EDGAR at any time, and is evidence
+# for a study rather than state the screener depends on.
+
+name: simulate
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: 'Earliest filing day to reconstruct (YYYY-MM-DD)'
+        required: true
+      until:
+        description: 'Latest filing day to reconstruct (YYYY-MM-DD). Blank = today.'
+        default: ''
+      limit:
+        description: 'Max documents per day (blank = no cap; a cap biases the sample)'
+        default: ''
+      stage:
+        description: 'collect | measure | both'
+        default: 'both'
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Resume from whatever a previous run got through. A backfill that dies
+      # at hour six must not start from zero on the retry.
+      - name: Restore history
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: history-db
+          path: .
+
+      - name: Restore prices
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: prices-db
+          path: .
+
+      - name: Reconstruct filings
+        if: ${{ github.event.inputs.stage != 'measure' }}
+        env:
+          EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
+          EDGAR_DB: history.db
+        run: |
+          set -u
+          SINCE="${{ github.event.inputs.since }}"
+          UNTIL="${{ github.event.inputs.until }}"
+          LIMIT="${{ github.event.inputs.limit }}"
+          [ -z "$UNTIL" ] && UNTIL=$(date -u +%Y-%m-%d)
+          echo "reconstructing $SINCE .. $UNTIL into history.db"
+
+          python3 - "$SINCE" "$UNTIL" > days.txt <<'PY'
+          import sys
+          from datetime import date, timedelta
+          a = date.fromisoformat(sys.argv[1]); b = date.fromisoformat(sys.argv[2])
+          d = a
+          while d <= b:
+              if d.weekday() < 5:
+                  print(d.isoformat())
+              d += timedelta(days=1)
+          PY
+          echo "$(wc -l < days.txt) weekdays to scan"
+
+          # Sequential and unhurried: the collector paces itself against the
+          # SEC's limit internally, and a day that fails must not stop the run.
+          while read -r DAY; do
+            echo "── $DAY"
+            if [ -n "$LIMIT" ]; then
+              python3 edgar_discovery.py --date "$DAY" --limit "$LIMIT" || echo "  (day failed, continuing)"
+            else
+              python3 edgar_discovery.py --date "$DAY" || echo "  (day failed, continuing)"
+            fi
+          done < days.txt
+
+          echo "history.db is now $(du -h history.db | cut -f1)"
+
+      - name: Save history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-db
+          path: history.db
+          retention-days: 30
+          overwrite: true
+
+      - name: Measure
+        if: ${{ github.event.inputs.stage != 'collect' }}
+        env:
+          EDGAR_DB: history.db
+          PRICE_DB: prices.db
+        run: |
+          python3 - <<'PY'
+          import os, sqlite3
+          p = "history.db"
+          if not os.path.exists(p):
+              raise SystemExit("no history.db -- run the collect stage first")
+          c = sqlite3.connect(p)
+          for t in ("documents", "insider_buys", "insider_sales"):
+              n = c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+              lo, hi = c.execute(
+                  f"SELECT MIN(filed_date), MAX(filed_date) FROM documents").fetchone()
+              print(f"{t:<15}{n:>8} rows   (filings {lo} .. {hi})")
+          PY
+
+          python3 simulator.py --source ledger --fetch-prices \
+            --since "${{ github.event.inputs.since }}" \
+            --json simulation.json
+
+      - name: Save prices
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prices-db
+          path: prices.db
+          retention-days: 30
+          overwrite: true
+
+      - name: Save result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulation-result
+          path: simulation.json
+          retention-days: 90
