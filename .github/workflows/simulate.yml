@@ -57,7 +57,7 @@ jobs:
       - name: Reconstruct filings
         if: ${{ github.event.inputs.stage != 'measure' }}
         env:
-          EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
+          EDGAR_USER_AGENT: "edgar-discovery 52y9fp5njf@privaterelay.appleid.com"
           EDGAR_DB: history.db
         run: |
           set -u
@@ -80,17 +80,34 @@ jobs:
           echo "$(wc -l < days.txt) weekdays to scan"
 
           # Sequential and unhurried: the collector paces itself against the
-          # SEC's limit internally, and a day that fails must not stop the run.
+          # SEC's limit internally, and one bad day must not stop the run.
+          #
+          # But tolerating every failure is how a backfill reports success over
+          # an empty database. The first attempt did exactly that: all ten days
+          # died on an unset user agent, each was shrugged off, and the stage
+          # went green over 132KB of nothing. So failures are COUNTED, and a
+          # run that lost more than half its days is a failed run.
+          OK=0; BAD=0
           while read -r DAY; do
             echo "── $DAY"
             if [ -n "$LIMIT" ]; then
-              python3 edgar_discovery.py --date "$DAY" --limit "$LIMIT" || echo "  (day failed, continuing)"
+              python3 edgar_discovery.py --date "$DAY" --limit "$LIMIT" && OK=$((OK+1)) || { BAD=$((BAD+1)); echo "  (day failed)"; }
             else
-              python3 edgar_discovery.py --date "$DAY" || echo "  (day failed, continuing)"
+              python3 edgar_discovery.py --date "$DAY" && OK=$((OK+1)) || { BAD=$((BAD+1)); echo "  (day failed)"; }
             fi
           done < days.txt
 
-          echo "history.db is now $(du -h history.db | cut -f1)"
+          echo "collected $OK day(s), $BAD failed; history.db is $(du -h history.db | cut -f1)"
+          if [ "$OK" -eq 0 ]; then
+            echo "::error::every day failed -- the database is empty and any"
+            echo "::error::measurement over it would be meaningless"
+            exit 1
+          fi
+          if [ "$BAD" -gt "$OK" ]; then
+            echo "::error::more days failed ($BAD) than succeeded ($OK); the"
+            echo "::error::sample is too holed to measure"
+            exit 1
+          fi
 
       - name: Save history
         if: always()
