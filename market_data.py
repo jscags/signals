@@ -67,8 +67,14 @@ STOOQ_PACE = 0.35
 POLYGON_PACE = 12.5
 REQUEST_PACE = POLYGON_PACE if PROVIDER == "polygon" else STOOQ_PACE
 
-# How far back a backfill asks for. Polygon's free tier serves two years.
-HISTORY_START = os.environ.get("PRICE_START", "2024-01-01")
+# How far back a backfill asks for.
+#
+# The free tier serves two years of end-of-day history, so a fixed date here
+# would quietly slide out of range as the calendar moves and return short
+# series that look like thin coverage rather than an expired window. Asked for
+# relative to today instead, with a margin inside the limit.
+HISTORY_START = os.environ.get("PRICE_START") or (
+    date.today() - timedelta(days=700)).isoformat()
 
 # The benchmark. Every return this project quotes is quoted beside the market
 # over the identical window, because a number that is not is mostly telling you
