@@ -6,9 +6,11 @@
 # live state to answer a research question. So it builds a separate history.db
 # from scratch, and the live collection never sees it.
 #
-# The history database is carried between runs as an artifact rather than
-# committed: it is large, reproducible from EDGAR at any time, and is evidence
-# for a study rather than state the screener depends on.
+# The history and price databases are carried between runs in the ACTIONS
+# CACHE rather than committed: both are large, both are reproducible from their
+# sources at any time, and neither is state the screener depends on. Only the
+# result -- a small JSON file -- is kept as an artifact, because that is the
+# thing someone downloads and reads.
 
 name: simulate
 
@@ -39,20 +41,36 @@ jobs:
           python-version: '3.12'
 
       # Resume from whatever a previous run got through. A backfill that dies
-      # at hour six must not start from zero on the retry.
-      - name: Restore history
-        uses: actions/download-artifact@v4
-        continue-on-error: true
+      # at hour six must not start from zero on the retry, and prices already
+      # paid for at five requests a minute must not be re-fetched.
+      #
+      # CACHE, not download-artifact. download-artifact@v4 reads only the
+      # CURRENT run's artifacts unless given a run-id, so the first version of
+      # this restored nothing at all -- and because it was wrapped in
+      # continue-on-error, it reported success while doing nothing, and the
+      # measure stage then failed with "no history.db" on a database that had
+      # been collected perfectly well five days earlier. A cache keyed per run
+      # with a shared restore prefix always writes a new entry and always
+      # restores the newest one.
+      - name: Restore databases
+        uses: actions/cache@v4
         with:
-          name: history-db
-          path: .
+          path: |
+            history.db
+            prices.db
+          key: sim-db-${{ github.run_id }}
+          restore-keys: |
+            sim-db-
 
-      - name: Restore prices
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: prices-db
-          path: .
+      - name: Report what was restored
+        run: |
+          for f in history.db prices.db; do
+            if [ -f "$f" ]; then
+              echo "restored $f ($(du -h $f | cut -f1))"
+            else
+              echo "no $f carried over; starting fresh"
+            fi
+          done
 
       - name: Reconstruct filings
         if: ${{ github.event.inputs.stage != 'measure' }}
@@ -108,15 +126,6 @@ jobs:
             echo "::error::sample is too holed to measure"
             exit 1
           fi
-
-      - name: Save history
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: history-db
-          path: history.db
-          retention-days: 30
-          overwrite: true
 
       - name: Measure
         if: ${{ github.event.inputs.stage != 'collect' }}
@@ -177,15 +186,6 @@ jobs:
           python3 simulator.py --source ledger \
             --since "${{ github.event.inputs.since }}" \
             --json simulation.json
-
-      - name: Save prices
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: prices-db
-          path: prices.db
-          retention-days: 30
-          overwrite: true
 
       - name: Save result
         if: always()
