@@ -35,6 +35,7 @@ have captured.
 """
 
 import json
+import re
 import statistics
 import sys
 from datetime import date, datetime, timedelta
@@ -189,7 +190,33 @@ def format_report(name, result):
     return "\n".join(lines)
 
 
-def entries_from_ledger(conn, since=None, until=None, apply_sale_override=True):
+# Form 4 officer titles are free text, so the role filter is a matcher rather
+# than a lookup. These two patterns were checked against all 209 distinct
+# titles in the ledger: they catch "Co-Chief Executive Officer", "Interim CEO
+# & CFO" and "President/CEO (GBank)", and they correctly decline the thirty-odd
+# other "Chief ... Officer" variants -- Operating, Investment, Accounting,
+# Technology, Medical, Actuary and the rest. A looser "chief.*officer" would
+# have swept all of those in and quietly measured something else.
+CEO_RE = re.compile(r"\bCEO\b|\bchief\s+executive\b", re.I)
+CFO_RE = re.compile(r"\bCFO\b|\bchief\s+financial\b", re.I)
+DIRECTOR_RE = re.compile(r"\bdirector\b", re.I)
+
+ROLES = {
+    "ceo": lambda t: bool(CEO_RE.search(t or "")),
+    "cfo": lambda t: bool(CFO_RE.search(t or "")),
+    "ceo_cfo": lambda t: bool(CEO_RE.search(t or "") or CFO_RE.search(t or "")),
+    # The comparison group. A director buying is the common case -- 705 of
+    # 2,069 rows -- and without it a CEO/CFO number has nothing to be better
+    # or worse THAN.
+    "director": lambda t: bool(DIRECTOR_RE.search(t or "")
+                               and not CEO_RE.search(t or "")
+                               and not CFO_RE.search(t or "")),
+    "any": lambda t: True,
+}
+
+
+def entries_from_ledger(conn, since=None, until=None, apply_sale_override=True,
+                        role="any"):
     """Reconstruct purchase and cluster signals, point-in-time correct.
 
     The live evaluator filters the ledger by transaction date, which is right
@@ -222,9 +249,10 @@ def entries_from_ledger(conn, since=None, until=None, apply_sale_override=True):
     clause = (" AND " + " AND ".join(where)) if where else ""
 
     # Every buy, carrying the date it became public.
+    matches_role = ROLES.get(role, ROLES["any"])
     buys = conn.execute(
-        "SELECT b.issuer_cik cik, b.ticker, b.owner, b.txn_date, b.value,"
-        " d.filed_date FROM insider_buys b"
+        "SELECT b.issuer_cik cik, b.ticker, b.owner, b.owner_title,"
+        " b.txn_date, b.value, d.filed_date FROM insider_buys b"
         " JOIN documents d ON d.accession = b.accession"
         " WHERE COALESCE(b.suspect,0)=0 AND b.txn_date IS NOT NULL"
         " AND d.filed_date IS NOT NULL AND b.issuer_cik IS NOT NULL"
@@ -239,6 +267,8 @@ def entries_from_ledger(conn, since=None, until=None, apply_sale_override=True):
 
     by_cik = {}
     for row in buys:
+        if not matches_role(row["owner_title"]):
+            continue
         by_cik.setdefault(row["cik"], []).append(row)
     sales_by_cik = {}
     for row in sales:
@@ -332,12 +362,27 @@ def main(argv=None):
                     help="download any prices the entries need before measuring")
     ap.add_argument("--horizons", default=",".join(str(h) for h in HORIZONS))
     ap.add_argument("--json", metavar="PATH", help="write the full result as JSON")
+    ap.add_argument("--roles", default="",
+                    help="comma-separated roles to compare instead of the "
+                         "override contrast: ceo, cfo, ceo_cfo, director, any")
     args = ap.parse_args(argv)
 
     horizons = tuple(int(h) for h in args.horizons.split(",") if h.strip())
     led = ed.connect()
 
-    if args.source == "ledger":
+    roles = [r.strip() for r in args.roles.split(",") if r.strip()]
+    by_role = {}
+    if roles:
+        unknown = [r for r in roles if r not in ROLES]
+        if unknown:
+            print(f"unknown role(s): {', '.join(unknown)}. "
+                  f"Known: {', '.join(sorted(ROLES))}")
+            return 1
+        for r in roles:
+            by_role[r] = entries_from_ledger(led, args.since, args.until,
+                                             apply_sale_override=True, role=r)
+        shipped = no_override = []
+    elif args.source == "ledger":
         shipped = entries_from_ledger(led, args.since, args.until,
                                       apply_sale_override=True)
         no_override = entries_from_ledger(led, args.since, args.until,
@@ -346,7 +391,7 @@ def main(argv=None):
         shipped = entries_from_transitions(led)
         no_override = []
 
-    if not shipped and not no_override:
+    if not shipped and not no_override and not any(by_role.values()):
         print("No entries reconstructed. Nothing to measure -- this is a real\n"
               "answer, not an empty one: either the window holds no filings or\n"
               "no issuer cleared the floor.")
@@ -371,15 +416,25 @@ def main(argv=None):
         return 1
 
     out = {}
-    groups = [("purchase (as shipped)",
-               [e for e in shipped if e.rule == "purchase"]),
-              ("cluster (as shipped)",
-               [e for e in shipped if e.rule == "cluster"])]
-    if no_override:
-        groups += [("purchase (sale override OFF)",
-                    [e for e in no_override if e.rule == "purchase"]),
-                   ("cluster (sale override OFF)",
-                    [e for e in no_override if e.rule == "cluster"])]
+    if by_role:
+        # Split by rule as well as role: "the CEO bought" and "the CEO and the
+        # CFO both bought" are different claims and averaging them together
+        # would hide whichever one carries the information.
+        groups = []
+        for r in roles:
+            for rule in ("purchase", "cluster"):
+                groups.append((f"{rule} — {r}",
+                               [e for e in by_role[r] if e.rule == rule]))
+    else:
+        groups = [("purchase (as shipped)",
+                   [e for e in shipped if e.rule == "purchase"]),
+                  ("cluster (as shipped)",
+                   [e for e in shipped if e.rule == "cluster"])]
+        if no_override:
+            groups += [("purchase (sale override OFF)",
+                        [e for e in no_override if e.rule == "purchase"]),
+                       ("cluster (sale override OFF)",
+                        [e for e in no_override if e.rule == "cluster"])]
 
     print()
     for name, group in groups:

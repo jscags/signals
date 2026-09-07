@@ -29,6 +29,9 @@ on:
       stage:
         description: 'collect | measure | both'
         default: 'both'
+      roles:
+        description: 'Compare roles instead of the override contrast: ceo,cfo,ceo_cfo,director'
+        default: ''
 
 jobs:
   simulate:
@@ -183,9 +186,16 @@ jobs:
           print(f"  {n:,} bars across {t:,} tickers")
           PY
 
-          python3 simulator.py --source ledger \
-            --since "${{ github.event.inputs.since }}" \
-            --json simulation.json
+          ROLES="${{ github.event.inputs.roles }}"
+          if [ -n "$ROLES" ]; then
+            python3 simulator.py --source ledger \
+              --since "${{ github.event.inputs.since }}" \
+              --roles "$ROLES" --json simulation.json
+          else
+            python3 simulator.py --source ledger \
+              --since "${{ github.event.inputs.since }}" \
+              --json simulation.json
+          fi
 
       - name: Save result
         if: always()
