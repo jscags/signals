@@ -32,6 +32,9 @@ on:
       roles:
         description: 'Compare roles instead of the override contrast: ceo,cfo,ceo_cfo,director'
         default: ''
+      split_size:
+        description: 'Split each group by liquidity tier (true/false)'
+        default: 'false'
 
 jobs:
   simulate:
@@ -186,16 +189,11 @@ jobs:
           print(f"  {n:,} bars across {t:,} tickers")
           PY
 
-          ROLES="${{ github.event.inputs.roles }}"
-          if [ -n "$ROLES" ]; then
-            python3 simulator.py --source ledger \
-              --since "${{ github.event.inputs.since }}" \
-              --roles "$ROLES" --json simulation.json
-          else
-            python3 simulator.py --source ledger \
-              --since "${{ github.event.inputs.since }}" \
-              --json simulation.json
-          fi
+          ARGS="--source ledger --since ${{ github.event.inputs.since }} --json simulation.json"
+          [ -n "${{ github.event.inputs.roles }}" ] && ARGS="$ARGS --roles ${{ github.event.inputs.roles }}"
+          [ "${{ github.event.inputs.split_size }}" = "true" ] && ARGS="$ARGS --split-size"
+          echo "simulator.py $ARGS"
+          python3 simulator.py $ARGS
 
       - name: Save result
         if: always()

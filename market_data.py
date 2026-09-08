@@ -452,3 +452,29 @@ def refresh_grouped(conn, start, end, pace=None, verbose=True):
         time.sleep(pace)
         day += timedelta(days=1)
     return got, empty, failed
+
+
+def median_dollar_volume(conn, ticker, before_day, sessions=20):
+    """Typical daily dollar volume in the sessions BEFORE a day, or None.
+
+    A size proxy that exists for every priced entry, which market cap does not:
+    the ledger carries a share count for only some issuers, and a size split
+    that silently drops the rest would be measuring the subset it could size.
+
+    Measured strictly BEFORE the entry, and over a median rather than one day.
+    Both matter. A Form 4 becoming public can itself move volume, so the entry
+    day is contaminated by the very event being studied; and a single session
+    is noisy enough that one halt or one block trade would reclassify a company
+    by two buckets.
+    """
+    rows = conn.execute(
+        "SELECT close, volume FROM prices WHERE ticker = ? AND day < ?"
+        " AND close > 0 AND volume > 0 ORDER BY day DESC LIMIT ?",
+        (ticker, before_day, sessions)).fetchall()
+    if len(rows) < max(5, sessions // 4):
+        return None                 # too little history to characterise
+    values = sorted(r["close"] * r["volume"] for r in rows)
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2

@@ -65,6 +65,56 @@ class Entry:
                 f"{self.status}>")
 
 
+# Liquidity tiers, by typical daily dollar volume before the entry. The point
+# is one question: does the CEO result survive once the smallest, thinnest
+# names are set aside? If it does not, what was found is a size effect wearing
+# a role costume -- CEO purchases concentrated in distressed microcaps, and the
+# title merely along for the ride.
+#
+# Bucketed on dollar volume rather than market cap because dollar volume exists
+# for every priced entry. The ledger carries a share count for only some
+# issuers, and a size split that silently dropped the rest would be measuring
+# the subset it happened to be able to size.
+SIZE_BUCKETS = (
+    ("micro  <$1m/day", 0.0, 1e6),
+    ("small  $1-10m", 1e6, 1e7),
+    ("mid    $10-100m", 1e7, 1e8),
+    ("large  >$100m", 1e8, float("inf")),
+)
+
+
+def size_bucket(dollar_volume):
+    """Which tier a reading falls in. None -> 'unsized', never dropped."""
+    if dollar_volume is None:
+        return "unsized"
+    for name, lo, hi in SIZE_BUCKETS:
+        if lo <= dollar_volume < hi:
+            return name
+    return "unsized"
+
+
+def split_by_size(conn, entries, sessions=20):
+    """Partition RESOLVED entries by liquidity tier, keeping the unsized.
+
+    Entries are resolved first because the size is measured against the entry
+    day, and an entry with no price has no entry day. The unsized bucket is
+    reported rather than discarded: a company too new to have twenty sessions
+    of history is a real part of the population, and quietly dropping it would
+    tilt every tier toward established names.
+    """
+    out = {}
+    for entry in entries:
+        if entry.status != "ok":
+            resolve(conn, entry)
+        if entry.status != "ok":
+            out.setdefault("unpriced", []).append(entry)
+            continue
+        dv = market_data.median_dollar_volume(conn, entry.ticker,
+                                              entry.entry_day, sessions)
+        out.setdefault(size_bucket(dv), []).append(entry)
+    return out
+
+
 def resolve(conn, entry, max_gap_days=7):
     """Attach the first tradeable open strictly after the signal day.
 
@@ -362,6 +412,9 @@ def main(argv=None):
                     help="download any prices the entries need before measuring")
     ap.add_argument("--horizons", default=",".join(str(h) for h in HORIZONS))
     ap.add_argument("--json", metavar="PATH", help="write the full result as JSON")
+    ap.add_argument("--split-size", action="store_true",
+                    help="split each group by liquidity tier, to separate a "
+                         "role effect from a size effect")
     ap.add_argument("--roles", default="",
                     help="comma-separated roles to compare instead of the "
                          "override contrast: ceo, cfo, ceo_cfo, director, any")
@@ -440,6 +493,28 @@ def main(argv=None):
     for name, group in groups:
         if not group:
             print(f"── {name}\n   no entries\n")
+            continue
+        if args.split_size:
+            # The whole group first, so the tiers can be read against it.
+            whole = measure(prices, group, horizons=horizons)
+            out[name] = whole
+            print(format_report(f"{name}  [ALL]", whole))
+            print()
+            tiers = split_by_size(prices, group)
+            order = [b[0] for b in SIZE_BUCKETS] + ["unsized", "unpriced"]
+            for tier in order:
+                bucket = tiers.get(tier) or []
+                if not bucket:
+                    continue
+                if tier == "unpriced":
+                    # Named, not measured: these have no entry day to size.
+                    print(f"── {name}  [{tier}]\n   {len(bucket)} entries, "
+                          f"no price -- excluded from every tier above\n")
+                    continue
+                sub = measure(prices, bucket, horizons=horizons)
+                out[f"{name} [{tier}]"] = sub
+                print(format_report(f"{name}  [{tier}]", sub))
+                print()
             continue
         result = measure(prices, group, horizons=horizons)
         out[name] = result
