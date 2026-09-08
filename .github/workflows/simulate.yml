@@ -111,8 +111,27 @@ jobs:
           # died on an unset user agent, each was shrugged off, and the stage
           # went green over 132KB of nothing. So failures are COUNTED, and a
           # run that lost more than half its days is a failed run.
-          OK=0; BAD=0
+          # A SELF-IMPOSED time budget, well inside the job timeout.
+          #
+          # This is not belt-and-braces, it is the difference between partial
+          # progress and none. actions/cache saves in a POST step, and GitHub
+          # skips post steps when it cancels a job for timeout -- so a run that
+          # overshoots loses everything it collected. One chunk ran five hours
+          # and fifty minutes, was cancelled, and saved nothing at all.
+          #
+          # Stopping early and exiting 0 lets the job finish normally, the
+          # cache save runs, and the next dispatch resumes: the collector skips
+          # days already in run_log, so nothing is re-fetched. That makes the
+          # chunk size a preference rather than a constraint.
+          BUDGET_SECONDS=${BUDGET_SECONDS:-16200}      # 4h30m of a 5h50m cap
+          START=$(date +%s)
+          OK=0; BAD=0; LEFT=0
           while read -r DAY; do
+            ELAPSED=$(( $(date +%s) - START ))
+            if [ "$ELAPSED" -ge "$BUDGET_SECONDS" ]; then
+              LEFT=$((LEFT+1))
+              continue
+            fi
             echo "── $DAY"
             if [ -n "$LIMIT" ]; then
               python3 edgar_discovery.py --date "$DAY" --limit "$LIMIT" && OK=$((OK+1)) || { BAD=$((BAD+1)); echo "  (day failed)"; }
@@ -122,6 +141,11 @@ jobs:
           done < days.txt
 
           echo "collected $OK day(s), $BAD failed; history.db is $(du -h history.db | cut -f1)"
+          if [ "$LEFT" -gt 0 ]; then
+            echo "::warning::stopped on the time budget with $LEFT day(s) still"
+            echo "::warning::to scan. This run is SAVED -- dispatch the same"
+            echo "::warning::window again and it will resume where it stopped."
+          fi
           if [ "$OK" -eq 0 ]; then
             echo "::error::every day failed -- the database is empty and any"
             echo "::error::measurement over it would be meaningless"
