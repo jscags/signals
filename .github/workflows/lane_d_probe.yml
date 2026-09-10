@@ -1,0 +1,37 @@
+# Lane D, Phase 0: measure the sources before building anything.
+#
+# Its own workflow, per the architectural separation in this repo. It touches
+# no database -- not signals_d.sqlite, which does not exist yet, and certainly
+# not discovery.db. There is no cache, no artifact, no commit. The whole
+# output is the log.
+#
+# The sandbox this is authored in cannot reach data.sec.gov, so measuring the
+# sources at all requires a runner. That is the only reason this exists as a
+# workflow rather than a local script.
+
+name: lane-d-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Space-separated TICKER:CIK pairs, e.g. "AGX:0000100591 PWR:0001050915"'
+        default: 'AGX:0000100591'
+      quarters:
+        description: 'How many quarters of 8-Ks to examine per ticker'
+        default: '6'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Probe sources
+        run: |
+          echo "This job writes nothing. No database, no artifact, no commit."
+          python3 lane_d_probe.py ${{ github.event.inputs.tickers }}
