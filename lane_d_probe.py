@@ -98,12 +98,36 @@ BACKLOG_RE = re.compile(
     r"\$\s*([0-9][0-9,.]*)\s*(billion|million|bn|mm|m\b)?",
     re.I | re.S)
 
-# Context words that mean the number found is NOT the consolidated figure.
+# Comparative language that means THIS figure is a prior period or a segment
+# rather than the current consolidated number.
+#
+# Matched against the words immediately BEFORE the dollar amount, not a window
+# around it. That distinction is the whole game. The first version searched a
+# +/-90 character window and rejected AGX's canonical sentence -- "As of July
+# 31, 2026, consolidated project backlog was approximately $2.5 billion,
+# compared with $2.8 billion at April 30, 2026" -- because the word "compared"
+# sits AFTER the figure it wanted. It threw away the single most important
+# number in the filing while reporting itself as careful.
 DISQUALIFY = re.compile(
-    r"\b(segment|prior[- ]year|a year ago|compared|previously|"
-    r"as of [A-Z][a-z]+ \d{1,2}, 20[0-2]\d.{0,40}(was|were))\b", re.I)
+    r"\b(segment|compared\s+(with|to)|versus|vs\.?|a year ago|"
+    r"prior[- ]year|previously|at [A-Z][a-z]+ \d{1,2}, 20[0-2]\d)\b", re.I)
+LOOKBACK = 70
+
+# Every release ends with safe-harbor boilerplate that says "backlog" without
+# disclosing one: "...the successful addition of new contracts to project
+# backlog...". Counting those as a discussion of backlog inflates the MISSED
+# bucket with documents that never had a figure to miss.
+BOILERPLATE = re.compile(
+    r"(forward[- ]looking statements|safe harbor|"
+    r"private securities litigation reform act)", re.I)
 
 MENTIONS_BACKLOG = re.compile(r"backlog", re.I)
+
+
+def strip_boilerplate(text):
+    """Text up to the safe-harbor section, which discloses nothing."""
+    m = BOILERPLATE.search(text)
+    return text[:m.start()] if m else text
 
 
 def strip_tags(html):
@@ -136,22 +160,30 @@ def extract_backlog(text):
     """Every candidate, with the surrounding words that justify or damn it."""
     out = []
     for m in BACKLOG_RE.finditer(text):
+        # The words in front of the figure decide what the figure IS.
+        before = text[max(0, m.start(2) - LOOKBACK):m.start(2)]
+        bad = DISQUALIFY.search(before)
         start, end = max(0, m.start() - 90), min(len(text), m.end() + 90)
-        context = text[start:end]
         out.append({
             "matched": m.group(0)[:160],
             "value": to_usd(m.group(2), m.group(3)),
             "consolidated_word": bool(m.group(1)),
-            "disqualified_by": (DISQUALIFY.search(context).group(0)
-                                if DISQUALIFY.search(context) else None),
-            "context": context,
+            "disqualified_by": bad.group(0) if bad else None,
+            "context": text[start:end],
         })
     return out
 
 
 def classify(text, candidates):
-    """One filing, one bucket. See the module docstring."""
-    if not MENTIONS_BACKLOG.search(text):
+    """One filing, one bucket. See the module docstring.
+
+    Judged on the DISCLOSING part of the document. A release whose only use of
+    the word is in its safe-harbor paragraph had no figure to miss, so it is
+    ABSENT -- counting it as MISSED would report an extraction failure where
+    there was nothing to extract.
+    """
+    body = strip_boilerplate(text)
+    if not MENTIONS_BACKLOG.search(body):
         return "ABSENT", None
     if not candidates:
         return "MISSED", None
@@ -335,7 +367,7 @@ def probe_ticker(ticker, cik, quarters=6):
             continue
         examined += 1
         text = strip_tags(doc.body)
-        cands = extract_backlog(text)
+        cands = extract_backlog(strip_boilerplate(text))
         bucket, best = classify(text, cands)
         tally[bucket] += 1
         value = (f"${best['value']/1e9:.2f}bn" if best and best.get("value")
@@ -343,7 +375,7 @@ def probe_ticker(ticker, cik, quarters=6):
         shown = (best or (cands[0] if cands else {})).get("matched", "")
         print(f"{f['filed']:<12}{bucket:<9}{value:>16}  {shown[:120]}")
         if bucket == "MISSED":
-            hit = MENTIONS_BACKLOG.search(text)
+            hit = MENTIONS_BACKLOG.search(strip_boilerplate(text))
             around = text[max(0, hit.start()-100):hit.start()+160]
             print(f"{'':12}{'':9}{'':>16}  ...{around}...")
         if bucket == "WRONG" and best:
