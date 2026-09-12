@@ -272,8 +272,6 @@ def discover_feed(site):
     if page.status != OK:
         return None, page, "IR page not reachable"
     links = []
-    for tag in FEED_HINT.findall(page.body) or []:
-        pass
     for m in re.finditer(FEED_HINT, page.body):
         href = HREF.search(m.group(0))
         if href:
@@ -286,6 +284,46 @@ def discover_feed(site):
         url = (root.group(1) if root else "") + url
     feed = fetch(url, accept="application/rss+xml, application/xml", pace=0.4)
     return url, feed, None
+
+
+# Hand-entered, and printed on every run so a wrong one is visible as a wrong
+# URL rather than as a company that "has no feed". The work order forbids a
+# general web search engine here, and EDGAR's submissions payload carries no
+# website field, so there is nowhere to look these up from inside the probe.
+# An unreachable IR page is a fact about THIS TABLE, not about the company.
+IR_SITES = {
+    "AGX":  "https://www.arganinc.com/investors/",
+    "SPIR": "https://ir.spire.com/",
+    "CECO": "https://investors.cecoenviro.com/",
+    "PL":   "https://investors.planet.com/",
+    "ESE":  "https://investors.escotechnologies.com/",
+}
+
+
+def probe_feeds(pairs):
+    """Does an IR RSS feed exist? Answered per company, with the URL shown."""
+    print(f"\n{'='*74}\nIR FEEDS — declared, not guessed\n{'='*74}")
+    for ticker, _cik, site in pairs:
+        site = site or IR_SITES.get(ticker)
+        if not site:
+            print(f"{ticker:<6} SKIPPED    no IR URL supplied for this ticker")
+            continue
+        print(f"{ticker:<6} {site}")
+        url, got, why = discover_feed(site)
+        if why:
+            print(f"{'':6}   -> {why} "
+                  f"({got.status} {got.code or '-'} {got.bytes}B)")
+            continue
+        print(f"{'':6}   -> declares {url}")
+        print(f"{'':6}      {got.status} {got.code or '-'} {got.bytes}B"
+              + (f"  {got.note}" if got.note else ""))
+        if got.status != OK:
+            continue
+        titles = feed_titles(got.body, limit=5)
+        if not titles:
+            print(f"{'':6}      feed fetched but no <title> items parsed")
+        for t in titles:
+            print(f"{'':6}      · {t}")
 
 
 def feed_titles(body, limit=10):
@@ -399,18 +437,25 @@ def probe_ticker(ticker, cik, quarters=6):
 def main(argv):
     pairs = []
     for arg in argv[1:]:
-        if ":" in arg:
-            t, c = arg.split(":", 1)
-            pairs.append((t.strip().upper(), c.strip()))
+        if ":" not in arg:
+            continue
+        # TICKER:CIK or TICKER:CIK:https://ir.site/ -- split twice, because an
+        # IR URL contains a colon of its own.
+        bits = arg.split(":", 2)
+        t, c = bits[0], bits[1]
+        site = bits[2].strip() if len(bits) > 2 else ""
+        pairs.append((t.strip().upper(), c.strip(), site))
     if not pairs:
-        pairs = [("AGX", "0000100591")]
+        pairs = [("AGX", "0000100591", "")]
 
     print("LANE D — PHASE 0 SOURCE RELIABILITY PROBE")
     print(f"run at {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
     print("this script writes nothing: no database, no state, no files")
 
-    for ticker, cik in pairs:
+    for ticker, cik, _site in pairs:
         probe_ticker(ticker, cik)
+
+    probe_feeds(pairs)
 
     print(f"\n{'='*74}\nQUOTE SOURCES (free, no key) — from this runner's IP")
     print("=" * 74)
