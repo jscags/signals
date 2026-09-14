@@ -255,6 +255,82 @@ def exhibit_991(cik, accession):
     return pick, doc, None
 
 
+# ------------------------------------------------------------- diagnosis
+
+# SPIR came back 12-of-12 ABSENT, which is either a fact about Spire or a
+# defect in exhibit_991 -- and those have opposite consequences. exhibit_991
+# reads exactly ONE file per filing. If it picks the 8-K cover page instead of
+# the press release, every filing reads ABSENT and the probe reports a company
+# that never discusses backlog. So this opens EVERY htm exhibit in the filing
+# and counts the vocabulary in each, marking the one the picker chose.
+#
+# Writes nothing, like the rest of this module.
+VOCAB = [
+    ("backlog", re.compile(r"backlog", re.I)),
+    ("rpo", re.compile(r"remaining\s+performance\s+obligation", re.I)),
+    ("arr", re.compile(r"\bARR\b|annual\s+recurring\s+revenue", re.I)),
+    ("bookings", re.compile(r"\bbookings?\b", re.I)),
+    ("pipeline", re.compile(r"\bpipeline\b", re.I)),
+]
+
+
+def diagnose(ticker, cik, quarters=6):
+    print(f"\n{'='*74}\n{ticker} — EVERY EXHIBIT, NOT JUST THE PICKED ONE"
+          f"\n{'='*74}")
+
+    subs = submissions(cik)
+    print(f"submissions: {subs.status} {subs.code or ''} {subs.bytes}B")
+    if subs.status != OK:
+        print("  -> cannot enumerate filings")
+        return
+
+    filings, err = recent_8ks(subs.body, limit=quarters * 2)
+    if err:
+        print(f"  -> PARSE_FAIL on submissions json: {err}")
+        return
+
+    for f in filings:
+        plain = f["accession"].replace("-", "")
+        base = (f"https://www.sec.gov/Archives/edgar/data/"
+                f"{str(cik).lstrip('0')}/{plain}")
+        print(f"\n{f['filed']}  {f['accession']}  items={f['items'] or '-'}")
+
+        picked, _doc, why = exhibit_991(cik, f["accession"])
+        if picked is None:
+            print(f"   picker: {why}")
+
+        index = fetch(f"{base}/index.json", accept="application/json")
+        if index.status != OK:
+            print(f"   index {index.status} {index.code or '-'}")
+            continue
+        try:
+            items = json.loads(index.body)["directory"]["item"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            print(f"   index PARSE_FAIL {type(exc).__name__}")
+            continue
+
+        htm = [i for i in items
+               if i["name"].lower().endswith((".htm", ".html"))
+               and not re.match(r"(?i)R\d+\.htm", i["name"])]
+        if not htm:
+            print("   no htm items in the index at all")
+            continue
+
+        for item in htm:
+            name = item["name"]
+            doc = fetch(f"{base}/{name}", accept="text/html")
+            mark = ">>" if name == picked else "  "
+            if doc.status != OK:
+                print(f"   {mark} {name:<34}{doc.status} {doc.code or '-'}")
+                continue
+            text = strip_tags(doc.body)
+            counts = "  ".join(
+                f"{label}:{len(rx.findall(text))}" for label, rx in VOCAB)
+            print(f"   {mark} {name:<34}{len(doc.body)//1024:>5}KB  {counts}")
+
+        print("      (>> = the file exhibit_991 examined)")
+
+
 # --------------------------------------------------------------- ir feeds
 
 FEED_HINT = re.compile(
@@ -435,8 +511,10 @@ def probe_ticker(ticker, cik, quarters=6):
 
 
 def main(argv):
+    args = [a for a in argv[1:] if a != "--diagnose"]
+    diagnosing = "--diagnose" in argv[1:]
     pairs = []
-    for arg in argv[1:]:
+    for arg in args:
         if ":" not in arg:
             continue
         # TICKER:CIK or TICKER:CIK:https://ir.site/ -- split twice, because an
@@ -451,6 +529,11 @@ def main(argv):
     print("LANE D — PHASE 0 SOURCE RELIABILITY PROBE")
     print(f"run at {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
     print("this script writes nothing: no database, no state, no files")
+
+    if diagnosing:
+        for ticker, cik, _site in pairs:
+            diagnose(ticker, cik)
+        return 0
 
     for ticker, cik, _site in pairs:
         probe_ticker(ticker, cik)

@@ -20,6 +20,9 @@ on:
       quarters:
         description: 'How many quarters of 8-Ks to examine per ticker'
         default: '6'
+      mode:
+        description: 'measure | diagnose (diagnose opens every exhibit, not just the picked one)'
+        default: 'measure'
 
 jobs:
   probe:
@@ -32,6 +35,16 @@ jobs:
           python-version: '3.12'
 
       - name: Probe sources
+        env:
+          TICKERS: ${{ github.event.inputs.tickers }}
+          MODE: ${{ github.event.inputs.mode }}
         run: |
           echo "This job writes nothing. No database, no artifact, no commit."
-          python3 lane_d_probe.py ${{ github.event.inputs.tickers }}
+          # An explicit if, not `[ x = y ] && FLAGS=...`. Under `bash -e` that
+          # one-liner takes the whole step down whenever the test is false --
+          # which would be every ordinary measure run.
+          FLAGS=""
+          if [ "$MODE" = "diagnose" ]; then
+            FLAGS="--diagnose"
+          fi
+          python3 lane_d_probe.py $FLAGS $TICKERS
