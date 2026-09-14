@@ -414,6 +414,7 @@ def diagnose(ticker, cik, quarters=6):
     print(f"    of those, backlog > 0  {tally['earnings_backlog']}")
     print(f"  backlog in a file the picker skipped  "
           f"{tally['missed_by_picker']}")
+    return tally
 
 
 # --------------------------------------------------------------- ir feeds
@@ -616,8 +617,41 @@ def main(argv):
     print("this script writes nothing: no database, no state, no files")
 
     if diagnosing:
+        # Repeated at the end as one table. The per-ticker detail runs to
+        # hundreds of lines, and an answer that is only reachable by scrolling
+        # to the right point in the middle of a log is an answer that will be
+        # read selectively.
+        results = []
         for ticker, cik, _site in pairs:
-            diagnose(ticker, cik)
+            results.append((ticker, diagnose(ticker, cik)))
+
+        print(f"\n{'='*74}\nALL TICKERS\n{'='*74}")
+        print(f"{'':6}{'read':>6}{'disagree':>10}{'REV:0':>8}"
+              f"{'2.02':>7}{'w/ backlog':>12}{'picker missed':>15}")
+        print("-" * 74)
+        totals = {}
+        for ticker, t in results:
+            if t is None:
+                print(f"{ticker:<6}  (no result -- see the section above)")
+                continue
+            for k, v in t.items():
+                totals[k] = totals.get(k, 0) + v
+            print(f"{ticker:<6}{t['rows']:>6}{t['disagree']:>10}"
+                  f"{t['unread']:>8}{t['earnings']:>7}"
+                  f"{t['earnings_backlog']:>12}{t['missed_by_picker']:>15}")
+        if totals:
+            print("-" * 74)
+            print(f"{'all':<6}{totals['rows']:>6}{totals['disagree']:>10}"
+                  f"{totals['unread']:>8}{totals['earnings']:>7}"
+                  f"{totals['earnings_backlog']:>12}"
+                  f"{totals['missed_by_picker']:>15}")
+            hit = totals["earnings_backlog"]
+            n = totals["earnings"]
+            print(f"\nbacklog disclosed in {hit} of {n} item-2.02 filings"
+                  + (f" ({hit/n:.0%})" if n else ""))
+            print("  disagree>0 => strip_tags under-counts and every tally "
+                  "built on it must be restated")
+            print("  REV:0 => the picked exhibit was not actually read")
         return 0
 
     for ticker, cik, _site in pairs:
