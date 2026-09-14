@@ -320,7 +320,15 @@ def diagnose(ticker, cik, quarters=6):
         print(f"  -> PARSE_FAIL on submissions json: {err}")
         return
 
+    tally = {"rows": 0, "disagree": 0, "unread": 0,
+             "earnings": 0, "earnings_backlog": 0, "missed_by_picker": 0}
+
     for f in filings:
+        # Item 2.02 is Results of Operations. A quarterly metric can only
+        # appear in an earnings release, so counting 5.02 director changes and
+        # 8.01 announcements in the denominator understates the extractor by
+        # padding it with filings that never had a figure to find.
+        is_earnings = "2.02" in (f["items"] or "")
         plain = f["accession"].replace("-", "")
         base = (f"https://www.sec.gov/Archives/edgar/data/"
                 f"{str(cik).lstrip('0')}/{plain}")
@@ -348,6 +356,7 @@ def diagnose(ticker, cik, quarters=6):
             print("   no htm items in the index at all")
             continue
 
+        rows = []
         for item in htm:
             name = item["name"]
             doc = fetch(f"{base}/{name}", accept="text/html")
@@ -355,15 +364,56 @@ def diagnose(ticker, cik, quarters=6):
             if doc.status != OK:
                 print(f"   {mark} {name:<34}{doc.status} {doc.code or '-'}")
                 continue
+
+            t1, t2 = strip_tags(doc.body), strip_tags_v2(doc.body)
+            c1 = {term: len(rx.findall(t1)) for term, rx in VOCAB}
+            c2 = {term: len(rx.findall(t2)) for term, rx in VOCAB}
+            rows.append((name, c1, c2))
+
+            tally["rows"] += 1
+            if c1 != c2:
+                tally["disagree"] += 1
+
             print(f"   {mark} {name:<34}{len(doc.body)//1024:>5}KB")
-            for label, extract in (("v1", strip_tags), ("v2", strip_tags_v2)):
-                text = extract(doc.body)
-                counts = "  ".join(
-                    f"{term}:{len(rx.findall(text))}" for term, rx in VOCAB)
-                print(f"        {label} {len(text):>8,} chars   {counts}")
+            counts = "  ".join(f"{t}:{c2[t]}" for t, _ in VOCAB)
+            print(f"        v2 {len(t2):>8,} chars   {counts}")
+            if c1 != c2:
+                delta = "  ".join(f"{t}:{c1[t]}" for t, _ in VOCAB)
+                print(f"        v1 {len(t1):>8,} chars   {delta}"
+                      f"   <-- EXTRACTORS DISAGREE")
+
+        # Judged after the whole filing is read: the picked exhibit is not
+        # always the first one listed, so this cannot be decided in the loop.
+        chosen = next((c2 for n, _c1, c2 in rows if n == picked), None)
+        if chosen is not None:
+            if chosen["REVENUE"] == 0:
+                tally["unread"] += 1
+            if is_earnings:
+                tally["earnings"] += 1
+                if chosen["backlog"]:
+                    tally["earnings_backlog"] += 1
+            if not chosen["backlog"]:
+                skipped = [n for n, _c1, c2 in rows
+                           if n != picked and c2["backlog"]]
+                if skipped:
+                    tally["missed_by_picker"] += 1
+                    print(f"      !! picker read {picked} (backlog:0) but "
+                          f"{', '.join(skipped)} discusses backlog")
 
         print("      (>> = the file exhibit_991 examined;"
               " REVENUE:0 means the text was not read)")
+
+    print(f"\n{'-'*74}\n{ticker} SUMMARY")
+    print(f"  exhibits read            {tally['rows']}")
+    print(f"  extractors disagree      {tally['disagree']}"
+          f"   (non-zero => v1 has been under-counting)")
+    print(f"  picked exhibit REVENUE:0 {tally['unread']}"
+          f"   (a document that was not actually read)")
+    print(f"  item-2.02 filings        {tally['earnings']}"
+          f"   (the only ones a quarterly metric can appear in)")
+    print(f"    of those, backlog > 0  {tally['earnings_backlog']}")
+    print(f"  backlog in a file the picker skipped  "
+          f"{tally['missed_by_picker']}")
 
 
 # --------------------------------------------------------------- ir feeds
