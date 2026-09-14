@@ -41,6 +41,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from html import unescape
 
 USER_AGENT = "edgar-discovery 52y9fp5njf@privaterelay.appleid.com"
 SEC_PACE = 0.15                      # under the SEC's 10/sec
@@ -137,6 +138,29 @@ def strip_tags(html):
     text = (text.replace("&nbsp;", " ").replace("&amp;", "&")
                 .replace("&#160;", " ").replace("&#8217;", "'")
                 .replace("&rsquo;", "'").replace("&mdash;", "—"))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# Inline tags carry no word boundary. Replacing them with a space turns
+# "<span>back</span><span>log</span>" into "back log", which matches nothing
+# -- and a heavily styled 1.4MB release is exactly that shape. Block tags DO
+# separate words, so those still become a space.
+INLINE_TAG = re.compile(
+    r"(?is)</?(span|b|i|em|strong|font|a|sub|sup|u|small|ix:[a-z]+)\b[^>]*>")
+
+
+def strip_tags_v2(html):
+    """Same job, but word-boundary aware and with full entity decoding.
+
+    Written to be compared against strip_tags on the same document, not to
+    quietly replace it. If the two disagree, the older one has been silently
+    under-counting and every tally built on it is suspect.
+    """
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    text = INLINE_TAG.sub("", text)            # no boundary -> no space
+    text = re.sub(r"(?s)<[^>]+>", " ", text)   # block tags -> boundary
+    text = unescape(text)                      # &#8203; and friends
+    text = text.replace("​", "").replace("﻿", "")
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -271,7 +295,14 @@ VOCAB = [
     ("arr", re.compile(r"\bARR\b|annual\s+recurring\s+revenue", re.I)),
     ("bookings", re.compile(r"\bbookings?\b", re.I)),
     ("pipeline", re.compile(r"\bpipeline\b", re.I)),
+    # THE CONTROL. Every earnings release on earth says "revenue". A document
+    # that reports revenue:0 has not been read, whatever the other counts say
+    # -- so a zero here invalidates the row rather than describing the filer.
+    ("REVENUE", re.compile(r"revenue", re.I)),
 ]
+
+# EDGAR's own index wrappers are not filed content; counting them is noise.
+EDGAR_WRAPPER = re.compile(r"(?i)-index(-headers)?\.html?$")
 
 
 def diagnose(ticker, cik, quarters=6):
@@ -311,7 +342,8 @@ def diagnose(ticker, cik, quarters=6):
 
         htm = [i for i in items
                if i["name"].lower().endswith((".htm", ".html"))
-               and not re.match(r"(?i)R\d+\.htm", i["name"])]
+               and not re.match(r"(?i)R\d+\.htm", i["name"])
+               and not EDGAR_WRAPPER.search(i["name"])]
         if not htm:
             print("   no htm items in the index at all")
             continue
@@ -323,12 +355,15 @@ def diagnose(ticker, cik, quarters=6):
             if doc.status != OK:
                 print(f"   {mark} {name:<34}{doc.status} {doc.code or '-'}")
                 continue
-            text = strip_tags(doc.body)
-            counts = "  ".join(
-                f"{label}:{len(rx.findall(text))}" for label, rx in VOCAB)
-            print(f"   {mark} {name:<34}{len(doc.body)//1024:>5}KB  {counts}")
+            print(f"   {mark} {name:<34}{len(doc.body)//1024:>5}KB")
+            for label, extract in (("v1", strip_tags), ("v2", strip_tags_v2)):
+                text = extract(doc.body)
+                counts = "  ".join(
+                    f"{term}:{len(rx.findall(text))}" for term, rx in VOCAB)
+                print(f"        {label} {len(text):>8,} chars   {counts}")
 
-        print("      (>> = the file exhibit_991 examined)")
+        print("      (>> = the file exhibit_991 examined;"
+              " REVENUE:0 means the text was not read)")
 
 
 # --------------------------------------------------------------- ir feeds
