@@ -320,8 +320,9 @@ def diagnose(ticker, cik, quarters=6):
         print(f"  -> PARSE_FAIL on submissions json: {err}")
         return
 
-    tally = {"rows": 0, "disagree": 0, "unread": 0,
-             "earnings": 0, "earnings_backlog": 0, "missed_by_picker": 0}
+    tally = {"rows": 0, "disagree": 0, "unread": 0, "earnings": 0,
+             "earnings_backlog": 0, "earnings_unread": 0,
+             "missed_by_picker": 0}
 
     for f in filings:
         # Item 2.02 is Results of Operations. A quarterly metric can only
@@ -392,6 +393,15 @@ def diagnose(ticker, cik, quarters=6):
                 tally["earnings"] += 1
                 if chosen["backlog"]:
                     tally["earnings_backlog"] += 1
+                # The control that actually decides "absent" vs "not read".
+                # An 8-K cover page legitimately says nothing about revenue,
+                # so the unscoped count is dominated by filings where a zero
+                # means nothing. Only on an EARNINGS release is REVENUE:0
+                # proof the document was never read.
+                if chosen["REVENUE"] == 0:
+                    tally["earnings_unread"] += 1
+                    print(f"      !! item-2.02 filing, picked exhibit has "
+                          f"REVENUE:0 -- NOT READ, backlog:0 means nothing")
             if not chosen["backlog"]:
                 skipped = [n for n, _c1, c2 in rows
                            if n != picked and c2["backlog"]]
@@ -412,6 +422,8 @@ def diagnose(ticker, cik, quarters=6):
     print(f"  item-2.02 filings        {tally['earnings']}"
           f"   (the only ones a quarterly metric can appear in)")
     print(f"    of those, backlog > 0  {tally['earnings_backlog']}")
+    print(f"    of those, NOT READ     {tally['earnings_unread']}"
+          f"   (REVENUE:0 on an earnings release)")
     print(f"  backlog in a file the picker skipped  "
           f"{tally['missed_by_picker']}")
     return tally
@@ -626,8 +638,8 @@ def main(argv):
             results.append((ticker, diagnose(ticker, cik)))
 
         print(f"\n{'='*74}\nALL TICKERS\n{'='*74}")
-        print(f"{'':6}{'read':>6}{'disagree':>10}{'REV:0':>8}"
-              f"{'2.02':>7}{'w/ backlog':>12}{'picker missed':>15}")
+        print(f"{'':6}{'read':>6}{'disagree':>10}{'2.02':>7}"
+              f"{'w/ backlog':>12}{'NOT READ':>10}{'picker missed':>15}")
         print("-" * 74)
         totals = {}
         for ticker, t in results:
@@ -637,13 +649,13 @@ def main(argv):
             for k, v in t.items():
                 totals[k] = totals.get(k, 0) + v
             print(f"{ticker:<6}{t['rows']:>6}{t['disagree']:>10}"
-                  f"{t['unread']:>8}{t['earnings']:>7}"
-                  f"{t['earnings_backlog']:>12}{t['missed_by_picker']:>15}")
+                  f"{t['earnings']:>7}{t['earnings_backlog']:>12}"
+                  f"{t['earnings_unread']:>10}{t['missed_by_picker']:>15}")
         if totals:
             print("-" * 74)
             print(f"{'all':<6}{totals['rows']:>6}{totals['disagree']:>10}"
-                  f"{totals['unread']:>8}{totals['earnings']:>7}"
-                  f"{totals['earnings_backlog']:>12}"
+                  f"{totals['earnings']:>7}{totals['earnings_backlog']:>12}"
+                  f"{totals['earnings_unread']:>10}"
                   f"{totals['missed_by_picker']:>15}")
             hit = totals["earnings_backlog"]
             n = totals["earnings"]
@@ -651,7 +663,8 @@ def main(argv):
                   + (f" ({hit/n:.0%})" if n else ""))
             print("  disagree>0 => strip_tags under-counts and every tally "
                   "built on it must be restated")
-            print("  REV:0 => the picked exhibit was not actually read")
+            print("  NOT READ>0 => an earnings release with no 'revenue' in "
+                  "it; its backlog:0 is meaningless, not an absence")
         return 0
 
     for ticker, cik, _site in pairs:
