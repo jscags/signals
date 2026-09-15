@@ -27,7 +27,7 @@ on:
         description: 'Max documents per day (blank = no cap; a cap biases the sample)'
         default: ''
       stage:
-        description: 'collect | measure | both'
+        description: 'collect | measure | both | audit (audit is read-only)'
         default: 'both'
       roles:
         description: 'Compare roles instead of the override contrast: ceo,cfo,ceo_cfo,director'
@@ -78,8 +78,12 @@ jobs:
             fi
           done
 
+      # Named stages, not "not the other one". These were `!= 'measure'` and
+      # `!= 'collect'`, which meant ANY new stage value silently ran both --
+      # so adding `audit` would have started a five-hour backfill on a run
+      # asked only to inspect what was already there.
       - name: Reconstruct filings
-        if: ${{ github.event.inputs.stage != 'measure' }}
+        if: ${{ github.event.inputs.stage == 'collect' || github.event.inputs.stage == 'both' }}
         env:
           EDGAR_USER_AGENT: "edgar-discovery 52y9fp5njf@privaterelay.appleid.com"
           EDGAR_DB: history.db
@@ -157,8 +161,19 @@ jobs:
             exit 1
           fi
 
+      # Read-only. Proves the window is dense before anything is measured over
+      # it -- MIN..MAX is a range, not coverage, and a backfill that died mid
+      # window leaves endpoints that look perfect either way.
+      - name: Audit continuity
+        if: ${{ github.event.inputs.stage == 'audit' }}
+        env:
+          EDGAR_DB: history.db
+          SINCE: ${{ github.event.inputs.since }}
+          UNTIL: ${{ github.event.inputs.until }}
+        run: python3 audit_continuity.py
+
       - name: Measure
-        if: ${{ github.event.inputs.stage != 'collect' }}
+        if: ${{ github.event.inputs.stage == 'measure' || github.event.inputs.stage == 'both' }}
         env:
           EDGAR_DB: history.db
           PRICE_DB: prices.db
