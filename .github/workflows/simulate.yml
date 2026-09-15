@@ -213,7 +213,17 @@ jobs:
           print(f"  {n:,} bars across {t:,} tickers")
           PY
 
+          # --until is passed through. simulator.py has always accepted it and
+          # this workflow has always dropped it, so every measurement so far
+          # has run from `since` to the end of the database. That silently
+          # rules out the one thing an out-of-sample test needs: holding back
+          # the period the rules were written against. A blended window cannot
+          # answer whether the signal survives outside the sample, however many
+          # months it spans.
           ARGS="--source ledger --since ${{ github.event.inputs.since }} --json simulation.json"
+          if [ -n "${UNTIL}" ]; then
+            ARGS="$ARGS --until ${UNTIL}"
+          fi
           [ -n "${{ github.event.inputs.roles }}" ] && ARGS="$ARGS --roles ${{ github.event.inputs.roles }}"
           [ "${{ github.event.inputs.split_size }}" = "true" ] && ARGS="$ARGS --split-size"
           echo "simulator.py $ARGS"
