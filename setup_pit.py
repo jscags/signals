@@ -152,6 +152,31 @@ def facts_filed_by(facts, asof):
     return trimmed, {"dropped_future": dropped, "dropped_undated": undated}
 
 
+def relevant_only(facts):
+    """Drop every tag the rule does not read, once, before the date loop.
+
+    evaluate_setup reads exactly two concept families: LIABILITY_CONCEPTS via
+    instant_series and REVENUE_CONCEPTS via flow_series. Nothing else in the
+    payload can change its verdict, so discarding the rest is safe by
+    inspection rather than by hope.
+
+    It is also the difference between a run that finishes and one that does
+    not. facts_filed_by walks the whole payload for EACH filing date, and a
+    companyfacts document carries hundreds of tags across tens of thousands of
+    facts. An issuer with eighty filing dates was being walked eighty times
+    over data the rule never looks at.
+    """
+    wanted = {tag for _tax, tag in (list(setup_signal.LIABILITY_CONCEPTS)
+                                    + list(setup_signal.REVENUE_CONCEPTS))}
+    kept = {}
+    for taxonomy, tags in (facts.get("facts") or {}).items():
+        keep = {tag: payload for tag, payload in (tags or {}).items()
+                if tag in wanted}
+        if keep:
+            kept[taxonomy] = keep
+    return dict(facts, facts=kept)
+
+
 def filing_dates(facts, concepts_only=True):
     """Every distinct date on which this issuer filed something relevant.
 
@@ -211,6 +236,9 @@ def signal_dates(facts, threshold=4, mode=CROSSING):
     date, so an amended filing that restates the same quarter does not fire a
     second entry for one piece of news.
     """
+    # Trim once, then walk. Correctness is unchanged -- the discarded tags are
+    # ones the rule never reads -- and the date loop no longer pays for them.
+    facts = relevant_only(facts)
     dates = filing_dates(facts)
     fired, prev, last_quarter = [], 0, None
     stats = {"evaluated": 0, "dropped_future": 0, "dropped_undated": 0}
