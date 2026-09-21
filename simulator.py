@@ -596,15 +596,29 @@ def main(argv=None):
                 groups.append((f"{rule} — {r}",
                                [e for e in by_role[r] if e.rule == rule]))
     else:
-        groups = [("purchase (as shipped)",
-                   [e for e in shipped if e.rule == "purchase"]),
-                  ("cluster (as shipped)",
-                   [e for e in shipped if e.rule == "cluster"])]
+        # Group by the rules actually PRESENT, never a hardcoded pair. This
+        # read ("purchase", "cluster"), so Lane A entries carrying rule
+        # "setup6+" matched neither and were dropped from the report: two real
+        # entries printed as "no entries", which reads exactly like a
+        # measurement rather than like a lost group. Every future entry source
+        # would have hit the same wall.
+        groups = [(f"{rule} (as shipped)",
+                   [e for e in shipped if e.rule == rule])
+                  for rule in sorted({e.rule for e in shipped})]
         if no_override:
-            groups += [("purchase (sale override OFF)",
-                        [e for e in no_override if e.rule == "purchase"]),
-                       ("cluster (sale override OFF)",
-                        [e for e in no_override if e.rule == "cluster"])]
+            groups += [(f"{rule} (sale override OFF)",
+                        [e for e in no_override if e.rule == rule])
+                       for rule in sorted({e.rule for e in no_override})]
+
+    # The parts must sum to the whole. A grouping that quietly drops entries
+    # reports a smaller, self-selected sample as though it were the result.
+    binned = sum(len(g) for _name, g in groups)
+    expected = (sum(len(v) for v in by_role.values()) if by_role
+                else len(shipped) + len(no_override))
+    if binned != expected:
+        raise SystemExit(
+            f"grouping lost entries: {binned} binned of {expected} produced. "
+            f"Rules present: {sorted({e.rule for e in shipped})}")
 
     print()
     for name, group in groups:
