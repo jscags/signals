@@ -417,7 +417,8 @@ def setup_universe(conn, since=None, until=None):
 
 
 def entries_from_setup(conn, tickers, since=None, until=None, threshold=6,
-                       limit=None, progress=None):
+                       limit=None, progress=None,
+                       mode=setup_pit.CROSSING):
     """Lane A streak crossings as entries, point-in-time correct.
 
     The streak is recomputed from companyfacts filtered to what had been FILED
@@ -439,7 +440,8 @@ def entries_from_setup(conn, tickers, since=None, until=None, threshold=6,
     entries = []
 
     for n, (cik, _company) in enumerate(universe, 1):
-        fired, outcome = setup_pit.crossings(cik, threshold=threshold)
+        fired, outcome = setup_pit.crossings(cik, threshold=threshold,
+                                            mode=mode)
         if outcome == setup_pit.MISSING:
             stats["missing"] += 1
         elif outcome == setup_pit.FAILED:
@@ -462,7 +464,7 @@ def entries_from_setup(conn, tickers, since=None, until=None, threshold=6,
             if not ticker:
                 stats["no_ticker"] += 1
                 continue
-            entries.append(Entry(ticker, cik, f"setup{streak}", day))
+            entries.append(Entry(ticker, cik, f"setup{threshold}+", day))
 
         if progress and n % progress == 0:
             print(f"   {n}/{len(universe)} issuers · {stats['crossings']} "
@@ -496,6 +498,13 @@ def main(argv=None):
                     help="Lane A: consecutive quarters required (--source setup)")
     ap.add_argument("--issuers", type=int, default=0,
                     help="Lane A: cap the universe, for a smoke run")
+    ap.add_argument("--entry-mode", choices=(setup_pit.CROSSING,
+                                             setup_pit.CONFIRMATION),
+                    default=setup_pit.CONFIRMATION,
+                    help="Lane A: 'crossing' fires only when the streak first "
+                         "reaches the threshold; 'confirmation' fires on every "
+                         "newly reported quarter it still holds, which is what "
+                         "the live page actually offers")
     ap.add_argument("--since", help="earliest signal date (YYYY-MM-DD)")
     ap.add_argument("--until", help="latest signal date (YYYY-MM-DD)")
     ap.add_argument("--fetch-prices", action="store_true",
@@ -536,10 +545,10 @@ def main(argv=None):
         # dropped quietly: it is a gap in coverage, not an absence of signal.
         tickers = ed.load_ticker_map()
         print(f"Lane A: streak >= {args.threshold} consecutive quarters, "
-              f"recomputed point-in-time from XBRL")
+              f"mode={args.entry_mode}, recomputed point-in-time from XBRL")
         shipped, setup_stats = entries_from_setup(
             led, tickers, args.since, args.until,
-            threshold=args.threshold,
+            threshold=args.threshold, mode=args.entry_mode,
             limit=args.issuers or None, progress=100)
         no_override = []
         print(f"  universe {setup_stats['issuers']} issuers: "

@@ -48,6 +48,10 @@ _last_request = 0.0
 
 OK, MISSING, FAILED = "OK", "MISSING", "FAILED"
 
+# Declared before any function that takes one as a default -- a default is
+# evaluated when the def executes, not when it is called.
+CROSSING, CONFIRMATION = "crossing", "confirmation"
+
 
 def fetch_facts(cik):
     """companyfacts for one issuer, as (payload, outcome).
@@ -83,7 +87,7 @@ def fetch_facts(cik):
         return None, FAILED
 
 
-def crossings(cik, threshold=6, facts=None):
+def crossings(cik, threshold=6, facts=None, mode=CROSSING):
     """Every day this issuer's streak first reached `threshold`.
 
     The payload is used and released -- companyfacts runs to megabytes and the
@@ -95,7 +99,7 @@ def crossings(cik, threshold=6, facts=None):
         facts, outcome = fetch_facts(cik)
     if facts is None:
         return [], outcome
-    fired, _stats = signal_dates(facts, threshold=threshold)
+    fired, _stats = signal_dates(facts, threshold=threshold, mode=mode)
     return fired, outcome
 
 
@@ -182,31 +186,54 @@ def streak_asof(facts, asof):
     return int(verdict.get("streak") or 0), verdict
 
 
-def signal_dates(facts, threshold=4):
-    """Days the streak first reached `threshold`, newest evidence forward.
+def signal_dates(facts, threshold=4, mode=CROSSING):
+    """Days this issuer produced a signal, under one of two readings.
 
-    A CROSSING, not a level. A company sitting at streak 6 for two years is one
-    signal, not five hundred -- counting every day it qualifies would weight
-    that company by how long it stayed qualified, which is a property of the
-    company rather than of the signal, and would swamp the sample with whoever
-    held the condition longest.
+    CROSSING -- the streak first reaches `threshold`. The cleanest "new
+    information" event, and re-arming: a streak that lapses and later returns
+    fires again, because that genuinely is a second occurrence. It is also
+    RARE. A company that entered the condition in 2018 and stayed there never
+    fires again, so a measurement window of a few months can contain no
+    crossings at all while the screener lists that company every day.
 
-    Re-arming is deliberate: a streak that lapses below the threshold and later
-    returns fires again, because that genuinely is a second occurrence.
+    CONFIRMATION -- every newly reported quarter for which the streak still
+    holds. This is what the live page actually offers: it shows whoever is
+    currently at streak >= N, and a reader could act on any of them on any
+    day, not only on the day they first qualified.
+
+    Neither is the "true" reading, which is why both exist and are reported
+    apart. Crossings answer "is entering this condition informative"; confirm-
+    ations answer "is being in it informative". Pooling them would silently
+    weight companies by how long they held the condition -- a property of the
+    company, not of the signal.
+
+    Confirmations are keyed on the most recent QUARTER END, not on the filing
+    date, so an amended filing that restates the same quarter does not fire a
+    second entry for one piece of news.
     """
     dates = filing_dates(facts)
-    fired, prev, stats = [], 0, {"evaluated": 0, "dropped_future": 0,
-                                 "dropped_undated": 0}
+    fired, prev, last_quarter = [], 0, None
+    stats = {"evaluated": 0, "dropped_future": 0, "dropped_undated": 0}
+
     for when in dates:
         trimmed, s = facts_filed_by(facts, when)
         stats["dropped_future"] = max(stats["dropped_future"], s["dropped_future"])
         stats["dropped_undated"] = s["dropped_undated"]
         stats["evaluated"] += 1
-        streak = int((setup_signal.evaluate_setup(trimmed, today=when)
-                      .get("streak")) or 0)
-        if streak >= threshold and prev < threshold:
+
+        verdict = setup_signal.evaluate_setup(trimmed, today=when)
+        streak = int(verdict.get("streak") or 0)
+        quarters = verdict.get("quarters") or []
+        newest = quarters[0].get("quarter_end") if quarters else None
+
+        if mode == CROSSING:
+            if streak >= threshold and prev < threshold:
+                fired.append((when, streak))
+        elif streak >= threshold and newest and newest != last_quarter:
             fired.append((when, streak))
+            last_quarter = newest
         prev = streak
+
     return fired, stats
 
 

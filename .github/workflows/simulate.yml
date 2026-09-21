@@ -38,6 +38,9 @@ on:
       issuers:
         description: 'Lane A: cap the universe for a smoke run (blank = all)'
         default: ''
+      entry_mode:
+        description: 'Lane A: confirmation (every quarter it holds) | crossing (first entry only)'
+        default: 'confirmation'
       roles:
         description: 'Compare roles instead of the override contrast: ceo,cfo,ceo_cfo,director'
         default: ''
@@ -252,6 +255,7 @@ jobs:
           ARGS="--source ${SOURCE:-ledger} --since ${{ github.event.inputs.since }} --json simulation.json"
           if [ "$SOURCE" = "setup" ]; then
             ARGS="$ARGS --threshold ${{ github.event.inputs.threshold }}"
+            ARGS="$ARGS --entry-mode ${{ github.event.inputs.entry_mode }}"
             if [ -n "${{ github.event.inputs.issuers }}" ]; then
               ARGS="$ARGS --issuers ${{ github.event.inputs.issuers }}"
             fi
