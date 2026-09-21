@@ -29,6 +29,15 @@ on:
       stage:
         description: 'collect | measure | both | audit (audit is read-only)'
         default: 'both'
+      source:
+        description: 'ledger (insider Form 4) | setup (Lane A streak) | transitions'
+        default: 'ledger'
+      threshold:
+        description: 'Lane A: consecutive quarters required'
+        default: '6'
+      issuers:
+        description: 'Lane A: cap the universe for a smoke run (blank = all)'
+        default: ''
       roles:
         description: 'Compare roles instead of the override contrast: ceo,cfo,ceo_cfo,director'
         default: ''
@@ -178,6 +187,10 @@ jobs:
           EDGAR_DB: history.db
           PRICE_DB: prices.db
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          # --source setup fetches companyfacts from data.sec.gov, which
+          # refuses requests without a declared contact. The collect step has
+          # always had this; the measure step never needed it until now.
+          EDGAR_USER_AGENT: "edgar-discovery 52y9fp5njf@privaterelay.appleid.com"
           SINCE: ${{ github.event.inputs.since }}
           UNTIL: ${{ github.event.inputs.until }}
         run: |
@@ -235,7 +248,14 @@ jobs:
           # the period the rules were written against. A blended window cannot
           # answer whether the signal survives outside the sample, however many
           # months it spans.
-          ARGS="--source ledger --since ${{ github.event.inputs.since }} --json simulation.json"
+          SOURCE="${{ github.event.inputs.source }}"
+          ARGS="--source ${SOURCE:-ledger} --since ${{ github.event.inputs.since }} --json simulation.json"
+          if [ "$SOURCE" = "setup" ]; then
+            ARGS="$ARGS --threshold ${{ github.event.inputs.threshold }}"
+            if [ -n "${{ github.event.inputs.issuers }}" ]; then
+              ARGS="$ARGS --issuers ${{ github.event.inputs.issuers }}"
+            fi
+          fi
           if [ -n "${UNTIL}" ]; then
             ARGS="$ARGS --until ${UNTIL}"
           fi

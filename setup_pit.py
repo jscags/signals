@@ -26,10 +26,77 @@ WRITES NOTHING. Pure functions over a payload the caller supplies.
 """
 
 import json
+import os
 import sys
+import time
+import urllib.error
+import urllib.request
 from datetime import date
 
 import setup_signal
+
+# ------------------------------------------------------------------- fetch
+#
+# Fetching is not writing: nothing below touches a database, a cache file or
+# the collector's state. It is kept apart from the pure functions above so the
+# reconstruction stays testable with no network at all.
+
+USER_AGENT = (os.environ.get("EDGAR_USER_AGENT")
+              or "edgar-discovery 52y9fp5njf@privaterelay.appleid.com")
+MIN_REQUEST_INTERVAL = 1.0 / 8          # published ceiling is 10/sec
+_last_request = 0.0
+
+OK, MISSING, FAILED = "OK", "MISSING", "FAILED"
+
+
+def fetch_facts(cik):
+    """companyfacts for one issuer, as (payload, outcome).
+
+    Three outcomes, never collapsed. A 404 is an ANSWER -- an issuer that has
+    filed no XBRL has no document at that address -- and must not read the same
+    as a request that failed. The whole point of the exercise is a hit rate,
+    and a run where a tenth of the universe quietly failed would report a hit
+    rate over the fraction that happened to respond.
+    """
+    global _last_request
+    gap = time.time() - _last_request
+    if gap < MIN_REQUEST_INTERVAL:
+        time.sleep(MIN_REQUEST_INTERVAL - gap)
+    _last_request = time.time()
+
+    url = (f"https://data.sec.gov/api/xbrl/companyfacts/"
+           f"CIK{int(cik):010d}.json")
+    request = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT, "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            raw = response.read()
+            if response.headers.get("Content-Encoding") == "gzip":
+                import gzip
+                raw = gzip.decompress(raw)
+            return json.loads(raw.decode("utf-8", "replace")), OK
+    except urllib.error.HTTPError as exc:
+        return None, (MISSING if exc.code == 404 else FAILED)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return None, FAILED
+
+
+def crossings(cik, threshold=6, facts=None):
+    """Every day this issuer's streak first reached `threshold`.
+
+    The payload is used and released -- companyfacts runs to megabytes and the
+    universe runs to four figures, so holding them would cost gigabytes to no
+    purpose.
+    """
+    outcome = OK
+    if facts is None:
+        facts, outcome = fetch_facts(cik)
+    if facts is None:
+        return [], outcome
+    fired, _stats = signal_dates(facts, threshold=threshold)
+    return fired, outcome
 
 
 def _as_date(text):

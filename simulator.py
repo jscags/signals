@@ -41,6 +41,7 @@ import sys
 from datetime import date, datetime, timedelta
 
 import market_data
+import setup_pit
 
 HORIZONS = (5, 10, 21, 63)
 
@@ -390,6 +391,90 @@ def entries_from_transitions(conn, rules=("purchase", "cluster"),
             for r in conn.execute(q + "ORDER BY observed_on", args)]
 
 
+def setup_universe(conn, since=None, until=None):
+    """Every issuer that filed a periodic report in the window.
+
+    The universe is taken from the FILINGS, not from issuer_setup. issuer_setup
+    holds the issuers the live collector has got around to scoring, which is a
+    record of where the collector has been rather than of who existed -- and
+    scoring is what the signal does, so selecting on it would hand the backtest
+    a universe already filtered by its own answer.
+
+    Every 10-Q and 10-K filer is in, including the ones that went on to delist.
+    Those are exactly the names a survivorship-blind test loses.
+    """
+    q = ("SELECT DISTINCT cik, company FROM documents "
+         "WHERE form_type LIKE '10-Q%' OR form_type LIKE '10-K%'")
+    args = []
+    if since:
+        q += " AND filed_date >= ?"
+        args.append(since)
+    if until:
+        q += " AND filed_date <= ?"
+        args.append(until)
+    return [(r["cik"], r["company"]) for r in conn.execute(q, args)
+            if r["cik"]]
+
+
+def entries_from_setup(conn, tickers, since=None, until=None, threshold=6,
+                       limit=None, progress=None):
+    """Lane A streak crossings as entries, point-in-time correct.
+
+    The streak is recomputed from companyfacts filtered to what had been FILED
+    by each candidate day -- see setup_pit. Reading issuer_setup instead would
+    read today's view of the series, which is the whole trap: a quarter that
+    was restated, or simply not yet filed, reads as though it were knowable.
+
+    Returns (entries, stats). The stats are not decoration. An issuer whose
+    facts could not be fetched is counted apart from one that fetched cleanly
+    and produced no crossing, because "no signal" and "could not look" are the
+    same shape downstream and this repo has paid for confusing them before.
+    """
+    universe = setup_universe(conn, since, until)
+    if limit:
+        universe = universe[:limit]
+
+    stats = {"issuers": len(universe), "ok": 0, "missing": 0, "failed": 0,
+             "no_ticker": 0, "crossings": 0, "outside_window": 0}
+    entries = []
+
+    for n, (cik, _company) in enumerate(universe, 1):
+        fired, outcome = setup_pit.crossings(cik, threshold=threshold)
+        if outcome == setup_pit.MISSING:
+            stats["missing"] += 1
+        elif outcome == setup_pit.FAILED:
+            stats["failed"] += 1
+        else:
+            stats["ok"] += 1
+
+        # load_ticker_map yields {cik: (symbol, title)} -- the symbol alone is
+        # what prices are keyed on. Passing the pair through would put a tuple
+        # where every price lookup expects a string and miss on all of them,
+        # silently, as "no price".
+        pair = tickers.get(cik) if tickers else None
+        ticker = pair[0] if isinstance(pair, (tuple, list)) else pair
+        for when, streak in fired:
+            day = when.isoformat()
+            if (since and day < since) or (until and day > until):
+                stats["outside_window"] += 1
+                continue
+            stats["crossings"] += 1
+            if not ticker:
+                stats["no_ticker"] += 1
+                continue
+            entries.append(Entry(ticker, cik, f"setup{streak}", day))
+
+        if progress and n % progress == 0:
+            print(f"   {n}/{len(universe)} issuers · {stats['crossings']} "
+                  f"crossings · {stats['failed']} failed", flush=True)
+
+    if stats["failed"] > stats["ok"]:
+        raise SystemExit(
+            f"{stats['failed']} issuers failed against {stats['ok']} that "
+            f"succeeded -- the universe is too holed to measure over")
+    return entries, stats
+
+
 # --------------------------------------------------------------- cli
 
 def _tickers_needed(entries):
@@ -402,10 +487,15 @@ def main(argv=None):
 
     ap = argparse.ArgumentParser(
         description="Measure whether the screener's signals found good entries.")
-    ap.add_argument("--source", choices=("ledger", "transitions"),
+    ap.add_argument("--source", choices=("ledger", "transitions", "setup"),
                     default="ledger",
                     help="reconstruct signals from the filing ledger "
-                         "(point-in-time correct) or read recorded transitions")
+                         "(point-in-time correct), read recorded transitions, "
+                         "or recompute Lane A streak crossings from XBRL")
+    ap.add_argument("--threshold", type=int, default=6,
+                    help="Lane A: consecutive quarters required (--source setup)")
+    ap.add_argument("--issuers", type=int, default=0,
+                    help="Lane A: cap the universe, for a smoke run")
     ap.add_argument("--since", help="earliest signal date (YYYY-MM-DD)")
     ap.add_argument("--until", help="latest signal date (YYYY-MM-DD)")
     ap.add_argument("--fetch-prices", action="store_true",
@@ -440,6 +530,24 @@ def main(argv=None):
                                       apply_sale_override=True)
         no_override = entries_from_ledger(led, args.since, args.until,
                                           apply_sale_override=False)
+    elif args.source == "setup":
+        # Lane A needs a cik -> ticker map; the ledger sources carry the ticker
+        # on the filing itself. An issuer with no symbol is counted, not
+        # dropped quietly: it is a gap in coverage, not an absence of signal.
+        tickers = ed.load_ticker_map()
+        print(f"Lane A: streak >= {args.threshold} consecutive quarters, "
+              f"recomputed point-in-time from XBRL")
+        shipped, setup_stats = entries_from_setup(
+            led, tickers, args.since, args.until,
+            threshold=args.threshold,
+            limit=args.issuers or None, progress=100)
+        no_override = []
+        print(f"  universe {setup_stats['issuers']} issuers: "
+              f"{setup_stats['ok']} fetched, {setup_stats['missing']} no XBRL, "
+              f"{setup_stats['failed']} failed")
+        print(f"  {setup_stats['crossings']} crossings in window, "
+              f"{setup_stats['outside_window']} outside it, "
+              f"{setup_stats['no_ticker']} with no ticker")
     else:
         shipped = entries_from_transitions(led)
         no_override = []
