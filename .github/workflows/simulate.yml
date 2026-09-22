@@ -33,7 +33,7 @@ on:
         description: 'ledger (insider Form 4) | setup (Lane A streak) | transitions'
         default: 'ledger'
       threshold:
-        description: 'Lane A: consecutive quarters required'
+        description: 'Lane A: consecutive quarters required; comma list sweeps in one pass (e.g. 3,4,5,6,7,8)'
         default: '6'
       issuers:
         description: 'Lane A: cap the universe for a smoke run (blank = all)'

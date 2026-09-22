@@ -416,7 +416,7 @@ def setup_universe(conn, since=None, until=None):
             if r["cik"]]
 
 
-def entries_from_setup(conn, tickers, since=None, until=None, threshold=6,
+def entries_from_setup(conn, tickers, since=None, until=None, thresholds=(6,),
                        limit=None, progress=None,
                        mode=setup_pit.CROSSING):
     """Lane A streak crossings as entries, point-in-time correct.
@@ -435,13 +435,18 @@ def entries_from_setup(conn, tickers, since=None, until=None, threshold=6,
     if limit:
         universe = universe[:limit]
 
+    thresholds = sorted({int(t) for t in thresholds})
     stats = {"issuers": len(universe), "ok": 0, "missing": 0, "failed": 0,
-             "no_ticker": 0, "crossings": 0, "outside_window": 0}
+             "no_ticker": 0, "crossings": 0, "outside_window": 0,
+             "by_threshold": {t: 0 for t in thresholds}}
     entries = []
 
     for n, (cik, _company) in enumerate(universe, 1):
-        fired, outcome = setup_pit.crossings(cik, threshold=threshold,
-                                            mode=mode)
+        # Every threshold from ONE fetch. Sweeping by re-running would refetch
+        # the same payloads once per threshold to reach answers all present in
+        # the first walk.
+        fired_by, outcome = setup_pit.crossings_multi(cik, thresholds,
+                                                      mode=mode)
         if outcome == setup_pit.MISSING:
             stats["missing"] += 1
         elif outcome == setup_pit.FAILED:
@@ -455,20 +460,23 @@ def entries_from_setup(conn, tickers, since=None, until=None, threshold=6,
         # silently, as "no price".
         pair = tickers.get(cik) if tickers else None
         ticker = pair[0] if isinstance(pair, (tuple, list)) else pair
-        for when, streak in fired:
-            day = when.isoformat()
-            if (since and day < since) or (until and day > until):
-                stats["outside_window"] += 1
-                continue
-            stats["crossings"] += 1
-            if not ticker:
-                stats["no_ticker"] += 1
-                continue
-            entries.append(Entry(ticker, cik, f"setup{threshold}+", day))
+
+        for t in thresholds:
+            for when, _streak in fired_by.get(t, ()):
+                day = when.isoformat()
+                if (since and day < since) or (until and day > until):
+                    stats["outside_window"] += 1
+                    continue
+                stats["crossings"] += 1
+                stats["by_threshold"][t] += 1
+                if not ticker:
+                    stats["no_ticker"] += 1
+                    continue
+                entries.append(Entry(ticker, cik, f"setup{t}+", day))
 
         if progress and n % progress == 0:
             print(f"   {n}/{len(universe)} issuers · {stats['crossings']} "
-                  f"crossings · {stats['failed']} failed", flush=True)
+                  f"signals · {stats['failed']} failed", flush=True)
 
     if stats["failed"] > stats["ok"]:
         raise SystemExit(
@@ -494,8 +502,10 @@ def main(argv=None):
                     help="reconstruct signals from the filing ledger "
                          "(point-in-time correct), read recorded transitions, "
                          "or recompute Lane A streak crossings from XBRL")
-    ap.add_argument("--threshold", type=int, default=6,
-                    help="Lane A: consecutive quarters required (--source setup)")
+    ap.add_argument("--threshold", default="6",
+                    help="Lane A: consecutive quarters required. A comma list "
+                         "sweeps them in ONE pass over the data (e.g. 3,4,5,6,"
+                         "7,8) rather than refetching per threshold")
     ap.add_argument("--issuers", type=int, default=0,
                     help="Lane A: cap the universe, for a smoke run")
     ap.add_argument("--entry-mode", choices=(setup_pit.CROSSING,
@@ -544,19 +554,23 @@ def main(argv=None):
         # on the filing itself. An issuer with no symbol is counted, not
         # dropped quietly: it is a gap in coverage, not an absence of signal.
         tickers = ed.load_ticker_map()
-        print(f"Lane A: streak >= {args.threshold} consecutive quarters, "
+        thresholds = sorted({int(t) for t in str(args.threshold).split(",")
+                             if t.strip()})
+        print(f"Lane A: streak >= {thresholds} consecutive quarters, "
               f"mode={args.entry_mode}, recomputed point-in-time from XBRL")
         shipped, setup_stats = entries_from_setup(
             led, tickers, args.since, args.until,
-            threshold=args.threshold, mode=args.entry_mode,
+            thresholds=thresholds, mode=args.entry_mode,
             limit=args.issuers or None, progress=100)
         no_override = []
         print(f"  universe {setup_stats['issuers']} issuers: "
               f"{setup_stats['ok']} fetched, {setup_stats['missing']} no XBRL, "
               f"{setup_stats['failed']} failed")
-        print(f"  {setup_stats['crossings']} crossings in window, "
+        print(f"  {setup_stats['crossings']} signals in window, "
               f"{setup_stats['outside_window']} outside it, "
               f"{setup_stats['no_ticker']} with no ticker")
+        for t in thresholds:
+            print(f"    streak >= {t}: {setup_stats['by_threshold'][t]} signals")
     else:
         shipped = entries_from_transitions(led)
         no_override = []

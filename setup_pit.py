@@ -87,6 +87,17 @@ def fetch_facts(cik):
         return None, FAILED
 
 
+def crossings_multi(cik, thresholds, facts=None, mode=CROSSING):
+    """Signals for several thresholds from ONE fetch. {threshold: [...]}."""
+    outcome = OK
+    if facts is None:
+        facts, outcome = fetch_facts(cik)
+    if facts is None:
+        return {int(t): [] for t in thresholds}, outcome
+    fired, _stats = signal_dates_multi(facts, thresholds, mode=mode)
+    return fired, outcome
+
+
 def crossings(cik, threshold=6, facts=None, mode=CROSSING):
     """Every day this issuer's streak first reached `threshold`.
 
@@ -239,8 +250,31 @@ def signal_dates(facts, threshold=4, mode=CROSSING):
     # Trim once, then walk. Correctness is unchanged -- the discarded tags are
     # ones the rule never reads -- and the date loop no longer pays for them.
     facts = relevant_only(facts)
+    fired, stats = signal_dates_multi(facts, [threshold], mode=mode)
+    return fired[threshold], stats
+
+
+def signal_dates_multi(facts, thresholds, mode=CROSSING):
+    """Every threshold answered from ONE walk. {threshold: [(date, streak)]}.
+
+    The streak at a given date does not depend on the threshold -- the
+    threshold only decides which streaks are worth emitting. Sweeping by
+    re-running the whole reconstruction per threshold would refetch and
+    re-evaluate identical data six times over, at six times the requests, to
+    reach six answers already present in the first pass.
+
+    Confirmation state is per-threshold and cannot be shared: an issuer at
+    streak 6 confirms for 3 through 6 and not for 7 or 8, so each threshold
+    reaches its first qualifying quarter at a different time and needs its own
+    memory of which quarter it last fired on.
+    """
+    facts = relevant_only(facts)
     dates = filing_dates(facts)
-    fired, prev, last_quarter = [], 0, None
+    thresholds = sorted({int(t) for t in thresholds})
+
+    fired = {t: [] for t in thresholds}
+    last_quarter = {t: None for t in thresholds}
+    prev = 0
     stats = {"evaluated": 0, "dropped_future": 0, "dropped_undated": 0}
 
     for when in dates:
@@ -254,12 +288,13 @@ def signal_dates(facts, threshold=4, mode=CROSSING):
         quarters = verdict.get("quarters") or []
         newest = quarters[0].get("quarter_end") if quarters else None
 
-        if mode == CROSSING:
-            if streak >= threshold and prev < threshold:
-                fired.append((when, streak))
-        elif streak >= threshold and newest and newest != last_quarter:
-            fired.append((when, streak))
-            last_quarter = newest
+        for t in thresholds:
+            if mode == CROSSING:
+                if streak >= t and prev < t:
+                    fired[t].append((when, streak))
+            elif streak >= t and newest and newest != last_quarter[t]:
+                fired[t].append((when, streak))
+                last_quarter[t] = newest
         prev = streak
 
     return fired, stats
