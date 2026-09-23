@@ -38,6 +38,9 @@ on:
       issuers:
         description: 'Lane A: cap the universe for a smoke run (blank = all)'
         default: ''
+      confluence_days:
+        description: 'Lane A: split each group by a public insider buy within N days (0 = off)'
+        default: '0'
       periods:
         description: 'Lane A: named disjoint windows LABEL:SINCE:UNTIL,... (blank = one window)'
         default: ''
@@ -261,6 +264,9 @@ jobs:
             ARGS="$ARGS --entry-mode ${{ github.event.inputs.entry_mode }}"
             if [ -n "${{ github.event.inputs.periods }}" ]; then
               ARGS="$ARGS --periods ${{ github.event.inputs.periods }}"
+            fi
+            if [ -n "${{ github.event.inputs.confluence_days }}" ]; then
+              ARGS="$ARGS --confluence-days ${{ github.event.inputs.confluence_days }}"
             fi
             if [ -n "${{ github.event.inputs.issuers }}" ]; then
               ARGS="$ARGS --issuers ${{ github.event.inputs.issuers }}"

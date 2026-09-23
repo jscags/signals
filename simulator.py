@@ -416,6 +416,44 @@ def setup_universe(conn, since=None, until=None):
             if r["cik"]]
 
 
+def insider_confluence(conn, entries, window_days=90, min_value=0.0):
+    """Split Lane A entries by whether an insider purchase was ALREADY PUBLIC.
+
+    The screener's actual thesis is the conjunction -- contract liabilities
+    outgrowing revenue AND insiders buying -- and it has never been measured.
+    Each half has now been measured alone and neither clears the bar, but a
+    conjunction can carry information neither part does.
+
+    POINT-IN-TIME, and the trap here is specific. insider_buys carries
+    txn_date and no filing date; the filing date lives in documents via the
+    accession. Selecting on txn_date alone would let a Lane A signal on day D
+    be confirmed by a Form 4 transacted on D-5 and not filed until D+30 --
+    information that did not exist. So the join is mandatory and the filing
+    must already be public on the signal day.
+
+    Returns (with_insider, without), both lists, so the contrast is reported
+    rather than the filtered set being presented on its own.
+    """
+    buys = {}
+    for row in conn.execute(
+            "SELECT b.issuer_cik AS cik, d.filed_date AS filed, "
+            "       b.txn_date AS txn, b.value AS value "
+            "FROM insider_buys b JOIN documents d ON d.accession = b.accession "
+            "WHERE d.filed_date IS NOT NULL AND b.txn_date IS NOT NULL"):
+        buys.setdefault(row["cik"], []).append(
+            (row["filed"], row["txn"], row["value"] or 0.0))
+
+    with_ins, without = [], []
+    for entry in entries:
+        day = entry.signal_day
+        floor = (date.fromisoformat(day)
+                 - timedelta(days=window_days)).isoformat()
+        hit = any(filed <= day and floor <= txn <= day and value >= min_value
+                  for filed, txn, value in buys.get(entry.cik, ()))
+        (with_ins if hit else without).append(entry)
+    return with_ins, without
+
+
 def parse_periods(spec):
     """"A:2025-04-01:2025-06-05,C:..." -> [(label, since, until), ...].
 
@@ -545,6 +583,11 @@ def main(argv=None):
                          "7,8) rather than refetching per threshold")
     ap.add_argument("--issuers", type=int, default=0,
                     help="Lane A: cap the universe, for a smoke run")
+    ap.add_argument("--confluence-days", type=int, default=0,
+                    help="Lane A: also split each group by whether an insider "
+                         "purchase was already public within N days before the "
+                         "signal. 0 = off. This is the screener's actual "
+                         "thesis and is measured against its own absence")
     ap.add_argument("--periods", default="",
                     help="Lane A: named disjoint windows, "
                          "LABEL:SINCE:UNTIL,LABEL:SINCE:UNTIL -- splits the "
@@ -621,6 +664,30 @@ def main(argv=None):
                               for l, _a, _b in periods)
             print(f"    streak >= {t}: "
                   f"{setup_stats['by_threshold'][t]:>4} signals   {cells}")
+
+        if args.confluence_days:
+            # The conjunction is measured against its own absence, never on
+            # its own. "Lane A with insiders did X" is uninterpretable without
+            # "Lane A without insiders did Y" beside it -- any subset of a
+            # population differs from the whole, and the question is whether
+            # the insider leg carries information the streak does not.
+            before = len(shipped)
+            tagged = []
+            for rule in sorted({e.rule for e in shipped}):
+                group = [e for e in shipped if e.rule == rule]
+                hit, miss = insider_confluence(
+                    led, group, window_days=args.confluence_days)
+                for e in hit:
+                    e.rule = f"{rule} +insider"
+                for e in miss:
+                    e.rule = f"{rule} no-insider"
+                tagged.extend(hit + miss)
+                print(f"    {rule}: {len(hit)} with a public insider buy "
+                      f"within {args.confluence_days}d, {len(miss)} without")
+            if len(tagged) != before:
+                raise SystemExit(
+                    f"confluence split lost entries: {len(tagged)} of {before}")
+            shipped = tagged
     else:
         shipped = entries_from_transitions(led)
         no_override = []
