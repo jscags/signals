@@ -416,7 +416,34 @@ def setup_universe(conn, since=None, until=None):
             if r["cik"]]
 
 
-def entries_from_setup(conn, tickers, since=None, until=None, thresholds=(6,),
+def parse_periods(spec):
+    """"A:2025-04-01:2025-06-05,C:..." -> [(label, since, until), ...].
+
+    Named windows rather than one span, because the history is not one span.
+    A scan hole splits it, and the three dense stretches behaved differently
+    enough that pooling them hid the disagreement.
+    """
+    out = []
+    for chunk in (spec or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(":")
+        if len(parts) != 3:
+            raise SystemExit(f"bad period {chunk!r}: want LABEL:SINCE:UNTIL")
+        label, since, until = (p.strip() for p in parts)
+        if since > until:
+            raise SystemExit(f"period {label}: since {since} after until {until}")
+        out.append((label, since, until))
+    for (la, sa, ua), (lb, sb, _ub) in zip(out, out[1:]):
+        if sb <= ua:
+            raise SystemExit(
+                f"periods {la} and {lb} overlap ({sa}..{ua} vs from {sb}); "
+                f"a signal counted in two windows is counted twice")
+    return out
+
+
+def entries_from_setup(conn, tickers, periods, thresholds=(6,),
                        limit=None, progress=None,
                        mode=setup_pit.CROSSING):
     """Lane A streak crossings as entries, point-in-time correct.
@@ -431,14 +458,17 @@ def entries_from_setup(conn, tickers, since=None, until=None, thresholds=(6,),
     and produced no crossing, because "no signal" and "could not look" are the
     same shape downstream and this repo has paid for confusing them before.
     """
-    universe = setup_universe(conn, since, until)
+    span_since = min(s for _l, s, _u in periods)
+    span_until = max(u for _l, _s, u in periods)
+    universe = setup_universe(conn, span_since, span_until)
     if limit:
         universe = universe[:limit]
 
     thresholds = sorted({int(t) for t in thresholds})
     stats = {"issuers": len(universe), "ok": 0, "missing": 0, "failed": 0,
              "no_ticker": 0, "crossings": 0, "outside_window": 0,
-             "by_threshold": {t: 0 for t in thresholds}}
+             "by_threshold": {t: 0 for t in thresholds},
+             "by_cell": {(l, t): 0 for l, _s, _u in periods for t in thresholds}}
     entries = []
 
     for n, (cik, _company) in enumerate(universe, 1):
@@ -464,15 +494,22 @@ def entries_from_setup(conn, tickers, since=None, until=None, thresholds=(6,),
         for t in thresholds:
             for when, _streak in fired_by.get(t, ()):
                 day = when.isoformat()
-                if (since and day < since) or (until and day > until):
+                # Periods are disjoint (checked at parse), so a signal lands in
+                # at most one. A signal between two windows -- in the scan hole
+                # -- belongs to neither and is counted as outside rather than
+                # nudged into a neighbour.
+                label = next((l for l, s2, u2 in periods if s2 <= day <= u2),
+                             None)
+                if label is None:
                     stats["outside_window"] += 1
                     continue
                 stats["crossings"] += 1
                 stats["by_threshold"][t] += 1
+                stats["by_cell"][(label, t)] += 1
                 if not ticker:
                     stats["no_ticker"] += 1
                     continue
-                entries.append(Entry(ticker, cik, f"setup{t}+", day))
+                entries.append(Entry(ticker, cik, f"{label} setup{t}+", day))
 
         if progress and n % progress == 0:
             print(f"   {n}/{len(universe)} issuers · {stats['crossings']} "
@@ -508,6 +545,11 @@ def main(argv=None):
                          "7,8) rather than refetching per threshold")
     ap.add_argument("--issuers", type=int, default=0,
                     help="Lane A: cap the universe, for a smoke run")
+    ap.add_argument("--periods", default="",
+                    help="Lane A: named disjoint windows, "
+                         "LABEL:SINCE:UNTIL,LABEL:SINCE:UNTIL -- splits the "
+                         "result per window in ONE pass over the data. "
+                         "Blank = a single window from --since/--until")
     ap.add_argument("--entry-mode", choices=(setup_pit.CROSSING,
                                              setup_pit.CONFIRMATION),
                     default=setup_pit.CONFIRMATION,
@@ -556,10 +598,15 @@ def main(argv=None):
         tickers = ed.load_ticker_map()
         thresholds = sorted({int(t) for t in str(args.threshold).split(",")
                              if t.strip()})
+        periods = (parse_periods(args.periods) if args.periods
+                   else [("all", args.since or "0000-01-01",
+                          args.until or "9999-12-31")])
         print(f"Lane A: streak >= {thresholds} consecutive quarters, "
               f"mode={args.entry_mode}, recomputed point-in-time from XBRL")
+        for label, a, b in periods:
+            print(f"  period {label}: {a} .. {b}")
         shipped, setup_stats = entries_from_setup(
-            led, tickers, args.since, args.until,
+            led, tickers, periods,
             thresholds=thresholds, mode=args.entry_mode,
             limit=args.issuers or None, progress=100)
         no_override = []
@@ -570,7 +617,10 @@ def main(argv=None):
               f"{setup_stats['outside_window']} outside it, "
               f"{setup_stats['no_ticker']} with no ticker")
         for t in thresholds:
-            print(f"    streak >= {t}: {setup_stats['by_threshold'][t]} signals")
+            cells = "  ".join(f"{l}:{setup_stats['by_cell'][(l, t)]}"
+                              for l, _a, _b in periods)
+            print(f"    streak >= {t}: "
+                  f"{setup_stats['by_threshold'][t]:>4} signals   {cells}")
     else:
         shipped = entries_from_transitions(led)
         no_override = []

@@ -38,6 +38,9 @@ on:
       issuers:
         description: 'Lane A: cap the universe for a smoke run (blank = all)'
         default: ''
+      periods:
+        description: 'Lane A: named disjoint windows LABEL:SINCE:UNTIL,... (blank = one window)'
+        default: ''
       entry_mode:
         description: 'Lane A: confirmation (every quarter it holds) | crossing (first entry only)'
         default: 'confirmation'
@@ -256,6 +259,9 @@ jobs:
           if [ "$SOURCE" = "setup" ]; then
             ARGS="$ARGS --threshold ${{ github.event.inputs.threshold }}"
             ARGS="$ARGS --entry-mode ${{ github.event.inputs.entry_mode }}"
+            if [ -n "${{ github.event.inputs.periods }}" ]; then
+              ARGS="$ARGS --periods ${{ github.event.inputs.periods }}"
+            fi
             if [ -n "${{ github.event.inputs.issuers }}" ]; then
               ARGS="$ARGS --issuers ${{ github.event.inputs.issuers }}"
             fi
