@@ -3718,6 +3718,20 @@ h1 {
   font-family: "IBM Plex Mono", monospace; font-size: 11.5px; color: var(--muted);
   display: flex; flex-wrap: wrap; gap: 4px 14px;
 }
+/* The lane's own backtest result, stated on the lane. The measurement said
+   this signal does not mark a good entry, and a screener that surfaces a
+   pattern while keeping that finding in a separate document is inviting the
+   reader to infer the opposite. Muted rather than alarmed: it is a caveat on
+   how to read the lane, not a warning about any one company. */
+.lanea-note {
+  font-size: 12px; line-height: 1.55; color: var(--muted);
+  border-left: 2px solid var(--warm); padding: 2px 0 2px 12px;
+  margin: 0 0 14px; max-width: 72ch;
+}
+.lanea-note b { color: var(--ink); font-weight: 600; }
+.lanea-note code {
+  font-family: "IBM Plex Mono", monospace; font-size: 11px;
+}
 .chips { display: flex; gap: 4px; margin-top: 8px; flex-wrap: wrap; }
 .chip {
   font-family: "IBM Plex Mono", monospace; font-size: 10px; font-weight: 600;
@@ -4624,6 +4638,25 @@ def render_controls(grouped, evidence_free=None):
 LANE_A_RUNGS = (8, 7, 6, 5, 4, 3)
 
 
+# Measured, not asserted. 609 signals over 5,563 issuers, 2025-04 to 2026-09,
+# streaks recomputed point-in-time from XBRL filed by each candidate day and
+# scored against SPY over the same sessions. Every threshold 3 through 8 and
+# every horizon was tested, split across three gap-free periods.
+#
+# The finding is on the lane because it is about the lane. Keeping it in a
+# separate write-up while the page goes on listing candidates lets the page
+# imply an edge the measurement could not find.
+LANE_A_EVIDENCE = (
+    '<p class="lanea-note">'
+    '<b>What the backtest said:</b> this pattern did not mark a good entry. '
+    'Across 609 signals and every threshold from 3 to 8 quarters, no rule beat '
+    'SPY more than half the time in more than one period. Holding '
+    '<code>63</code> sessions lost a median <code>4-12%</code> to SPY at a '
+    '27-46% hit rate, and the longer the streak the worse that got. '
+    'Treat these as companies to research, not as entries.'
+    '</p>')
+
+
 def render_lane_a(conn, moved=(), rungs=LANE_A_RUNGS):
     """The Lane A lane, built from STANDING verdicts rather than transitions.
 
@@ -4709,7 +4742,8 @@ def render_lane_a(conn, moved=(), rungs=LANE_A_RUNGS):
         f'revenue</b><span id="laneacount">{counts[opens_at]}</span></div>'
         f'<div class="streakset" role="group" aria-label="Minimum consecutive '
         f'quarters">{buttons}</div>'
-        f'{"".join(cards)}</section>'), counts[opens_at], {c for _s, c, _q in rows}
+        + LANE_A_EVIDENCE
+        + f'{"".join(cards)}</section>'), counts[opens_at], {c for _s, c, _q in rows}
 
 
 # Both gauges diverge around a midpoint -- 50 on a 0-100 sentiment scale, zero
