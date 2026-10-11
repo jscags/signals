@@ -2843,24 +2843,28 @@ FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata
 # few days -- so the tile shows the date of the reading rather than implying
 # it is live. A number labelled "current" that is actually last Tuesday's is
 # the one thing worse than no number.
-# BOUNDED on purpose. Unbounded, fredgraph.csv regenerates the whole series
-# back to 1987 and the first attempt timed out on the read after twenty
-# seconds -- it connected fine, it just never finished sending. Two
-# observations are all this needs, so a 120-day window leaves generous room
-# for holidays and the publication lag while keeping the response small.
-BRENT_URL = ("https://fred.stlouisfed.org/graph/fredgraph.csv"
-             "?id=DCOILBRENTEU&cosd={start}")
-BRENT_LOOKBACK_DAYS = 120
+# NOT FRED's own graph server. fredgraph.csv is reachable from a laptop and
+# hangs from a GitHub runner: it accepts the connection and sends nothing, at
+# a 20s timeout and at 45s, bounded to 120 days or unbounded, while CNN and
+# Treasury answer in under a second in the same run. Measured, twice.
+#
+# Of the candidates --probe-brent measured, this mirror of the same EIA series
+# is the only one both reachable and keyless: 163KB in 0.2s. api.stlouisfed.org
+# answers in 0.3s and would be the better provenance, but it wants a free
+# 32-character key; Stooq hangs or 404s; Yahoo returns 429 from a runner's
+# shared address.
+#
+# The cost of a mirror is that it can quietly stop updating, and a frozen
+# number still renders as a tile. BRENT_MAX_AGE_DAYS is the guard: past that,
+# the reading is refused and the gauge goes stale rather than presenting a
+# stale price as today's.
+BRENT_URL = ("https://raw.githubusercontent.com/datasets/oil-prices"
+             "/main/data/brent-daily.csv")
+BRENT_MAX_AGE_DAYS = 14
 TREASURY_YIELD_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
     "pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={year}")
 GAUGE_TIMEOUT = 20
-# FRED answers the connect immediately and then takes its time generating the
-# CSV, so the twenty seconds that are plenty for CNN and Treasury time out on
-# the read. A longer allowance for that one source distinguishes a slow host
-# from an unreachable one; if it still times out, the source is not viable
-# from a runner and no amount of waiting fixes it.
-GAUGE_TIMEOUTS = {"brent": 45}
 
 # CNN's endpoint refuses a default urllib agent outright. This is a browser
 # string because that is what it will answer; there is no documented API to
@@ -2926,17 +2930,23 @@ def parse_fear_greed(body):
             "as_of": stamp or market_today().isoformat(), "detail": detail}
 
 
-def parse_brent(body):
-    """The newest dated Brent spot price in a FRED CSV.
+def parse_brent(body, today=None):
+    """The newest dated Brent spot price in a DATE,VALUE CSV.
 
-    FRED emits a header row then DATE,VALUE lines, and writes "." for a day
-    with no observation -- holidays and the days between publication batches.
-    Those rows are skipped rather than read as zero: a zero oil price would
-    render as a tile, not as an error.
+    The feed emits a header row then DATE,VALUE lines, and some sources write
+    "." for a day with no observation -- holidays and the days between
+    publication batches. Those rows are skipped rather than read as zero: a
+    zero oil price would render as a tile, not as an error.
 
     The newest row WITH a value wins, and its date is carried through, because
     the series lags by a few days and the page must say which day it is
     showing.
+
+    A reading older than BRENT_MAX_AGE_DAYS is REFUSED. This is the one check
+    a mirror needs that a primary source does not: a mirror that stops
+    updating keeps serving HTTP 200 with a perfectly parseable price from
+    whenever it stopped, and that is the failure this repo is most prone to
+    dressing up as a result.
     """
     rows = []
     for line in (body or "").splitlines():
@@ -2956,6 +2966,12 @@ def parse_brent(body):
         raise FetchError("Brent feed carried no dated numeric observation")
     rows.sort()
     stamp, price = rows[-1]
+
+    age = ((today or market_today()) - date.fromisoformat(stamp)).days
+    if age > BRENT_MAX_AGE_DAYS:
+        raise FetchError(
+            f"Brent feed's newest observation is {stamp}, {age} days old "
+            f"(limit {BRENT_MAX_AGE_DAYS}) -- treating as not refreshed")
 
     # Direction over the previous available observation, so the tile can say
     # which way it moved without implying a trend from one number.
@@ -3030,9 +3046,7 @@ def probe_gauges(today=None):
     """
     today = today or market_today()
     sources = (
-        ("brent", BRENT_URL.format(
-            start=(today - timedelta(days=BRENT_LOOKBACK_DAYS)).isoformat()),
-         parse_brent, None),
+        ("brent", BRENT_URL, parse_brent, None),
         ("fear_greed", FEAR_GREED_URL, parse_fear_greed,
          {"Referer": "https://edition.cnn.com/markets/fear-and-greed",
           "Origin": "https://edition.cnn.com"}),
@@ -3042,7 +3056,7 @@ def probe_gauges(today=None):
     print("GAUGE SOURCE PROBE -- writes nothing\n")
     bad = 0
     for name, url, parse, headers in sources:
-        limit = GAUGE_TIMEOUTS.get(name, GAUGE_TIMEOUT)
+        limit = GAUGE_TIMEOUT
         print(f"{name}\n  {url[:96]}\n  timeout {limit}s")
         started = time.time()
         try:
@@ -3162,16 +3176,12 @@ def refresh_market_gauges(conn, today=None):
           "Origin": "https://edition.cnn.com"}),
         ("yield_spread",
          TREASURY_YIELD_URL.format(year=today.year), parse_yield_curve, None),
-        ("brent", BRENT_URL.format(
-            start=(today - timedelta(days=BRENT_LOOKBACK_DAYS)).isoformat()),
-         parse_brent, None),
+        ("brent", BRENT_URL, parse_brent, None),
     )
     fresh, stale = [], []
     for name, url, parse, headers in sources:
         try:
-            reading = parse(fetch_external(
-                url, timeout=GAUGE_TIMEOUTS.get(name, GAUGE_TIMEOUT),
-                headers=headers))
+            reading = parse(fetch_external(url, headers=headers))
         except (FetchError, ElementTree.ParseError, json.JSONDecodeError,
                 KeyError, TypeError, ValueError) as exc:
             print(f"WARNING: {name} gauge did not refresh: {exc}")
@@ -5016,7 +5026,7 @@ def _gauge_tile(title, hero, unit, label, warm, track, scale, detail,
 
 
 def render_gauges(conn):
-    """The two market gauges, above everything issuer-specific.
+    """The market gauges, above everything issuer-specific.
 
     Read from the database rather than fetched here: write_html makes no
     network calls, so the published page has to carry its numbers with it.
