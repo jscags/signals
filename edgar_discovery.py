@@ -2835,6 +2835,15 @@ def market_today():
 # is a stale tile, not a broken run.
 
 FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+# Brent spot, from the St Louis Fed's public CSV endpoint. No key, unlike the
+# EIA API it republishes, and a documented series rather than a scraped quote
+# page or an undocumented finance endpoint.
+#
+# It is a SPOT series, not a futures quote, and it publishes with a lag of a
+# few days -- so the tile shows the date of the reading rather than implying
+# it is live. A number labelled "current" that is actually last Tuesday's is
+# the one thing worse than no number.
+BRENT_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DCOILBRENTEU"
 TREASURY_YIELD_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
     "pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={year}")
@@ -2904,6 +2913,56 @@ def parse_fear_greed(body):
             "as_of": stamp or market_today().isoformat(), "detail": detail}
 
 
+def parse_brent(body):
+    """The newest dated Brent spot price in a FRED CSV.
+
+    FRED emits a header row then DATE,VALUE lines, and writes "." for a day
+    with no observation -- holidays and the days between publication batches.
+    Those rows are skipped rather than read as zero: a zero oil price would
+    render as a tile, not as an error.
+
+    The newest row WITH a value wins, and its date is carried through, because
+    the series lags by a few days and the page must say which day it is
+    showing.
+    """
+    rows = []
+    for line in (body or "").splitlines():
+        parts = line.strip().split(",")
+        if len(parts) < 2:
+            continue
+        stamp, raw = parts[0].strip(), parts[-1].strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", stamp):
+            continue            # header, or a shape we do not recognise
+        if raw in (".", "", "NA"):
+            continue            # no observation that day -- not a zero
+        try:
+            rows.append((stamp, float(raw)))
+        except ValueError:
+            continue
+    if not rows:
+        raise FetchError("Brent feed carried no dated numeric observation")
+    rows.sort()
+    stamp, price = rows[-1]
+
+    # Direction over the previous available observation, so the tile can say
+    # which way it moved without implying a trend from one number.
+    prev = rows[-2][1] if len(rows) > 1 else None
+    change = round(price - prev, 2) if prev is not None else None
+    if change is None:
+        label = "latest"
+    elif change > 0:
+        label = "up"
+    elif change < 0:
+        label = "down"
+    else:
+        label = "flat"
+    detail = {"prev": round(prev, 2)} if prev is not None else {}
+    if change is not None:
+        detail["change"] = change
+    return {"value": round(price, 2), "label": label, "as_of": stamp,
+            "detail": detail}
+
+
 def parse_yield_curve(body):
     """The 10-year minus 2-year par yield, in basis points.
 
@@ -2944,6 +3003,57 @@ def parse_yield_curve(body):
             "detail": {"10y": best["ten"], "2y": best["two"]}}
 
 
+def probe_gauges(today=None):
+    """Fetch and parse every gauge source. Writes nothing.
+
+    refresh_market_gauges is deliberately forgiving: a source that fails leaves
+    the previous value in place, marked stale, and the run carries on. That is
+    right for a live pipeline and useless for telling whether a NEW source
+    works -- a gauge that never once succeeded looks exactly like a gauge
+    having a bad day, and the page would simply never show the tile.
+
+    So this exercises the same sources with the same parsers and reports each
+    outcome explicitly, with no database to write a result into.
+    """
+    today = today or market_today()
+    sources = (
+        ("brent", BRENT_URL, parse_brent, None),
+        ("fear_greed", FEAR_GREED_URL, parse_fear_greed,
+         {"Referer": "https://edition.cnn.com/markets/fear-and-greed",
+          "Origin": "https://edition.cnn.com"}),
+        ("yield_spread",
+         TREASURY_YIELD_URL.format(year=today.year), parse_yield_curve, None),
+    )
+    print("GAUGE SOURCE PROBE -- writes nothing\n")
+    bad = 0
+    for name, url, parse, headers in sources:
+        print(f"{name}\n  {url[:96]}")
+        try:
+            body = fetch_external(url, headers=headers)
+        except Exception as exc:
+            bad += 1
+            print(f"  FETCH FAILED  {type(exc).__name__}: {exc}\n")
+            continue
+        print(f"  fetched {len(body)}B")
+        try:
+            reading = parse(body)
+        except Exception as exc:
+            bad += 1
+            print(f"  PARSE FAILED  {type(exc).__name__}: {exc}")
+            print(f"  first 120B: {body[:120]!r}\n")
+            continue
+        print(f"  value {reading['value']}  label {reading['label']!r}  "
+              f"as of {reading['as_of']}  detail {reading['detail']}")
+        age = "?"
+        try:
+            age = (today - date.fromisoformat(reading["as_of"])).days
+        except (TypeError, ValueError):
+            pass
+        print(f"  reading is {age} day(s) old\n")
+    print(f"{len(sources) - bad} of {len(sources)} sources usable")
+    return 1 if bad else 0
+
+
 def refresh_market_gauges(conn, today=None):
     """Refresh both gauges, keeping the last good value when one fails.
 
@@ -2963,6 +3073,7 @@ def refresh_market_gauges(conn, today=None):
           "Origin": "https://edition.cnn.com"}),
         ("yield_spread",
          TREASURY_YIELD_URL.format(year=today.year), parse_yield_curve, None),
+        ("brent", BRENT_URL, parse_brent, None),
     )
     fresh, stale = [], []
     for name, url, parse, headers in sources:
@@ -4638,7 +4749,14 @@ def render_controls(grouped, evidence_free=None):
 LANE_A_RUNGS = (8, 7, 6, 5, 4, 3)
 
 
-# Measured, not asserted. 609 signals over 5,563 issuers, 2025-04 to 2026-09,
+# Measured, not asserted, and RESTATED once the sample was split by liquidity.
+# The first version said holding 63 sessions lost 4-12% full stop. That was the
+# pooled figure and it was carried by the illiquid end: by tier, names under
+# $100m/day lose 6-12% while the >$100m tier comes out roughly flat to slightly
+# ahead (51-54% hit, n=48-69). The short-horizon loss is the part that survives
+# every tier, so that is what the note now leads with.
+#
+# 609 signals over 5,563 issuers, 2025-04 to 2026-09,
 # streaks recomputed point-in-time from XBRL filed by each candidate day and
 # scored against SPY over the same sessions. Every threshold 3 through 8 and
 # every horizon was tested, split across three gap-free periods.
@@ -4650,9 +4768,13 @@ LANE_A_EVIDENCE = (
     '<p class="lanea-note">'
     '<b>What the backtest said:</b> this pattern did not mark a good entry. '
     'Across 609 signals and every threshold from 3 to 8 quarters, no rule beat '
-    'SPY more than half the time in more than one period. Holding '
-    '<code>63</code> sessions lost a median <code>4-12%</code> to SPY at a '
-    '27-46% hit rate, and the longer the streak the worse that got. '
+    'SPY more than half the time in more than one period. The first two weeks '
+    'after a signal underperformed in <em>every</em> liquidity tier '
+    '(37-45% hit at 5 and 10 sessions). '
+    'Beyond that it depends on what you could actually trade: by '
+    '<code>63</code> sessions names under $100m a day lost a median '
+    '<code>6-12%</code> to SPY, while the most liquid tier was roughly flat '
+    'to slightly ahead. '
     'Treat these as companies to research, not as entries.'
     '</p>')
 
@@ -4762,6 +4884,13 @@ def render_lane_a(conn, moved=(), rungs=LANE_A_RUNGS):
 # editorialise.
 GAUGE_SPREAD_DOMAIN = 150.0
 
+# A stated range for the Brent track. $20-$150 covers every monthly close of
+# the last two decades including the 2020 collapse and the 2022 spike, so an
+# ordinary reading lands mid-track rather than pinned. A value outside it is
+# clamped AND labelled, never silently pinned to an end -- that would invent a
+# number the data does not support.
+BRENT_DOMAIN = (20.0, 150.0)
+
 
 def _gauge_track(position, midpoint, warm):
     """A track marked from its midpoint outwards, position and mid in percent."""
@@ -4811,6 +4940,37 @@ def render_gauges(conn):
         return ""
 
     tiles = []
+
+    # First in the row: asked for at the top of the page, and the gauges
+    # section already sits above everything issuer-specific.
+    #
+    # No diverging track. Fear/greed and the yield spread each have a
+    # meaningful midpoint to read outwards from; an oil price does not, and
+    # inventing one -- $80? a moving average? -- would assert a neutral level
+    # the data does not carry. So the track is a plain position inside a
+    # stated range and the hero number does the work.
+    row = rows.get("brent")
+    if row is not None and row["value"] is not None:
+        usd = float(row["value"])
+        detail = json.loads(row["detail"] or "{}")
+        change = detail.get("change")
+        lo, hi = BRENT_DOMAIN
+        position = (max(lo, min(hi, usd)) - lo) / (hi - lo) * 100
+        bits = []
+        if change is not None:
+            bits.append(f"{change:+.2f} vs prev")
+        if "prev" in detail:
+            bits.append(f"prev ${detail['prev']:.2f}")
+        tiles.append(_gauge_tile(
+            "Brent crude, spot", f"${usd:,.2f}", "/bbl",
+            row["label"] or "",
+            warm=bool(change is not None and change > 0),
+            track=_gauge_track(position, position, False),
+            scale=(f'<span>${lo:.0f}</span><span>per barrel</span>'
+                   f'<span>${hi:.0f}</span>'),
+            detail=bits,
+            as_of=row["as_of"] or "unknown", stale=bool(row["stale"]),
+            note=("beyond the scale" if not (lo <= usd <= hi) else "")))
 
     row = rows.get("fear_greed")
     if row is not None and row["value"] is not None:
@@ -5194,6 +5354,11 @@ def main():
     ap.add_argument("--probe-sic", type=int, metavar="N", nargs="?", const=0,
                     help="diagnostic: SIC codes across the buyback lane "
                          "(N limits the sample; 0 = all)")
+    ap.add_argument("--probe-gauges", action="store_true",
+                    help="diagnostic: fetch and parse every market gauge, "
+                         "writing nothing -- proves a new source is reachable "
+                         "from wherever this runs before the live run depends "
+                         "on it")
     ap.add_argument("--probe-form4", metavar="ACCESSION",
                     help="diagnostic: print one Form 4's transactions as filed")
     ap.add_argument("--transition-cap", type=int, metavar="N",
@@ -5264,6 +5429,8 @@ def main():
         probe_setup_population(sample=args.probe_setup_population)
         return
 
+    if args.probe_gauges:
+        return probe_gauges()
     if args.probe_buybacks:
         probe_buybacks(sample=args.probe_buybacks)
         return
