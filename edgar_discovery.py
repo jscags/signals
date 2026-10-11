@@ -2843,7 +2843,14 @@ FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata
 # few days -- so the tile shows the date of the reading rather than implying
 # it is live. A number labelled "current" that is actually last Tuesday's is
 # the one thing worse than no number.
-BRENT_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DCOILBRENTEU"
+# BOUNDED on purpose. Unbounded, fredgraph.csv regenerates the whole series
+# back to 1987 and the first attempt timed out on the read after twenty
+# seconds -- it connected fine, it just never finished sending. Two
+# observations are all this needs, so a 120-day window leaves generous room
+# for holidays and the publication lag while keeping the response small.
+BRENT_URL = ("https://fred.stlouisfed.org/graph/fredgraph.csv"
+             "?id=DCOILBRENTEU&cosd={start}")
+BRENT_LOOKBACK_DAYS = 120
 TREASURY_YIELD_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
     "pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={year}")
@@ -3017,7 +3024,9 @@ def probe_gauges(today=None):
     """
     today = today or market_today()
     sources = (
-        ("brent", BRENT_URL, parse_brent, None),
+        ("brent", BRENT_URL.format(
+            start=(today - timedelta(days=BRENT_LOOKBACK_DAYS)).isoformat()),
+         parse_brent, None),
         ("fear_greed", FEAR_GREED_URL, parse_fear_greed,
          {"Referer": "https://edition.cnn.com/markets/fear-and-greed",
           "Origin": "https://edition.cnn.com"}),
@@ -3073,7 +3082,9 @@ def refresh_market_gauges(conn, today=None):
           "Origin": "https://edition.cnn.com"}),
         ("yield_spread",
          TREASURY_YIELD_URL.format(year=today.year), parse_yield_curve, None),
-        ("brent", BRENT_URL, parse_brent, None),
+        ("brent", BRENT_URL.format(
+            start=(today - timedelta(days=BRENT_LOOKBACK_DAYS)).isoformat()),
+         parse_brent, None),
     )
     fresh, stale = [], []
     for name, url, parse, headers in sources:
