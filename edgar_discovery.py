@@ -3097,6 +3097,12 @@ BRENT_CANDIDATES = (
     # choice is informed, NOT because it is adopted.
     ("yahoo_chart", "https://query1.finance.yahoo.com/v8/finance/chart/"
      "BZ%3DF?range=5d&interval=1d"),
+    # A community mirror of the EIA series, keyless, on a host a runner can
+    # certainly reach. Its whole risk is staleness, which the tail of the
+    # response measures directly: a mirror that stopped updating in 2023 is
+    # worse than no tile, because the number would look current.
+    ("datahub_mirror", "https://raw.githubusercontent.com/datasets/oil-prices"
+     "/main/data/brent-daily.csv"),
 )
 
 
@@ -3124,7 +3130,12 @@ def probe_brent_sources(timeout=20):
         answered += 1
         text = body.decode("utf-8", "replace")
         print(f"  HTTP {status}  {len(body)}B in {time.time() - started:.1f}s")
-        print(f"  first 200B: {text[:200]!r}\n")
+        print(f"  first 200B: {text[:200]!r}")
+        # A chronological file puts the newest observation at the END, so the
+        # head alone cannot tell a live feed from an abandoned one.
+        if len(text) > 200:
+            print(f"  last 200B:  {text[-200:]!r}")
+        print()
     print(f"{answered} of {len(BRENT_CANDIDATES)} candidates answered")
     # Every candidate answering is the expected outcome; this probe reports,
     # it does not grade. A non-zero exit would say "something is broken",
