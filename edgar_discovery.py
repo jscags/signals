@@ -2855,6 +2855,12 @@ TREASURY_YIELD_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
     "pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={year}")
 GAUGE_TIMEOUT = 20
+# FRED answers the connect immediately and then takes its time generating the
+# CSV, so the twenty seconds that are plenty for CNN and Treasury time out on
+# the read. A longer allowance for that one source distinguishes a slow host
+# from an unreachable one; if it still times out, the source is not viable
+# from a runner and no amount of waiting fixes it.
+GAUGE_TIMEOUTS = {"brent": 45}
 
 # CNN's endpoint refuses a default urllib agent outright. This is a browser
 # string because that is what it will answer; there is no documented API to
@@ -3036,14 +3042,17 @@ def probe_gauges(today=None):
     print("GAUGE SOURCE PROBE -- writes nothing\n")
     bad = 0
     for name, url, parse, headers in sources:
-        print(f"{name}\n  {url[:96]}")
+        limit = GAUGE_TIMEOUTS.get(name, GAUGE_TIMEOUT)
+        print(f"{name}\n  {url[:96]}\n  timeout {limit}s")
+        started = time.time()
         try:
-            body = fetch_external(url, headers=headers)
+            body = fetch_external(url, timeout=limit, headers=headers)
         except Exception as exc:
             bad += 1
-            print(f"  FETCH FAILED  {type(exc).__name__}: {exc}\n")
+            print(f"  FETCH FAILED after {time.time() - started:.1f}s  "
+                  f"{type(exc).__name__}: {exc}\n")
             continue
-        print(f"  fetched {len(body)}B")
+        print(f"  fetched {len(body)}B in {time.time() - started:.1f}s")
         try:
             reading = parse(body)
         except Exception as exc:
@@ -3089,7 +3098,9 @@ def refresh_market_gauges(conn, today=None):
     fresh, stale = [], []
     for name, url, parse, headers in sources:
         try:
-            reading = parse(fetch_external(url, headers=headers))
+            reading = parse(fetch_external(
+                url, timeout=GAUGE_TIMEOUTS.get(name, GAUGE_TIMEOUT),
+                headers=headers))
         except (FetchError, ElementTree.ParseError, json.JSONDecodeError,
                 KeyError, TypeError, ValueError) as exc:
             print(f"WARNING: {name} gauge did not refresh: {exc}")
