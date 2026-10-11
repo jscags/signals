@@ -3072,6 +3072,66 @@ def probe_gauges(today=None):
     return 1 if bad else 0
 
 
+# Candidates for the Brent reading, measured rather than argued about.
+# fredgraph.csv is reachable from a laptop and hangs from a GitHub runner --
+# it accepts the connection and never sends, at twenty seconds and at
+# forty-five, while CNN and Treasury answer in under a second in the same run.
+#
+# This probe asks one question of each candidate: does it answer at all, how
+# fast, and with what. It does not parse, does not write, and is not wired
+# into the live gauge registry -- reachability is a fact worth having before
+# the question of which source is acceptable, and the two are separate
+# questions. An HTTP error is an ANSWER here, not a failure: a 400 from a
+# keyed API proves the host is reachable and tells us the key is what is
+# missing.
+BRENT_CANDIDATES = (
+    # Official FRED, documented, free registration -- a different host from
+    # the graph server that hangs. No key here, so a fast 4xx is the good
+    # outcome: it means the host answers and a key is all that is wanted.
+    ("fred_api_nokey", "https://api.stlouisfed.org/fred/series/observations"
+     "?series_id=DCOILBRENTEU&file_type=json&limit=2&sort_order=desc"
+     "&api_key=probe_no_key"),
+    # Stooq's published CSV download. Keyless, continuous Brent future.
+    ("stooq_csv", "https://stooq.com/q/l/?s=cb.f&f=sd2t2ohlc&h&e=csv"),
+    # Yahoo's chart endpoint. Undocumented and unsanctioned -- included so the
+    # choice is informed, NOT because it is adopted.
+    ("yahoo_chart", "https://query1.finance.yahoo.com/v8/finance/chart/"
+     "BZ%3DF?range=5d&interval=1d"),
+)
+
+
+def probe_brent_sources(timeout=20):
+    """Reachability of each Brent candidate. Writes nothing, parses nothing."""
+    print("BRENT CANDIDATE PROBE -- writes nothing, adopts nothing\n")
+    answered = 0
+    for name, url in BRENT_CANDIDATES:
+        print(f"{name}\n  {url[:110]}")
+        request = urllib.request.Request(url, headers={
+            "User-Agent": GAUGE_USER_AGENT,
+            "Accept": "application/json, text/csv, text/plain, */*",
+        })
+        started = time.time()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status, body = response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            # An answer. Slow or fast, a status code means the host is there.
+            status, body = exc.code, exc.read()
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            print(f"  NO ANSWER after {time.time() - started:.1f}s  "
+                  f"{type(exc).__name__}: {exc}\n")
+            continue
+        answered += 1
+        text = body.decode("utf-8", "replace")
+        print(f"  HTTP {status}  {len(body)}B in {time.time() - started:.1f}s")
+        print(f"  first 200B: {text[:200]!r}\n")
+    print(f"{answered} of {len(BRENT_CANDIDATES)} candidates answered")
+    # Every candidate answering is the expected outcome; this probe reports,
+    # it does not grade. A non-zero exit would say "something is broken",
+    # and nothing here is broken -- the question is which source to adopt.
+    return 0
+
+
 def refresh_market_gauges(conn, today=None):
     """Refresh both gauges, keeping the last good value when one fails.
 
@@ -5381,6 +5441,10 @@ def main():
                          "writing nothing -- proves a new source is reachable "
                          "from wherever this runs before the live run depends "
                          "on it")
+    ap.add_argument("--probe-brent", action="store_true",
+                    help="diagnostic: which Brent candidate sources answer "
+                         "from wherever this runs, and how fast -- adopts "
+                         "nothing and writes nothing")
     ap.add_argument("--probe-form4", metavar="ACCESSION",
                     help="diagnostic: print one Form 4's transactions as filed")
     ap.add_argument("--transition-cap", type=int, metavar="N",
@@ -5453,6 +5517,8 @@ def main():
 
     if args.probe_gauges:
         return probe_gauges()
+    if args.probe_brent:
+        return probe_brent_sources()
     if args.probe_buybacks:
         probe_buybacks(sample=args.probe_buybacks)
         return
@@ -5608,4 +5674,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()'s return value is an exit code, and discarding it was how a probe
+    # that reported "2 of 3 sources usable" still finished with a green tick.
+    # A failed source is now a failed run. Every other path returns None, which
+    # is zero.
+    sys.exit(main() or 0)

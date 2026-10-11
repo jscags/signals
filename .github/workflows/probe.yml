@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Which probe: buybacks, contracts, setup, setup-population, sic or gauges'
+        description: 'Which probe: buybacks, contracts, setup, setup-population, sic, gauges or brent'
         default: 'buybacks'
       sample:
         description: 'Sample size, or a CIK for the setup probe (Axon = 1069183)'
@@ -30,13 +30,14 @@ jobs:
         run: |
           TARGET="${TARGET:-buybacks}"
           SAMPLE="${SAMPLE:-60}"
-          # Most probes take a sample size. The gauge probe does not -- it
-          # fetches a fixed set of sources -- and appending one to a flag that
-          # accepts no value fails argument parsing before a single request is
-          # made. Which is the right failure, but only if the caller does not
-          # keep handing it an argument it never asked for.
-          if [ "$TARGET" = "gauges" ]; then
-            python3 edgar_discovery.py --probe-gauges
-          else
-            python3 edgar_discovery.py "--probe-${TARGET}" "$SAMPLE"
-          fi
+          # Most probes take a sample size. The ones that fetch a fixed set of
+          # sources do not, and appending one to a flag that accepts no value
+          # fails argument parsing before a single request is made. Which is
+          # the right failure, but only if the caller does not keep handing it
+          # an argument it never asked for.
+          case "$TARGET" in
+            gauges|brent)
+              python3 edgar_discovery.py "--probe-${TARGET}" ;;
+            *)
+              python3 edgar_discovery.py "--probe-${TARGET}" "$SAMPLE" ;;
+          esac
