@@ -934,6 +934,27 @@ CREATE TABLE IF NOT EXISTS market_gauges (
     stale      INTEGER DEFAULT 0
 );
 
+-- The same gauges over time, one row per gauge per observation date, for the
+-- 90-day lines on the page.
+--
+-- Separate from market_gauges rather than replacing it: that table answers
+-- "what is it now", including the case where the last refresh failed and the
+-- number showing is the previous good one. This one answers "what has it
+-- been", where a failed refresh is simply an absent row. Collapsing the two
+-- would mean either losing the stale flag or inventing history for days a
+-- refresh never happened.
+--
+-- The primary key is (name, as_of), so re-reading a payload that overlaps
+-- what we already hold is idempotent -- every source hands back its whole
+-- back series on every fetch, and a revised figure for a day we already have
+-- should correct that day rather than duplicate it.
+CREATE TABLE IF NOT EXISTS gauge_history (
+    name   TEXT NOT NULL,
+    as_of  TEXT NOT NULL,
+    value  REAL NOT NULL,
+    PRIMARY KEY (name, as_of)
+);
+
 -- Annualised repurchase activity per issuer, cached on the same terms as the
 -- share count: slow-moving, one small request, and worth surviving between
 -- runs on a fresh runner.
@@ -2808,6 +2829,12 @@ def handle_ma(conn, row, listed):
     )
 
 
+# The two zones this file reasons in. Stored timestamps are UTC and rendered
+# dates are ET, per the standing rule for this repo.
+EASTERN = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
+
+
 def market_today():
     """Today as EDGAR reckons it.
 
@@ -2818,7 +2845,7 @@ def market_today():
     with a 403 for a file that does not exist yet. The evening schedule sits
     squarely in that window.
     """
-    return datetime.now(ZoneInfo("America/New_York")).date()
+    return datetime.now(EASTERN).date()
 
 
 # ------------------------------------------------------- market context
@@ -2928,6 +2955,73 @@ def parse_fear_greed(body):
                 pass
     return {"value": round(score, 1), "label": label,
             "as_of": stamp or market_today().isoformat(), "detail": detail}
+
+
+def yield_series_years(today, current_body=None, fetch=None):
+    """The 2y/10y spread series covering the whole history window.
+
+    Treasury's feed is per calendar year: --probe-history showed this year's
+    starting at 2026-01-02. From January to roughly April a 90-day window
+    reaches back before that, so one fetch would silently return a short
+    series and the line would just begin partway across the chart with
+    nothing saying why. So the previous year is fetched too whenever the
+    window opens before this year did.
+
+    The second fetch is only ever needed near the turn of the year, and a
+    failure on it is raised rather than swallowed: a half-covered window is
+    exactly the partial view this repo is supposed to report as partial.
+    """
+    fetch = fetch or (lambda url: fetch_external(url))
+    floor = today - timedelta(days=GAUGE_HISTORY_DAYS)
+    pairs = []
+    if floor.year != today.year:
+        pairs.extend(yield_series(fetch(
+            TREASURY_YIELD_URL.format(year=floor.year))))
+    # The caller already holds this year's feed -- it is the same 300KB the
+    # current reading was parsed from, so asking Treasury for it twice a run
+    # would be rude and pointless.
+    pairs.extend(yield_series(
+        current_body if current_body is not None
+        else fetch(TREASURY_YIELD_URL.format(year=today.year))))
+    return pairs
+
+
+def fear_greed_series(body):
+    """CNN's daily fear and greed history, as (date, score).
+
+    The payload carries a year of it under fear_and_greed_historical.data as
+    {"x": epoch_ms, "y": score} -- confirmed by --probe-history rather than
+    assumed, because the key name is the whole dependency here and a guess
+    that missed would have produced an empty chart with no error.
+
+    The timestamps are UTC milliseconds. They are converted in ET, the market
+    timezone the rest of the page renders in, so a point does not land on the
+    wrong calendar day for a reader looking at a date axis.
+    """
+    data = json.loads(body)
+    block = (data.get("fear_and_greed_historical") or {}).get("data")
+    if not isinstance(block, list) or not block:
+        raise FetchError(
+            "fear and greed payload carried no fear_and_greed_historical.data")
+    out = []
+    for point in block:
+        if not isinstance(point, dict):
+            continue
+        stamp, score = point.get("x"), point.get("y")
+        if stamp is None or score is None:
+            continue
+        try:
+            when = datetime.fromtimestamp(float(stamp) / 1000.0, tz=UTC)
+            score = float(score)
+        except (TypeError, ValueError, OSError, OverflowError):
+            continue
+        if not 0 <= score <= 100:
+            continue        # out of the index's own range -- not a reading
+        out.append((when.astimezone(EASTERN).date().isoformat(),
+                    round(score, 1)))
+    if not out:
+        raise FetchError("fear and greed history carried no usable point")
+    return out
 
 
 def brent_series(body):
@@ -3082,6 +3176,12 @@ def parse_yield_curve(body):
 
 
 GAUGE_HISTORY_DAYS = 90
+# How much history is KEPT, as opposed to drawn. Generous next to the 90-day
+# window so a longer view can be added later without waiting for data, but
+# bounded: the Brent mirror hands back its whole series to 1987, and storing
+# 9,108 rows to draw sixty of them would put a third of a megabyte into a
+# database that is committed to git twice a day.
+GAUGE_HISTORY_KEEP_DAYS = 400
 
 
 def probe_history(today=None):
@@ -3305,15 +3405,21 @@ def refresh_market_gauges(conn, today=None):
         # answer and the gauge stays stale rather than being worked around.
         ("fear_greed", FEAR_GREED_URL, parse_fear_greed,
          {"Referer": "https://edition.cnn.com/markets/fear-and-greed",
-          "Origin": "https://edition.cnn.com"}),
+          "Origin": "https://edition.cnn.com"},
+         lambda body, when: fear_greed_series(body)),
         ("yield_spread",
-         TREASURY_YIELD_URL.format(year=today.year), parse_yield_curve, None),
-        ("brent", BRENT_URL, parse_brent, None),
+         TREASURY_YIELD_URL.format(year=today.year), parse_yield_curve, None,
+         # This one may need a second fetch: the feed is per calendar year and
+         # the window reaches into the previous one each January.
+         lambda body, when: yield_series_years(when, current_body=body)),
+        ("brent", BRENT_URL, parse_brent, None,
+         lambda body, when: brent_series(body)),
     )
     fresh, stale = [], []
-    for name, url, parse, headers in sources:
+    for name, url, parse, headers, series in sources:
         try:
-            reading = parse(fetch_external(url, headers=headers))
+            body = fetch_external(url, headers=headers)
+            reading = parse(body)
         except (FetchError, ElementTree.ParseError, json.JSONDecodeError,
                 KeyError, TypeError, ValueError) as exc:
             print(f"WARNING: {name} gauge did not refresh: {exc}")
@@ -3333,7 +3439,72 @@ def refresh_market_gauges(conn, today=None):
             (name, reading["value"], reading["label"], reading["as_of"],
              json.dumps(reading["detail"]), today.isoformat()))
         fresh.append(name)
+
+        # History is additive and must never cost us the reading. The tile
+        # above is the thing people came for; the line underneath it is
+        # context. So a series that cannot be extracted is reported and
+        # skipped, leaving whatever history we already hold intact.
+        try:
+            stored = store_gauge_history(conn, name, series(body, today))
+        except (FetchError, ElementTree.ParseError, json.JSONDecodeError,
+                KeyError, TypeError, ValueError) as exc:
+            print(f"WARNING: {name} history did not update: {exc}")
+        else:
+            print(f"  {name} history: {stored} point(s) stored or refreshed")
     return fresh, stale
+
+
+def store_gauge_history(conn, name, pairs, today=None):
+    """Upsert dated points for one gauge. Returns how many were written.
+
+    Idempotent by (name, as_of): every source hands back its whole back
+    series on every fetch, so the common case is rewriting the same points,
+    and a revised figure for a day already held should correct that day
+    rather than sit beside it.
+
+    Bounded to GAUGE_HISTORY_KEEP_DAYS on both ends of the operation -- older
+    points are not stored, and older rows already held are pruned -- so the
+    table cannot grow without limit just because a source is generous.
+    """
+    today = today or market_today()
+    keep = (today - timedelta(days=GAUGE_HISTORY_KEEP_DAYS)).isoformat()
+    rows, dropped = [], 0
+    for stamp, value in pairs:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(stamp)):
+            continue
+        if str(stamp) < keep:
+            dropped += 1
+            continue
+        try:
+            rows.append((name, str(stamp), float(value)))
+        except (TypeError, ValueError):
+            continue
+    if not rows:
+        # Note the difference: a series that was all older than the retention
+        # window is a feed that has stopped, not a feed with nothing in it.
+        raise FetchError(
+            f"{name} series carried no dated numeric point inside the last "
+            f"{GAUGE_HISTORY_KEEP_DAYS} days"
+            + (f" ({dropped} older point(s) seen)" if dropped else ""))
+    conn.execute("DELETE FROM gauge_history WHERE name = ? AND as_of < ?",
+                 (name, keep))
+    conn.executemany(
+        "INSERT INTO gauge_history (name, as_of, value) VALUES (?,?,?)"
+        " ON CONFLICT(name, as_of) DO UPDATE SET value = excluded.value", rows)
+    return len(rows)
+
+
+def gauge_history_points(conn, name, today=None, days=GAUGE_HISTORY_DAYS):
+    """The stored points for one gauge inside the window, oldest first."""
+    today = today or market_today()
+    floor = (today - timedelta(days=days)).isoformat()
+    # Bounded at BOTH ends. The window is "the last 90 days", not "everything
+    # after 90 days ago", and a source that ever emitted a date in the future
+    # would otherwise stretch the x-axis out to it.
+    return [(row[0], row[1]) for row in conn.execute(
+        "SELECT as_of, value FROM gauge_history"
+        " WHERE name = ? AND as_of >= ? AND as_of <= ?"
+        " ORDER BY as_of", (name, floor, today.isoformat()))]
 
 
 def business_days_back(n):
@@ -4005,6 +4176,17 @@ CSS = """
      the dark card) where red/green is not. The midpoint is grey on purpose --
      a hue there would read as a third state. */
   --warm: #B4630A; --cool: #1736D0;
+  /* The 90-day lines. Their own tokens rather than the text ones they would
+     otherwise borrow: these are data marks, and --muted exists to set the
+     weight of label text on this surface, which is a different job that is
+     free to change without dragging a chart with it.
+     --trend is a deliberate de-emphasis grey -- the hero number is the
+     headline and the line is the shape behind it -- so it fails a chroma
+     floor meant to catch a categorical hue that has accidentally gone grey.
+     Here grey IS the encoding and nothing else shares the chart. Both clear
+     3:1 on the card and are separable from each other (worst adjacent
+     dE 20.0 protan light, 16.9 deutan dark). */
+  --trend: #6B7B87; --trend-now: #1B3FD8;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -4017,6 +4199,11 @@ CSS = """
     /* Re-stepped for the dark card, not inverted: both poles sit inside the
        dark lightness band and clear 3:1 on #151C21. */
     --warm: #CE7C21; --cool: #5A86F5;
+    /* Re-stepped for the dark card too. The text greys sit above the dark
+       lightness band (L 0.68 and 0.725 against a 0.48-0.67 band), which is
+       right for text and wrong for a mark, so the line gets its own step
+       rather than the page getting repainted. */
+    --trend: #727D87; --trend-now: #5A86F5;
   }
 }
 * { box-sizing: border-box; }
@@ -4268,6 +4455,63 @@ h1 {
 .g-stale {
   margin-left: 8px; color: var(--warm); border: 1px solid var(--warm);
   border-radius: 2px; padding: 0 4px;
+}
+/* ---- 90-day lines ---- */
+/* The line is recessive on purpose: the hero number is the headline and this
+   is the shape behind it. Only the current point wears the accent. */
+.spark { display: block; width: 100%; height: auto; margin-top: 9px; }
+.s-line {
+  fill: none; stroke: var(--trend); stroke-width: 2;
+  stroke-linejoin: round; stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.s-now { fill: var(--trend-now); }
+/* Solid hairline. Dashes would read as a projection; this is just where the
+   neutral level is. */
+.s-rule {
+  stroke: var(--rule); stroke-width: 1; vector-effect: non-scaling-stroke;
+}
+.s-ruletext {
+  font-family: "IBM Plex Mono", monospace; font-size: 8.5px;
+  fill: var(--muted);
+}
+.s-axis {
+  display: flex; justify-content: space-between; gap: 6px;
+  font-family: "IBM Plex Mono", monospace; font-size: 9.5px;
+  color: var(--muted); letter-spacing: .04em; margin-top: 3px;
+}
+.s-axis span:nth-child(2) { text-align: center; }
+/* The table twin. Collapsed so it does not crowd the tile, present so no
+   value on the line is reachable only by hovering it. */
+.s-table { margin-top: 6px; }
+.s-table summary {
+  font-family: "IBM Plex Mono", monospace; font-size: 9.5px;
+  color: var(--muted); cursor: pointer; letter-spacing: .04em;
+}
+.s-table table {
+  width: 100%; border-collapse: collapse; margin-top: 5px;
+  font-family: "IBM Plex Mono", monospace; font-size: 10px;
+}
+.s-table caption {
+  text-align: left; color: var(--muted); font-size: 9.5px;
+  padding-bottom: 3px;
+}
+.s-table th, .s-table td {
+  text-align: left; padding: 1px 0; font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid var(--rule);
+}
+.s-table th { color: var(--muted); font-weight: 400; }
+.s-table th:last-child, .s-table td:last-child { text-align: right; }
+.s-table tbody { display: block; max-height: 150px; overflow-y: auto; }
+/* The head and each body row are separate table boxes so the body can
+   scroll. Without a fixed layout they size their columns independently and
+   the header stops sitting above the column it names. */
+.s-table thead, .s-table tbody tr {
+  display: table; width: 100%; table-layout: fixed;
+}
+.g-nohist {
+  font-family: "IBM Plex Mono", monospace; font-size: 9.5px;
+  color: var(--muted); margin: 9px 0 0;
 }
 @media (max-width: 560px) { .gauge { flex: 1 1 100%; } }
 /* ---- KPI row ---- */
@@ -5127,6 +5371,129 @@ GAUGE_SPREAD_DOMAIN = 150.0
 BRENT_DOMAIN = (20.0, 150.0)
 
 
+SPARK_W, SPARK_H, SPARK_PAD = 300.0, 54.0, 5.0
+
+
+def render_sparkline(points, fmt, baseline=None, baseline_label=""):
+    """A 90-day line for one gauge, as inline SVG. Returns "" for no history.
+
+    Deliberate choices, each of which could go the other way:
+
+    * A LINE, not an area. The y-axis here cannot start at zero -- Brent lives
+      in the hundreds and the spread is tens of basis points -- and a filled
+      area read from a truncated floor overstates every move as a proportion
+      of nothing. The line states the shape without implying a magnitude.
+    * x is proportional to the DATE, not to the point's index. These are
+      trading days with weekend and holiday gaps; spacing them evenly would
+      quietly compress a fortnight's gap to the same width as a Tuesday.
+    * One hue, and it never follows the direction of travel. The hero number
+      above already carries warm/cool, but a LINE that changed colour when
+      the latest tick turned would be colour encoding rank, and the chart
+      would repaint itself on a number that has not moved the series.
+    * The extremes are labelled and nothing else is. A value beside every
+      point is unreadable, and a chart whose scale is only discoverable by
+      hovering is a chart that cannot be read on paper or by a screen reader.
+    """
+    if len(points) < 2:
+        # One point is not a line. Saying so beats drawing a dot and letting
+        # it read as a flat quarter.
+        return ('<p class="g-nohist">not enough history for a line yet</p>'
+                if points else "")
+
+    days = [date.fromisoformat(stamp) for stamp, _ in points]
+    values = [value for _, value in points]
+    span = (days[-1] - days[0]).days or 1
+
+    lo, hi = min(values), max(values)
+    if baseline is not None:
+        # The reference line has to be inside the plot or it is not a
+        # reference -- it would sit on the frame and read as the axis.
+        lo, hi = min(lo, baseline), max(hi, baseline)
+    if hi == lo:
+        hi, lo = hi + 1.0, lo - 1.0          # a flat series sits mid-height
+
+    def place(day, value):
+        x = SPARK_PAD + (day - days[0]).days / span * (SPARK_W - 2 * SPARK_PAD)
+        y = (SPARK_H - SPARK_PAD
+             - (value - lo) / (hi - lo) * (SPARK_H - 2 * SPARK_PAD))
+        return x, y
+
+    path = " ".join(f"{x:.1f},{y:.1f}" for x, y in
+                    (place(d, v) for d, v in zip(days, values)))
+    last_x, last_y = place(days[-1], values[-1])
+
+    rule = ""
+    if baseline is not None:
+        _, by = place(days[0], baseline)
+        # Solid hairline. A dashed rule reads as a projection or a threshold
+        # being approached, and this is neither -- it is just where zero is.
+        #
+        # LABELLED, in place. Unlabelled it is indistinguishable from a card
+        # divider: when the series sits far from neutral the rule pins one
+        # edge of the plot and reads as a border or an axis rather than as a
+        # level the data is being measured against. Looking at the render is
+        # the only way this shows up -- the geometry was correct either way.
+        flip = by < SPARK_H / 2        # near the top, hang the label below
+        # Which END to hang it from is measured, not guessed. The right edge
+        # is where the accent dot always sits, so a label parked there
+        # collided with the line and the dot the moment the series ran close
+        # to the baseline. Compare the vertical clearance at each end and
+        # take the roomier one.
+        left_gap = abs(place(days[0], values[0])[1] - by)
+        right_gap = abs(last_y - by)
+        at_left = left_gap > right_gap
+        rule = (f'<line class="s-rule" x1="{SPARK_PAD:.1f}" y1="{by:.1f}" '
+                f'x2="{SPARK_W - SPARK_PAD:.1f}" y2="{by:.1f}"></line>'
+                f'<text class="s-ruletext" '
+                f'x="{SPARK_PAD if at_left else SPARK_W - SPARK_PAD:.1f}" '
+                f'y="{by + (9 if flip else -3):.1f}" '
+                f'text-anchor="{"start" if at_left else "end"}">'
+                f'{html.escape(baseline_label)}</text>')
+
+    reading = (f"{fmt(values[-1])} on {days[-1].isoformat()}, "
+               f"from {fmt(values[0])} on {days[0].isoformat()}; "
+               f"low {fmt(lo if baseline is None else min(values))}, "
+               f"high {fmt(hi if baseline is None else max(values))}")
+    return (
+        f'<svg class="spark" viewBox="0 0 {SPARK_W:.0f} {SPARK_H:.0f}" '
+        # Uniform scaling, not "none": a stretched viewBox scales the stroke
+        # anisotropically, so a steep segment would render thicker than a
+        # shallow one. non-scaling-stroke then holds the line at 2px at
+        # whatever width the tile ends up.
+        f'role="img" preserveAspectRatio="xMidYMid meet" '
+        f'aria-label="{html.escape(reading)}">'
+        f'<title>{html.escape(reading)}</title>'
+        f'{rule}'
+        f'<polyline class="s-line" points="{path}"></polyline>'
+        f'<circle class="s-now" cx="{last_x:.1f}" cy="{last_y:.1f}" r="3">'
+        f'</circle></svg>'
+        f'<div class="s-axis"><span>{html.escape(days[0].isoformat())}</span>'
+        # The baseline is named on the rule itself, so it is not repeated
+        # here -- the middle slot carries the range the line actually covers.
+        f'<span>{html.escape(fmt(min(values)))} – '
+        f'{html.escape(fmt(max(values)))}'
+        f'</span><span>{html.escape(days[-1].isoformat())}</span></div>')
+
+
+def render_history_table(points, fmt, title):
+    """The table twin for a sparkline: every plotted value, without hovering.
+
+    A line on a page is a shape, not a readout. This is the same data in the
+    form a screen reader, a printout and a reader who wants the actual number
+    can all use, collapsed so it does not crowd the tile.
+    """
+    if not points:
+        return ""
+    rows = "".join(
+        f"<tr><td>{html.escape(stamp)}</td>"
+        f"<td>{html.escape(fmt(value))}</td></tr>"
+        for stamp, value in reversed(points))
+    return (f'<details class="s-table"><summary>{len(points)} points</summary>'
+            f'<table><caption>{html.escape(title)}, newest first</caption>'
+            f'<thead><tr><th>date</th><th>value</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table></details>')
+
+
 def _gauge_track(position, midpoint, warm):
     """A track marked from its midpoint outwards, position and mid in percent."""
     left, width = min(position, midpoint), abs(position - midpoint)
@@ -5139,7 +5506,7 @@ def _gauge_track(position, midpoint, warm):
 
 
 def _gauge_tile(title, hero, unit, label, warm, track, scale, detail,
-                as_of, stale, note=""):
+                as_of, stale, note="", spark=""):
     bits = "".join(f"<span>{html.escape(d)}</span>" for d in detail)
     aging = ('<span class="g-stale">last refresh failed</span>' if stale else "")
     return (
@@ -5152,12 +5519,13 @@ def _gauge_tile(title, hero, unit, label, warm, track, scale, detail,
         f'{track}'
         f'<div class="g-scale">{scale}</div>'
         f'<div class="g-detail">{bits}</div>'
+        f'{spark}'
         f'<div class="g-foot">as of {html.escape(as_of)}'
         + (f' · {html.escape(note)}' if note else "")
         + f'{aging}</div></div>')
 
 
-def render_gauges(conn):
+def render_gauges(conn, today=None):
     """The market gauges, above everything issuer-specific.
 
     Read from the database rather than fetched here: write_html makes no
@@ -5169,10 +5537,22 @@ def render_gauges(conn):
     note saying so. What must never happen is a stale number presented as
     today's, which is the one reading that would quietly mislead.
     """
+    today = today or market_today()
     rows = {row["name"]: row for row in conn.execute(
         "SELECT name, value, label, as_of, detail, stale FROM market_gauges")}
     if not rows:
         return ""
+
+    def history(name, fmt, title, baseline=None, baseline_label=""):
+        """The 90-day line plus its table twin, or nothing at all.
+
+        A gauge with no stored history renders exactly as it did before this
+        existed -- the line is additive context, and its absence must not
+        cost the tile its number.
+        """
+        points = gauge_history_points(conn, name, today=today)
+        return (render_sparkline(points, fmt, baseline, baseline_label)
+                + render_history_table(points, fmt, title))
 
     tiles = []
 
@@ -5204,6 +5584,8 @@ def render_gauges(conn):
             scale=(f'<span>${lo:.0f}</span><span>per barrel</span>'
                    f'<span>${hi:.0f}</span>'),
             detail=bits,
+            spark=history("brent", lambda v: f"${v:,.2f}",
+                          "Brent crude, spot"),
             as_of=row["as_of"] or "unknown", stale=bool(row["stale"]),
             note=("beyond the scale" if not (lo <= usd <= hi) else "")))
 
@@ -5219,6 +5601,9 @@ def render_gauges(conn):
             track=_gauge_track(score, 50.0, score < 50),
             scale='<span>0 fear</span><span>50</span><span>greed 100</span>',
             detail=[f"{k} {detail[k]:.0f}" for k in order if k in detail],
+            spark=history("fear_greed", lambda v: f"{v:.0f}",
+                          "CNN fear & greed", baseline=50.0,
+                          baseline_label="50 neutral"),
             as_of=row["as_of"] or "unknown", stale=bool(row["stale"])))
 
     row = rows.get("yield_spread")
@@ -5235,6 +5620,9 @@ def render_gauges(conn):
                    '<span>0 inverted ⟋ normal</span>'
                    f'<span>+{GAUGE_SPREAD_DOMAIN:.0f}</span>'),
             detail=[f"{k} {detail[k]:.2f}%" for k in ("10y", "2y") if k in detail],
+            spark=history("yield_spread", lambda v: f"{v:+.0f} bp",
+                          "10-year minus 2-year", baseline=0.0,
+                          baseline_label="0 inversion"),
             as_of=row["as_of"] or "unknown", stale=bool(row["stale"]),
             note=("beyond the scale" if abs(bp) > GAUGE_SPREAD_DOMAIN else "")))
 
