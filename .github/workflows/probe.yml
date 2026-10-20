@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Which probe: buybacks, contracts, setup, setup-population, sic, gauges or brent'
+        description: 'Which probe: buybacks, contracts, setup, setup-population, sic, gauges, brent or history'
         default: 'buybacks'
       sample:
         description: 'Sample size, or a CIK for the setup probe (Axon = 1069183)'
@@ -36,7 +36,7 @@ jobs:
           # the right failure, but only if the caller does not keep handing it
           # an argument it never asked for.
           case "$TARGET" in
-            gauges|brent)
+            gauges|brent|history)
               python3 edgar_discovery.py "--probe-${TARGET}" ;;
             *)
               python3 edgar_discovery.py "--probe-${TARGET}" "$SAMPLE" ;;
