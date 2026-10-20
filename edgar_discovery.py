@@ -5422,7 +5422,7 @@ def render_sparkline(points, fmt, baseline=None, baseline_label=""):
                     (place(d, v) for d, v in zip(days, values)))
     last_x, last_y = place(days[-1], values[-1])
 
-    rule = ""
+    rule, caption_extra = "", ""
     if baseline is not None:
         _, by = place(days[0], baseline)
         # Solid hairline. A dashed rule reads as a projection or a threshold
@@ -5433,22 +5433,39 @@ def render_sparkline(points, fmt, baseline=None, baseline_label=""):
         # edge of the plot and reads as a border or an axis rather than as a
         # level the data is being measured against. Looking at the render is
         # the only way this shows up -- the geometry was correct either way.
-        flip = by < SPARK_H / 2        # near the top, hang the label below
-        # Which END to hang it from is measured, not guessed. The right edge
-        # is where the accent dot always sits, so a label parked there
-        # collided with the line and the dot the moment the series ran close
-        # to the baseline. Compare the vertical clearance at each end and
-        # take the roomier one.
-        left_gap = abs(place(days[0], values[0])[1] - by)
-        right_gap = abs(last_y - by)
-        at_left = left_gap > right_gap
         rule = (f'<line class="s-rule" x1="{SPARK_PAD:.1f}" y1="{by:.1f}" '
-                f'x2="{SPARK_W - SPARK_PAD:.1f}" y2="{by:.1f}"></line>'
-                f'<text class="s-ruletext" '
-                f'x="{SPARK_PAD if at_left else SPARK_W - SPARK_PAD:.1f}" '
-                f'y="{by + (9 if flip else -3):.1f}" '
-                f'text-anchor="{"start" if at_left else "end"}">'
-                f'{html.escape(baseline_label)}</text>')
+                f'x2="{SPARK_W - SPARK_PAD:.1f}" y2="{by:.1f}"></line>')
+        # WHERE the label goes is decided by collision, not by a rule of
+        # thumb. Two heuristics failed here in turn: parking it at the right
+        # edge put it under the accent dot, and then picking the end with the
+        # roomier ENDPOINT still collided the first time real data crossed
+        # the baseline in the middle, because the line can re-enter the
+        # label's band anywhere along it. So each candidate box is tested
+        # against every plotted point, and if all four are occupied the
+        # label is dropped into the caption rather than drawn over the data.
+        plotted = [place(d, v) for d, v in zip(days, values)]
+        box_w = 5.0 * len(baseline_label)
+        best = None
+        for at_left in (False, True):
+            x0 = SPARK_PAD if at_left else SPARK_W - SPARK_PAD - box_w
+            for below in (True, False):
+                mid = by + (7.0 if below else -6.0)
+                if not (SPARK_PAD <= mid <= SPARK_H - SPARK_PAD):
+                    continue            # the box would hang outside the plot
+                clash = sum(1 for x, y in plotted
+                            if x0 - 2 <= x <= x0 + box_w + 2
+                            and abs(y - mid) <= 6.0)
+                if best is None or clash < best[0]:
+                    best = (clash, at_left, mid)
+        if best and best[0] == 0:
+            _, at_left, mid = best
+            rule += (f'<text class="s-ruletext" '
+                     f'x="{SPARK_PAD if at_left else SPARK_W - SPARK_PAD:.1f}" '
+                     f'y="{mid + 3:.1f}" '
+                     f'text-anchor="{"start" if at_left else "end"}">'
+                     f'{html.escape(baseline_label)}</text>')
+        else:
+            caption_extra = baseline_label
 
     reading = (f"{fmt(values[-1])} on {days[-1].isoformat()}, "
                f"from {fmt(values[0])} on {days[0].isoformat()}; "
@@ -5468,11 +5485,13 @@ def render_sparkline(points, fmt, baseline=None, baseline_label=""):
         f'<circle class="s-now" cx="{last_x:.1f}" cy="{last_y:.1f}" r="3">'
         f'</circle></svg>'
         f'<div class="s-axis"><span>{html.escape(days[0].isoformat())}</span>'
-        # The baseline is named on the rule itself, so it is not repeated
-        # here -- the middle slot carries the range the line actually covers.
+        # The baseline is normally named on the rule itself, so the middle
+        # slot carries the range the line covers -- unless there was nowhere
+        # clear to draw that label, in which case it falls back to here.
         f'<span>{html.escape(fmt(min(values)))} – '
         f'{html.escape(fmt(max(values)))}'
-        f'</span><span>{html.escape(days[-1].isoformat())}</span></div>')
+        + (f' · {html.escape(caption_extra)}' if caption_extra else "")
+        + f'</span><span>{html.escape(days[-1].isoformat())}</span></div>')
 
 
 def render_history_table(points, fmt, title):
