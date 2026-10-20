@@ -2930,6 +2930,55 @@ def parse_fear_greed(body):
             "as_of": stamp or market_today().isoformat(), "detail": detail}
 
 
+def brent_series(body):
+    """Every dated Brent observation in a DATE,VALUE CSV, as (date, price).
+
+    Same row discipline as parse_brent: a "." or blank is no observation and
+    is skipped rather than read as a zero, because a zero plotted on a line
+    is a cliff to the axis floor and looks like an event.
+    """
+    out = []
+    for line in (body or "").splitlines():
+        parts = line.strip().split(",")
+        if len(parts) < 2:
+            continue
+        stamp, raw = parts[0].strip(), parts[-1].strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", stamp):
+            continue
+        if raw in (".", "", "NA"):
+            continue
+        try:
+            out.append((stamp, float(raw)))
+        except ValueError:
+            continue
+    return out
+
+
+def yield_series(body):
+    """Every complete 2y/10y row in a Treasury curve feed, as (date, bp).
+
+    Rows missing either tenor are dropped, not carried forward: an incomplete
+    row is an absent spread, and interpolating one would invent a number.
+    """
+    root = ElementTree.fromstring(body)
+    out = []
+    for entry in root.iter():
+        if not entry.tag.endswith("properties"):
+            continue
+        fields = {}
+        for child in entry:
+            fields[child.tag.rsplit("}", 1)[-1]] = (child.text or "").strip()
+        stamp = fields.get("NEW_DATE", "")[:10]
+        two, ten = fields.get("BC_2YEAR"), fields.get("BC_10YEAR")
+        if not stamp or not two or not ten:
+            continue
+        try:
+            out.append((stamp, float(round((float(ten) - float(two)) * 100))))
+        except ValueError:
+            continue
+    return out
+
+
 def parse_brent(body, today=None):
     """The newest dated Brent spot price in a DATE,VALUE CSV.
 
@@ -3030,6 +3079,89 @@ def parse_yield_curve(body):
         label = "normal"
     return {"value": float(spread_bp), "label": label, "as_of": best["as_of"],
             "detail": {"10y": best["ten"], "2y": best["two"]}}
+
+
+GAUGE_HISTORY_DAYS = 90
+
+
+def probe_history(today=None):
+    """What history each gauge payload already carries. Writes nothing.
+
+    A 90-day line needs 90 days of points, and the question of where they come
+    from has exactly two answers: either the payload we already fetch carries
+    the back series, or the chart has to accumulate one point a day and will
+    be a stub until Christmas. That is worth knowing BEFORE a table, a store
+    and a renderer are built on a guess.
+
+    So this reports the shape of each response rather than asserting it. For
+    the JSON feed it dumps the top-level keys and the length and endpoints of
+    any embedded series, because guessing CNN's schema from the outside is
+    exactly the kind of assumption that turns into an empty chart.
+    """
+    today = today or market_today()
+    floor = (today - timedelta(days=GAUGE_HISTORY_DAYS)).isoformat()
+    print(f"GAUGE HISTORY PROBE -- writes nothing\n"
+          f"window: {floor} .. {today.isoformat()} "
+          f"({GAUGE_HISTORY_DAYS} days)\n")
+
+    def window(pairs):
+        """How many of these dated points fall inside the 90-day window."""
+        inside = [p for p in pairs if p[0] >= floor]
+        if not pairs:
+            return "  no dated points at all"
+        return (f"  {len(pairs)} points total, {len(inside)} inside the window"
+                f"\n  range {pairs[0][0]} .. {pairs[-1][0]}"
+                f"\n  newest 3: {pairs[-3:]}")
+
+    print("brent (CSV)")
+    try:
+        body = fetch_external(BRENT_URL)
+        pairs = sorted(brent_series(body))
+        print(f"  fetched {len(body)}B")
+        print(window(pairs))
+    except Exception as exc:
+        print(f"  FAILED  {type(exc).__name__}: {exc}")
+    print()
+
+    print("yield_spread (XML)")
+    try:
+        body = fetch_external(TREASURY_YIELD_URL.format(year=today.year))
+        pairs = sorted(yield_series(body))
+        print(f"  fetched {len(body)}B")
+        print(window(pairs))
+        if pairs and pairs[0][0] > floor:
+            print(f"  NOTE: this year's feed starts at {pairs[0][0]}, after "
+                  f"the window opens -- the previous year is needed too")
+    except Exception as exc:
+        print(f"  FAILED  {type(exc).__name__}: {exc}")
+    print()
+
+    print("fear_greed (JSON)")
+    try:
+        body = fetch_external(FEAR_GREED_URL, headers={
+            "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+            "Origin": "https://edition.cnn.com"})
+        print(f"  fetched {len(body)}B")
+        data = json.loads(body)
+        print(f"  top-level keys: {sorted(data)}")
+        # Dump the shape of anything that looks like a series, so the
+        # extractor is written against what is there rather than what I
+        # expect to be there.
+        for key in sorted(data):
+            block = data[key]
+            if not isinstance(block, dict):
+                print(f"  {key}: {type(block).__name__}")
+                continue
+            series = block.get("data")
+            if isinstance(series, list) and series:
+                print(f"  {key}.data: {len(series)} entries, "
+                      f"first {series[0]!r}, last {series[-1]!r}")
+            else:
+                print(f"  {key}: keys {sorted(block)}")
+    except Exception as exc:
+        print(f"  FAILED  {type(exc).__name__}: {exc}")
+    print()
+    return 0
 
 
 def probe_gauges(today=None):
@@ -5462,6 +5594,10 @@ def main():
                          "writing nothing -- proves a new source is reachable "
                          "from wherever this runs before the live run depends "
                          "on it")
+    ap.add_argument("--probe-history", action="store_true",
+                    help="diagnostic: how much back history each gauge "
+                         "payload already carries, which decides whether a "
+                         "90-day line can be drawn now or has to accumulate")
     ap.add_argument("--probe-brent", action="store_true",
                     help="diagnostic: which Brent candidate sources answer "
                          "from wherever this runs, and how fast -- adopts "
@@ -5540,6 +5676,8 @@ def main():
         return probe_gauges()
     if args.probe_brent:
         return probe_brent_sources()
+    if args.probe_history:
+        return probe_history()
     if args.probe_buybacks:
         probe_buybacks(sample=args.probe_buybacks)
         return
