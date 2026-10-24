@@ -24,6 +24,9 @@ on:
       budget:
         description: 'Hard ceiling on API requests'
         default: '700'
+      control:
+        description: 'Unfiltered comparison: spread, shifted, both or none'
+        default: 'spread'
 
 jobs:
   backtest:
@@ -58,6 +61,7 @@ jobs:
           CLOUDS: ${{ inputs.clouds }}
           TARGET_YIELD: ${{ inputs.target_yield }}
           BUDGET: ${{ inputs.budget }}
+          CONTROL: ${{ inputs.control }}
         run: |
           if [ -z "${POLYGON_API_KEY}" ]; then
             echo "::error::POLYGON_API_KEY is not set."
@@ -69,6 +73,7 @@ jobs:
             --clouds "${CLOUDS:-5/12,34/50}" \
             --yield "${TARGET_YIELD:-5}" \
             --budget "${BUDGET:-700}" \
+            --control "${CONTROL:-spread}" \
             --price-start 2024-10-20 2>&1 | tee backtest.log
 
       - name: Keep the report

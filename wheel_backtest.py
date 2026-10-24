@@ -407,6 +407,31 @@ def control_days(days, rows, n_wanted, seed=11):
     return judgeable[::step][:n_wanted]
 
 
+def shifted_days(days, signals, offset=5):
+    """Entries a fixed number of sessions AFTER each signal, unfiltered.
+
+    The second control, and the stricter one. The evenly-spaced control tests
+    the filter against the whole window, but the filtered entries cluster --
+    four of SOXL's twenty-five land inside three weeks of June -- so a flat
+    control can penalise the rule for WHEN it traded rather than for how well
+    it chose. Entering a week after each signal holds the calendar nearly
+    constant and removes only the red day itself, which isolates the thing
+    the filter actually claims.
+
+    Days that are themselves signals are dropped, or the control would be
+    partly made of the arm it is meant to be compared against.
+    """
+    pos = {d: i for i, d in enumerate(days)}
+    taken = set(signals)
+    out = []
+    for day in signals:
+        j = pos.get(day, -1) + offset
+        if 0 <= j < len(days) and days[j] not in taken:
+            out.append(days[j])
+            taken.add(days[j])
+    return out
+
+
 def summarise(label, trades):
     """Totals that cannot hide a tail behind a hit rate."""
     done = [t for t in trades if "return_pct" in t]
@@ -461,7 +486,7 @@ def summarise(label, trades):
             "hit": len(wins) / len(rets) * 100.0, "held": held}
 
 
-def run(tickers, clouds, drop_pct, budget_limit, control=True,
+def run(tickers, clouds, drop_pct, budget_limit, control="spread",
         target_yield=TARGET_YIELD, price_start=None):
     if not POLYGON_KEY:
         print("POLYGON_API_KEY is not set.")
@@ -515,39 +540,52 @@ def run(tickers, clouds, drop_pct, budget_limit, control=True,
                 break
         filt = summarise(f"{ticker} -- FILTERED (steps 1-3 applied)", trades)
 
-        ctrl = None
+        arms = {}
         if control and signals:
-            picks = control_days(days, rows, len(signals))
-            ctrl_trades = []
-            for day in picks:
-                try:
-                    ctrl_trades.append(simulate(conn, ticker, day, by_day,
-                                                days, budget, POLYGON_KEY,
-                                                target_yield))
-                except RuntimeError as exc:
-                    print(f"  control stopped early: {exc}")
-                    break
-            ctrl = summarise(f"{ticker} -- CONTROL (no filter, same count,"
-                             f" same span)", ctrl_trades)
-        results[ticker] = (filt, ctrl)
+            plans = []
+            if control in ("spread", "both"):
+                plans.append(("spread", control_days(days, rows, len(signals)),
+                              "no filter, same count, spread across the span"))
+            if control in ("shifted", "both"):
+                plans.append(("shifted", shifted_days(days, signals),
+                              "no filter, 5 sessions after each signal,"
+                              " same calendar"))
+            for name, picks, why in plans:
+                trades_c = []
+                for day in picks:
+                    try:
+                        trades_c.append(simulate(conn, ticker, day, by_day,
+                                                 days, budget, POLYGON_KEY,
+                                                 target_yield))
+                    except RuntimeError as exc:
+                        print(f"  control {name} stopped early: {exc}")
+                        break
+                arms[name] = summarise(
+                    f"{ticker} -- CONTROL [{name}] ({why})", trades_c)
+        results[ticker] = (filt, arms)
         print(f"\n  requests used so far: {budget.used}/{budget.limit}")
 
     print(f"\n{'=' * 72}\nDID THE FILTER EARN ITS PLACE?\n{'=' * 72}")
-    for ticker, (filt, ctrl) in results.items():
-        if not filt or not ctrl:
-            print(f"{ticker}: not comparable "
-                  f"(filtered n={filt['n'] if filt else 0},"
-                  f" control n={ctrl['n'] if ctrl else 0})")
+    for ticker, (filt, arms) in results.items():
+        if not filt:
+            print(f"\n{ticker}: nothing priced on the filtered arm")
             continue
-        edge = filt["median"] - ctrl["median"]
-        print(f"\n{ticker}  filtered n={filt['n']}  control n={ctrl['n']}")
-        print(f"  median    {filt['median']:+.2f}%  vs  {ctrl['median']:+.2f}%"
-              f"   -> {edge:+.2f}% to the filter")
-        print(f"  worst     {filt['worst']:+.2f}%  vs  {ctrl['worst']:+.2f}%")
-        print(f"  sum       {filt['sum']:+.2f}%  vs  {ctrl['sum']:+.2f}%")
-        if filt["n"] < 10 or ctrl["n"] < 10:
-            print(f"  !! fewer than ten trades on one side. This repo has"
-                  f" already been burned once by a cell resting on n=2.")
+        print(f"\n{ticker}  filtered n={filt['n']}")
+        for name, ctrl in arms.items():
+            if not ctrl:
+                print(f"  vs {name}: nothing priced")
+                continue
+            edge = filt["median"] - ctrl["median"]
+            print(f"  vs {name:8} n={ctrl['n']:3}  "
+                  f"median {filt['median']:+.2f}% vs {ctrl['median']:+.2f}%"
+                  f"  -> {edge:+.2f}% to the filter")
+            print(f"  {'':11}      worst  {filt['worst']:+.2f}% vs"
+                  f" {ctrl['worst']:+.2f}%   "
+                  f"sum {filt['sum']:+.2f}% vs {ctrl['sum']:+.2f}%")
+            if filt["n"] < 10 or ctrl["n"] < 10:
+                print(f"  {'':11}      !! fewer than ten trades on one side."
+                      f" This repo has already been burned by a cell"
+                      f" resting on n=2.")
 
     print(f"\n{'=' * 72}")
     print("SCOPE. Option history begins around October 2024, so every number")
@@ -568,14 +606,17 @@ def main():
                     default=TARGET_YIELD, help="step 5's premium/strike %%")
     ap.add_argument("--budget", type=int, default=900,
                     help="hard ceiling on API requests")
-    ap.add_argument("--no-control", action="store_true")
+    ap.add_argument("--control", default="spread",
+                    choices=("spread", "shifted", "both", "none"),
+                    help="which unfiltered comparison to run")
     ap.add_argument("--price-start", default=None)
     args = ap.parse_args()
     clouds = tuple(tuple(int(n) for n in p.split("/"))
                    for p in args.clouds.split(","))
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     return run(tickers, clouds, args.drop, args.budget,
-               control=not args.no_control, target_yield=args.target_yield,
+               control=None if args.control == "none" else args.control,
+               target_yield=args.target_yield,
                price_start=args.price_start)
 
 
