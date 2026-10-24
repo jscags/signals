@@ -1,0 +1,22 @@
+# Diagnostic only. Answers two questions before a line of the put-selling
+# screener is built: how far back these tickers can be priced, and whether an
+# options chain is reachable at all.
+# Never scheduled, writes nothing, commits nothing.
+
+name: wheel-probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Probe the data the 9-step process needs
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+        run: python3 wheel_probe.py
