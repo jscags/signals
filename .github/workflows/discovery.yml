@@ -95,11 +95,35 @@ jobs:
           echo "running: python3 edgar_discovery.py $ARGS"
           python3 edgar_discovery.py $ARGS
 
+      # The setups page. A separate step so a failure here cannot cost the
+      # EDGAR dashboard its run -- the two lanes answer different questions
+      # and neither should be able to take the other down. continue-on-error
+      # is deliberate: no key, or a refused price fetch, leaves the previous
+      # wheel.html in place rather than publishing an empty one.
+      - name: Setups page
+        continue-on-error: true
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          PRICE_DB: prices.db
+          WHEEL_TICKERS: ${{ vars.WHEEL_TICKERS }}
+        run: |
+          if [ -z "${POLYGON_API_KEY}" ]; then
+            echo "::warning::POLYGON_API_KEY not set; setups page not rebuilt"
+            exit 0
+          fi
+          python3 wheel_page.py \
+            --db discovery.db \
+            --out docs/wheel.html \
+            --tickers "${WHEEL_TICKERS:-TQQQ,SOXL,SPXL}"
+
       - name: Commit state and dashboard
         run: |
           git config user.name  "discovery-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add discovery.db docs/index.html
+          # -- so a missing wheel.html (first run, or a skipped step) does not
+          # fail the commit that carries the dashboard.
+          git add docs/wheel.html 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "nothing new"
             exit 0

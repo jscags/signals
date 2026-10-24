@@ -5946,7 +5946,7 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
 <style>{CSS}</style>
 </head><body><div class="wrap">
 <h1>EDGAR Discovery</h1>
-<p class="meta">{len(moves)} transition{"" if len(moves) == 1 else "s"} &nbsp;·&nbsp; {sum(counts.values()):,} issuers tracked &nbsp;·&nbsp; days covered: {covered}{f" &nbsp;·&nbsp; {docs} filings scanned" if docs else ""} &nbsp;·&nbsp; built {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
+<p class="meta">{len(moves)} transition{"" if len(moves) == 1 else "s"} &nbsp;·&nbsp; {sum(counts.values()):,} issuers tracked &nbsp;·&nbsp; days covered: {covered}{f" &nbsp;·&nbsp; {docs} filings scanned" if docs else ""} &nbsp;·&nbsp; built {datetime.now().strftime("%Y-%m-%d %H:%M")} &nbsp;·&nbsp; <a href="wheel.html">setups</a></p>
 {"".join(sections)}
 {watch_html}
 </div><div id="tip" role="status" aria-live="polite"></div>
