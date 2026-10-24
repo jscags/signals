@@ -351,6 +351,17 @@ def simulate(conn, ticker, signal_day, bars_by_day, days, budget, key,
             outcome = "assigned"
     pnl = best["premium"] - exit_price          # per share
     held = (date.fromisoformat(exit_day) - date.fromisoformat(entry_day)).days
+
+    # What the two alternatives did over the IDENTICAL days. Selling a put
+    # caps the upside at the premium while keeping nearly all the downside,
+    # so the honest competitor is not cash -- it is owning the thing. On a 3x
+    # fund in a rising market that comparison is the whole argument, and it
+    # is the one the nine steps never make.
+    hold = None
+    exit_close = bars_by_day.get(exit_day, {}).get("close")
+    if exit_close and spot:
+        hold = (exit_close - spot) / spot * 100.0
+    bench = benchmark_return(conn, entry_day, exit_day)
     return {
         "signal": signal_day, "entry": entry_day, "exit": exit_day,
         "expiry": expiry, "strike": best["strike"], "spot": spot,
@@ -359,7 +370,25 @@ def simulate(conn, ticker, signal_day, bars_by_day, days, budget, key,
         "exit_price": exit_price, "outcome": outcome,
         "pnl": pnl, "return_pct": pnl / best["strike"] * 100.0,
         "held_days": held, "contract": best["contract"],
+        "hold_pct": hold, "bench_pct": bench,
     }
+
+
+def benchmark_return(conn, start_day, end_day):
+    """SPY over the same days, or None if it cannot be priced.
+
+    None rather than zero. A benchmark that could not be read is not a
+    benchmark that went nowhere, and averaging the second into a column of
+    real numbers is how a comparison quietly becomes flattering.
+    """
+    rows = conn.execute(
+        "SELECT day, close FROM prices WHERE ticker = ? AND day >= ?"
+        " AND day <= ? AND close > 0 ORDER BY day",
+        (market_data.BENCHMARK, start_day, end_day)).fetchall()
+    if len(rows) < 2:
+        return None
+    first, last = rows[0]["close"], rows[-1]["close"]
+    return (last - first) / first * 100.0 if first else None
 
 
 def control_days(days, rows, n_wanted, seed=11):
@@ -410,6 +439,17 @@ def summarise(label, trades):
           f"   best {rets[-1]:+.2f}%")
     print(f"  sum of returns    : {total:+.2f}%  (on capital secured per trade)")
     print(f"  capital-days used : {held}")
+    # The alternatives, over exactly the days each trade was open.
+    holds = [t["hold_pct"] for t in done if t.get("hold_pct") is not None]
+    benches = [t["bench_pct"] for t in done if t.get("bench_pct") is not None]
+    if holds:
+        print(f"  -- owning it instead, same days: sum {sum(holds):+.2f}%,"
+              f" median {sorted(holds)[len(holds) // 2]:+.2f}%"
+              f"  ({len(holds)}/{len(done)} priced)")
+    if benches:
+        print(f"  -- SPY instead, same days:       sum {sum(benches):+.2f}%,"
+              f" median {sorted(benches)[len(benches) // 2]:+.2f}%"
+              f"  ({len(benches)}/{len(done)} priced)")
     for name, n in sorted(outcomes.items(), key=lambda kv: -kv[1]):
         print(f"      {n:3}  {name}")
     losses = [r for r in rets if r <= 0]
@@ -444,7 +484,10 @@ def run(tickers, clouds, drop_pct, budget_limit, control=True,
     # are a month of signals rather than a rounding error.
     if price_start:
         market_data.HISTORY_START = price_start
-    fetched, cached, failed = market_data.refresh(conn, list(tickers))
+    # The benchmark is fetched with the rest: a comparison that depends on a
+    # later request is a comparison that goes missing when the budget runs out.
+    fetched, cached, failed = market_data.refresh(
+        conn, list(tickers) + [market_data.BENCHMARK])
     print(f"underlying prices: {fetched} fetched, {cached} cached,"
           f" {failed} failed  (from {market_data.HISTORY_START})")
 
