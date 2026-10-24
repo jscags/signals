@@ -1,0 +1,79 @@
+# Does the 9-step process pay, and does the step 1-3 filter earn its place?
+# Long-running: option bars cost one request each against a 5/min limit, so
+# a full pass is roughly two hours. The price database is cached between
+# runs, which makes a re-run cheap.
+# Writes nothing to the repository.
+
+name: wheel-backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Tickers to test'
+        default: 'SOXL,TQQQ,SPXL'
+      drop:
+        description: 'Red-day threshold, percent'
+        default: '5'
+      clouds:
+        description: 'EMA cloud pairs'
+        default: '5/12,34/50'
+      target_yield:
+        description: 'Step 5 premium/strike target, percent'
+        default: '5'
+      budget:
+        description: 'Hard ceiling on API requests'
+        default: '700'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Option bars never change once a contract has expired, so a cache hit
+      # turns a two-hour run into a two-minute one. The key rolls weekly so
+      # the underlying prices stay fresh without discarding the options.
+      - name: Restore the price and option cache
+        uses: actions/cache@v4
+        with:
+          path: prices.db
+          key: wheel-prices-${{ github.run_id }}
+          restore-keys: |
+            wheel-prices-
+
+      - name: Arithmetic first
+        run: python3 wheel.py
+
+      - name: Backtest
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          PRICE_DB: prices.db
+          TICKERS: ${{ inputs.tickers }}
+          DROP: ${{ inputs.drop }}
+          CLOUDS: ${{ inputs.clouds }}
+          TARGET_YIELD: ${{ inputs.target_yield }}
+          BUDGET: ${{ inputs.budget }}
+        run: |
+          if [ -z "${POLYGON_API_KEY}" ]; then
+            echo "::error::POLYGON_API_KEY is not set."
+            exit 1
+          fi
+          python3 wheel_backtest.py \
+            --tickers "${TICKERS:-SOXL,TQQQ,SPXL}" \
+            --drop "${DROP:-5}" \
+            --clouds "${CLOUDS:-5/12,34/50}" \
+            --yield "${TARGET_YIELD:-5}" \
+            --budget "${BUDGET:-700}" \
+            --price-start 2024-10-20 2>&1 | tee backtest.log
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-backtest-report
+          path: backtest.log
