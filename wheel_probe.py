@@ -155,6 +155,67 @@ def probe_options(key):
     return verdict
 
 
+def probe_option_depth(key):
+    """How far back OPTION data goes -- which is not the same limit as stock.
+
+    The underlying stops dead at two years. If contracts stop there too, the
+    backtest can only ever see a rising market and cannot falsify anything.
+    If expired contracts from 2022 are listed AND priced, the drawdown is
+    reachable and the whole exercise is worth doing properly.
+
+    Two separate things are tested because they fail separately: the registry
+    may happily list a contract from 2022 that no longer has prices attached,
+    which would look like success right up until every premium came back
+    empty.
+    """
+    print("\n" + "=" * 72)
+    print("3. OPTION HISTORY DEPTH -- can the backtest reach the 2022 bear?")
+    print("=" * 72)
+    reachable = {}
+    for label, expiry in (("2022 (bear)", "2022-06-17"),
+                          ("2023 (recovery)", "2023-06-16"),
+                          ("2025 (in window)", "2025-06-20")):
+        time.sleep(PACE)
+        url = ("https://api.polygon.io/v3/reference/options/contracts"
+               f"?underlying_ticker=TQQQ&contract_type=put"
+               f"&expiration_date={expiry}&expired=true"
+               f"&limit=20&apiKey={key}")
+        status, body = _get(url)
+        try:
+            results = (json.loads(body).get("results") or [])
+        except (json.JSONDecodeError, TypeError):
+            results = []
+        print(f"\n{label}  expiry {expiry}")
+        print(f"  contracts listed: HTTP {status}, {len(results)} found")
+        if not results:
+            print(f"  {_brief(body)}")
+            reachable[label] = False
+            continue
+        # Listed is not priced. Ask the middle contract for its actual bars.
+        contract = results[len(results) // 2]
+        ticker = contract.get("ticker")
+        strike = contract.get("strike_price")
+        time.sleep(PACE)
+        lo = (date.fromisoformat(expiry) - timedelta(days=60)).isoformat()
+        url = (f"https://api.polygon.io/v2/aggs/ticker/{ticker}"
+               f"/range/1/day/{lo}/{expiry}?adjusted=true&limit=90"
+               f"&apiKey={key}")
+        status, body = _get(url)
+        try:
+            bars = (json.loads(body).get("results") or [])
+        except (json.JSONDecodeError, TypeError):
+            bars = []
+        print(f"  {ticker} (strike {strike})")
+        print(f"  priced: HTTP {status}, {len(bars)} daily bars in the 60 days"
+              f" before expiry")
+        reachable[label] = bool(bars)
+        if not bars:
+            print(f"  {_brief(body)}")
+            print("  -> listed but NOT priced: the registry remembers the")
+            print("     contract, the free tier will not sell you its history")
+    return reachable
+
+
 def main():
     key = os.environ.get("POLYGON_API_KEY", "")
     if not key:
@@ -167,6 +228,7 @@ def main():
     print("WHEEL DATA PROBE -- writes nothing, decides nothing\n")
     depths = probe_history(key)
     verdict = probe_options(key)
+    reach = probe_option_depth(key)
 
     print("\n" + "=" * 72)
     print("WHAT THIS MEANS")
@@ -182,6 +244,18 @@ def main():
             print("any result here means anything.")
     else:
         print("No price history at all -- nothing downstream is possible.")
+    bear = reach.get("2022 (bear)")
+    print(f"\nOption history reaches the 2022 drawdown: "
+          f"{'YES' if bear else 'no'}")
+    if bear:
+        print("Which changes the whole exercise: the backtest can be run")
+        print("across the regime that actually decides this strategy, with")
+        print("real premiums rather than modelled ones.")
+    else:
+        print("So the real-premium backtest is confined to a rising market.")
+        print("It can measure how the rule behaved; it cannot falsify it.")
+        print("Any result has to be quoted with that scope attached.")
+
     live = verdict.get("chain snapshot (LIVE prices)")
     hist = verdict.get("aggregates for one contract (HISTORY)")
     print(f"\nLive chain for a screener: {'yes' if live else 'NO'}")
