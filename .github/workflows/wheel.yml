@@ -1,0 +1,45 @@
+# Steps 1-3 and 8-9 for the watchlist: which tickers are set up, and how
+# often the rule has fired over the priceable window.
+# Writes nothing to the repository. Prices live in a gitignored database.
+
+name: wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Watchlist (your step 1)'
+        default: 'TQQQ,SOXL,SPXL'
+      drop:
+        description: 'Red-day threshold, percent'
+        default: '5'
+      clouds:
+        description: 'EMA cloud pairs'
+        default: '5/12,34/50'
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Arithmetic first
+        run: python3 wheel.py
+      - name: Report the watchlist
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          PRICE_DB: prices.db
+          TICKERS: ${{ inputs.tickers }}
+          DROP: ${{ inputs.drop }}
+          CLOUDS: ${{ inputs.clouds }}
+        run: |
+          if [ -z "${POLYGON_API_KEY}" ]; then
+            echo "::error::POLYGON_API_KEY is not set."
+            exit 1
+          fi
+          python3 wheel.py --report \
+            --tickers "${TICKERS:-TQQQ,SOXL,SPXL}" \
+            --drop "${DROP:-5}" \
+            --clouds "${CLOUDS:-5/12,34/50}"
