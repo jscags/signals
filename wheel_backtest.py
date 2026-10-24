@@ -134,7 +134,7 @@ def connect(path=None):
     return conn
 
 
-def _get(url, budget):
+def _once(url, budget):
     budget.spend()
     request = urllib.request.Request(url, headers={
         "User-Agent": market_data.USER_AGENT, "Accept": "application/json"})
@@ -150,6 +150,27 @@ def _get(url, budget):
         return None, {"error": f"{type(exc).__name__}: {exc}"}
 
 
+# Retried rather than cached. A 429 means "slow down", a 5xx means "not now",
+# and a dropped connection means nothing at all -- but the first version of
+# this module wrote every one of them into the cache as a contract with no
+# bars, which is this repo's oldest failure mode wearing new clothes: a
+# transport error recorded as an absence, permanently, and never retried.
+RETRY_STATUSES = (429, 500, 502, 503, 504, None)
+
+
+def _get(url, budget, tries=4):
+    status, data = _once(url, budget)
+    for attempt in range(1, tries):
+        if status not in RETRY_STATUSES:
+            break
+        back = PACE * (attempt + 1)
+        print(f"    http {status} -- backing off {back:.0f}s and retrying "
+              f"({attempt}/{tries - 1})")
+        time.sleep(back)
+        status, data = _once(url, budget)
+    return status, data
+
+
 def load_chain(conn, underlying, expiry, budget, key):
     """Strikes listed for one underlying and expiry. Cached."""
     row = conn.execute(
@@ -161,6 +182,12 @@ def load_chain(conn, underlying, expiry, budget, key):
                f"&expiration_date={expiry}&expired=true&limit=1000"
                f"&apiKey={key}")
         status, data = _get(url, budget)
+        if status != 200:
+            # NOT cached. A refused request is not an empty chain, and
+            # writing it as one would make every later run agree.
+            print(f"    chain {underlying} {expiry}: http {status} "
+                  f"-- not cached, will retry")
+            return []
         results = data.get("results") or []
         conn.executemany(
             "INSERT OR REPLACE INTO option_chain"
@@ -184,8 +211,10 @@ def load_contract(conn, contract, start, end, budget, key,
                   underlying=None, strike=None, expiry=None):
     """Daily bars for one contract over a range. Cached, including misses."""
     seen = conn.execute(
-        "SELECT status FROM option_meta WHERE contract = ?",
-        (contract,)).fetchone()
+        "SELECT status FROM option_meta WHERE contract = ?"
+        # FAILED is not a cache hit. Only an actual answer from the server --
+        # bars, or a 200 carrying none -- settles a contract.
+        " AND status IN ('OK','NONE')", (contract,)).fetchone()
     if seen is None:
         url = (f"https://api.polygon.io/v2/aggs/ticker/{contract}"
                f"/range/1/day/{start}/{end}?adjusted=true&sort=asc"
@@ -211,14 +240,20 @@ def load_contract(conn, contract, start, end, budget, key,
                 "INSERT OR REPLACE INTO option_bars (contract, day, open,"
                 " high, low, close, volume, vwap) VALUES (?,?,?,?,?,?,?,?)",
                 rows)
-        note = "" if rows else (data.get("message") or f"http {status}")[:120]
+        if status == 200:
+            state = "OK" if rows else "NONE"
+            note = "" if rows else "200 with no results -- never traded"
+        else:
+            state = "FAILED"
+            note = (data.get("message") or f"http {status}")[:120]
         conn.execute(
             "INSERT OR REPLACE INTO option_meta (contract, underlying, expiry,"
             " strike, status, n_days, fetched_at, note) VALUES (?,?,?,?,?,?,?,?)",
-            (contract, underlying, expiry, strike,
-             "OK" if rows else "EMPTY", len(rows),
+            (contract, underlying, expiry, strike, state, len(rows),
              datetime.now().isoformat(timespec="seconds"), note))
         conn.commit()
+        if state == "FAILED":
+            return []
     return conn.execute(
         "SELECT day, open, high, low, close, volume, vwap FROM option_bars"
         " WHERE contract = ? AND day >= ? AND day <= ? ORDER BY day",
@@ -393,6 +428,16 @@ def run(tickers, clouds, drop_pct, budget_limit, control=True,
         return 2
     budget = Budget(budget_limit)
     conn = connect()
+    # An earlier build of this module wrote transport errors into the cache
+    # as contracts with no bars. Those rows are indistinguishable from real
+    # answers by status alone, so any that carry an http note are cleared and
+    # will be asked again.
+    stale = conn.execute(
+        "DELETE FROM option_meta WHERE status = 'FAILED'"
+        " OR (status = 'EMPTY' AND note LIKE 'http %')").rowcount
+    conn.commit()
+    if stale:
+        print(f"cleared {stale} contract(s) cached from a failed request")
     # refresh() reads the window from the module, not from an argument, so
     # widening it is done here. The default asks for 700 days; the free tier
     # actually serves about 730, and on a two-year study those extra weeks
