@@ -542,7 +542,7 @@ def summarise(label, trades):
 
 def run(tickers, clouds, drop_pct, budget_limit, control="spread",
         target_yield=TARGET_YIELD, price_start=None,
-        on_assignment="realize"):
+        on_assignment="realize", save_to=None):
     if not POLYGON_KEY:
         print("POLYGON_API_KEY is not set.")
         return 2
@@ -644,6 +644,11 @@ def run(tickers, clouds, drop_pct, budget_limit, control="spread",
                       f" This repo has already been burned by a cell"
                       f" resting on n=2.")
 
+    if save_to:
+        save_findings(save_to, results, tickers, clouds, drop_pct,
+                      target_yield, on_assignment, conn)
+        print(f"\nwrote {save_to}")
+
     print(f"\n{'=' * 72}")
     print("SCOPE. Option history begins around October 2024, so every number")
     print("above comes from a period with no sustained bear market. The")
@@ -652,6 +657,46 @@ def run(tickers, clouds, drop_pct, budget_limit, control="spread",
     print("rising market, which is the only market that was available.")
     print(f"requests used: {budget.used}/{budget.limit}")
     return 0
+
+
+def save_findings(path, results, tickers, clouds, drop_pct, target_yield,
+                  on_assignment, conn):
+    """Write the summary to a committed JSON file.
+
+    The log is an artifact that expires; this is the finding. It carries its
+    own scope with it -- the window, the parameters, the assignment rule --
+    because a bare set of returns detached from the period it came from is
+    the thing most likely to be quoted back later as if it were general.
+    """
+    window = conn.execute(
+        "SELECT MIN(day), MAX(day) FROM prices WHERE ticker = ?",
+        (tickers[0],)).fetchone()
+    payload = {
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "params": {
+            "clouds": [list(c) for c in clouds],
+            "drop_pct": drop_pct,
+            "target_yield_pct": target_yield,
+            "dte_target": DTE_TARGET,
+            "profit_take": PROFIT_TAKE,
+            "on_assignment": on_assignment,
+        },
+        "window": {"first": window[0], "last": window[1]},
+        "scope_note": (
+            "Option history begins around October 2024. This window contains "
+            "no sustained bear market, so it cannot falsify a strategy whose "
+            "losses are all in the drawdown."),
+        "tickers": {},
+    }
+    for ticker, (filt, arms) in results.items():
+        payload["tickers"][ticker] = {
+            "filtered": filt,
+            "controls": {k: v for k, v in (arms or {}).items()},
+        }
+    with open(path, "w") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    return path
 
 
 def main():
@@ -667,6 +712,9 @@ def main():
                     choices=("spread", "shifted", "both", "none"),
                     help="which unfiltered comparison to run")
     ap.add_argument("--price-start", default=None)
+    ap.add_argument("--save", dest="save_to", default=None,
+                    metavar="PATH",
+                    help="write the summary to a JSON file for the page")
     ap.add_argument("--on-assignment", default="realize",
                     choices=("realize", "hold"),
                     help="realize books the loss at expiry; hold keeps the "
@@ -680,7 +728,8 @@ def main():
                control=None if args.control == "none" else args.control,
                target_yield=args.target_yield,
                price_start=args.price_start,
-               on_assignment=args.on_assignment)
+               on_assignment=args.on_assignment,
+               save_to=args.save_to)
 
 
 if __name__ == "__main__":

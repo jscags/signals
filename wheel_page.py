@@ -73,6 +73,22 @@ WHEEL_CSS = """
 .w-steps { font-size: 12.5px; line-height: 1.6; color: var(--muted); }
 .w-steps li { margin-bottom: 3px; }
 .w-steps .done { color: var(--ink); }
+.w-find { margin: 0 0 18px; }
+.w-find h2 { font-size: 13px; letter-spacing: .08em; text-transform: uppercase;
+             color: var(--muted); font-weight: 600; margin: 0 0 8px;
+             font-family: "IBM Plex Mono", monospace; }
+.w-find table { width: 100%; border-collapse: collapse; font-size: 12px;
+                font-family: "IBM Plex Mono", monospace; }
+.w-find th, .w-find td { text-align: right; padding: 3px 6px;
+                         border-bottom: 1px solid var(--rule);
+                         font-variant-numeric: tabular-nums; font-weight: 400; }
+.w-find thead th { color: var(--muted); font-size: 10px;
+                   letter-spacing: .06em; }
+.w-find tbody th { text-align: left; }
+.w-find tr.ctrl { color: var(--muted); }
+.w-find i { font-style: normal; color: var(--warm); }
+.w-scope { font-size: 11px; color: var(--muted); line-height: 1.55;
+           margin: 6px 0 0; }
 @media (max-width: 560px) { .w-grid { grid-template-columns: 1fr; } }
 """
 
@@ -125,6 +141,66 @@ def refresh_state(conn, tickers, clouds=wheel.CLOUDS, drop_pct=wheel.DROP_PCT,
     return out
 
 
+def render_findings(path="wheel_findings.json"):
+    """What the backtest found, on the page rather than in an expired log.
+
+    Rendered from the committed file so the page cannot quote a result the
+    repository does not contain, and so the scope travels with the numbers.
+    A missing file renders nothing at all: an absent backtest is not a
+    backtest that found nothing.
+    """
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    tickers = data.get("tickers") or {}
+    if not tickers:
+        return ""
+    params = data.get("params") or {}
+    window = data.get("window") or {}
+
+    rows = []
+    for ticker, block in sorted(tickers.items()):
+        filt = block.get("filtered")
+        if not filt:
+            continue
+        def cell(d):
+            if not d:
+                return "<td>—</td><td>—</td><td>—</td>"
+            open_n = d.get("open") or 0
+            flag = (f' <i>+{open_n} open</i>' if open_n else "")
+            return (f'<td>{d["n"]}{flag}</td>'
+                    f'<td>{d["median"]:+.2f}%</td>'
+                    f'<td>{d["sum"]:+.2f}%</td>')
+        hold = filt.get("hold_sum")
+        rows.append(
+            f'<tr><th>{ed.html.escape(ticker)} filtered</th>{cell(filt)}'
+            f'<td>{"—" if hold is None else f"{hold:+.2f}%"}</td></tr>')
+        for name, ctrl in sorted((block.get("controls") or {}).items()):
+            ch = (ctrl or {}).get("hold_sum")
+            rows.append(
+                f'<tr class="ctrl"><th>· control: {ed.html.escape(name)}</th>'
+                f'{cell(ctrl)}'
+                f'<td>{"—" if ch is None else f"{ch:+.2f}%"}</td></tr>')
+    if not rows:
+        return ""
+    return (
+        '<section class="w-find"><h2>What the backtest found</h2>'
+        '<table><thead><tr><th>arm</th><th>trades</th><th>median</th>'
+        '<th>sum</th><th>owning it instead</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table>'
+        f'<p class="w-scope">{ed.html.escape(window.get("first") or "?")} to '
+        f'{ed.html.escape(window.get("last") or "?")} · clouds '
+        f'{ed.html.escape(", ".join("/".join(map(str, c)) for c in params.get("clouds", [])))} '
+        f'· {params.get("drop_pct", "?")}% red day · '
+        f'{params.get("target_yield_pct", "?")}% target yield · on assignment: '
+        f'{ed.html.escape(str(params.get("on_assignment", "?")))}</p>'
+        f'<p class="w-scope"><b>Scope.</b> '
+        f'{ed.html.escape(data.get("scope_note", ""))}</p>'
+        '</section>')
+
+
 def render_card(row):
     """One ticker. The reason always travels with the verdict."""
     (ticker, as_of, close, move, green, qualifies, why, streak,
@@ -170,6 +246,7 @@ def write_page(conn, path="docs/wheel.html", clouds=wheel.CLOUDS,
     cards = "".join(render_card(tuple(r)) for r in rows)
     n_set = sum(1 for r in rows if r[11] == "OK" and r[5])
     gauges = ed.render_gauges(conn)
+    findings = render_findings()
     cloud_text = ", ".join(f"{f}/{s}" for f, s in clouds)
 
     steps = (
@@ -207,6 +284,7 @@ options chain, so steps 4–7 are a question for your broker. A premium
 modelled here would be the least reliable number on the page wearing the
 same typeface as the most reliable one.</p>
 <div class="w-grid">{cards}</div>
+{findings}
 {steps}
 </div></body></html>"""
     with open(path, "w") as fh:

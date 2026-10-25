@@ -30,6 +30,9 @@ on:
       on_assignment:
         description: 'realize books the loss; hold keeps the shares'
         default: 'realize'
+      save:
+        description: 'Commit wheel_findings.json so the page can show it'
+        default: 'false'
 
 jobs:
   backtest:
@@ -79,7 +82,24 @@ jobs:
             --budget "${BUDGET:-700}" \
             --control "${CONTROL:-spread}" \
             --on-assignment "${ON_ASSIGNMENT:-realize}" \
+            --save wheel_findings.json \
             --price-start 2024-10-20 2>&1 | tee backtest.log
+
+      # The log is an artifact that expires; the findings file is the
+      # record. Committed only when asked, because a backtest run to try a
+      # parameter should not quietly rewrite what the page claims.
+      - name: Commit the findings
+        if: ${{ inputs.save == 'true' }}
+        run: |
+          git config user.name  "discovery-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add wheel_findings.json
+          if git diff --staged --quiet; then
+            echo "findings unchanged"
+            exit 0
+          fi
+          git commit -m "wheel findings: $(date -u +%Y-%m-%d)"
+          git push
 
       - name: Keep the report
         if: always()
