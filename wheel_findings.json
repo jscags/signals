@@ -1,0 +1,67 @@
+{
+  "generated": "2026-10-25T12:31:35",
+  "params": {
+    "clouds": [
+      [
+        5,
+        12
+      ],
+      [
+        34,
+        50
+      ]
+    ],
+    "drop_pct": 5.0,
+    "dte_target": 30,
+    "on_assignment": "hold",
+    "profit_take": 0.5,
+    "target_yield_pct": 5.0
+  },
+  "scope_note": "Option history begins around October 2024. This window contains no sustained bear market, so it cannot falsify a strategy whose losses are all in the drawdown.",
+  "tickers": {
+    "SOXL": {
+      "controls": {
+        "shifted": {
+          "held": 459,
+          "hit": 100.0,
+          "hold_sum": 95.34153521213952,
+          "mean": 3.5407265011187716,
+          "median": 2.71,
+          "n": 21,
+          "open": 0,
+          "sum": 74.3552565234942,
+          "unrealised": 0,
+          "worst": 1.8958333333333335
+        },
+        "spread": {
+          "held": 290,
+          "hit": 100.0,
+          "hold_sum": 163.1689716810282,
+          "mean": 3.6860584065466986,
+          "median": 2.8617021276595747,
+          "n": 25,
+          "open": 0,
+          "sum": 92.15146016366747,
+          "unrealised": 0,
+          "worst": 0.33333333333332626
+        }
+      },
+      "filtered": {
+        "held": 262,
+        "hit": 100.0,
+        "hold_sum": 153.77387521491562,
+        "mean": 3.818769787846216,
+        "median": 3.2303370786516856,
+        "n": 24,
+        "open": 0,
+        "sum": 91.65047490830918,
+        "unrealised": 0,
+        "worst": 2.234375
+      }
+    }
+  },
+  "window": {
+    "first": "2024-10-24",
+    "last": "2026-10-23"
+  }
+}
