@@ -173,13 +173,25 @@ def render_findings(path="wheel_findings.json"):
         if not filt:
             continue
         def cell(d):
+            """The headline column is the HONEST total, not the realised one.
+
+            An arm with open positions reads +56.73% realised and -7.72% all
+            in. Letting the first of those lead the page would be the same
+            trick the harness was built to refuse, committed one layer up in
+            the presentation.
+            """
             if not d:
                 return "<td>—</td><td>—</td><td>—</td>"
             open_n = d.get("open") or 0
+            unreal = d.get("unrealised") or 0.0
             flag = (f' <i>+{open_n} open</i>' if open_n else "")
+            total = d["sum"] + unreal
+            shown = (f'{total:+.2f}%'
+                     + (f' <i>({d["sum"]:+.2f}% realised)</i>'
+                        if open_n else ""))
             return (f'<td>{d["n"]}{flag}</td>'
                     f'<td>{d["median"]:+.2f}%</td>'
-                    f'<td>{d["sum"]:+.2f}%</td>')
+                    f'<td>{shown}</td>')
         hold = filt.get("hold_sum")
         rows.append(
             f'<tr><th>{ed.html.escape(ticker)} filtered</th>{cell(filt)}'
@@ -195,7 +207,7 @@ def render_findings(path="wheel_findings.json"):
     return (
         '<section class="w-find"><h2>What the backtest found</h2>'
         '<table><thead><tr><th>arm</th><th>trades</th><th>median</th>'
-        '<th>sum</th><th>owning it instead</th></tr></thead>'
+        '<th>total incl. open</th><th>owning it instead</th></tr></thead>'
         f'<tbody>{"".join(rows)}</tbody></table>'
         f'<p class="w-scope">{ed.html.escape(window.get("first") or "?")} to '
         f'{ed.html.escape(window.get("last") or "?")} · clouds '
