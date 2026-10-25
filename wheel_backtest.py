@@ -279,7 +279,7 @@ def pick_expiry(conn, underlying, entry_day, budget, key):
 
 
 def simulate(conn, ticker, signal_day, bars_by_day, days, budget, key,
-             target_yield=TARGET_YIELD):
+             target_yield=TARGET_YIELD, on_assignment="realize"):
     """One trade from one signal. Returns a dict, or a dict saying why not."""
     i = days.index(signal_day)
     if i + 1 >= len(days):
@@ -351,6 +351,34 @@ def simulate(conn, ticker, signal_day, bars_by_day, days, budget, key,
             outcome = "assigned"
     pnl = best["premium"] - exit_price          # per share
     held = (date.fromisoformat(exit_day) - date.fromisoformat(entry_day)).days
+    still_open = False
+
+    # STEP 6's promise, tested rather than taken on trust: "if you get
+    # assigned, you're buying an ETF you already chose at the strike price you
+    # agreed to". Under on_assignment="hold" an assignment is not booked as a
+    # loss -- the shares are kept at a cost basis of strike minus premium and
+    # followed until they come back to it.
+    #
+    # This is the generous reading of the strategy and it is also the one that
+    # is easiest to fool yourself with, because a position that is never
+    # closed never shows a loss. So a holding that has not recovered by the
+    # end of the data is marked to market and flagged open, never counted as
+    # though it had been closed.
+    if outcome == "assigned" and on_assignment == "hold":
+        basis = best["strike"] - best["premium"]
+        after = [d for d in days if d > exit_day]
+        recovered = next(
+            (d for d in after if bars_by_day[d]["close"] >= basis), None)
+        if recovered:
+            close = bars_by_day[recovered]["close"]
+            exit_day, outcome = recovered, "assigned, recovered"
+        else:
+            close = bars_by_day[after[-1]]["close"] if after else under
+            exit_day = after[-1] if after else exit_day
+            outcome, still_open = "assigned, STILL HELD", True
+        pnl = close - basis
+        held = (date.fromisoformat(exit_day)
+                - date.fromisoformat(entry_day)).days
 
     # What the two alternatives did over the IDENTICAL days. Selling a put
     # caps the upside at the premium while keeping nearly all the downside,
@@ -370,7 +398,7 @@ def simulate(conn, ticker, signal_day, bars_by_day, days, budget, key,
         "exit_price": exit_price, "outcome": outcome,
         "pnl": pnl, "return_pct": pnl / best["strike"] * 100.0,
         "held_days": held, "contract": best["contract"],
-        "hold_pct": hold, "bench_pct": bench,
+        "hold_pct": hold, "bench_pct": bench, "still_open": still_open,
     }
 
 
@@ -449,13 +477,27 @@ def summarise(label, trades):
     if not done:
         print("  -- nothing priced, so nothing is claimed")
         return None
-    rets = sorted(t["return_pct"] for t in done)
+    # An open position is not a result. Folding a holding that has not come
+    # back into the same total as closed trades is the exact self-deception
+    # the hold-through-assignment rule invites, so they are split.
+    open_ = [t for t in done if t.get("still_open")]
+    closed = [t for t in done if not t.get("still_open")]
+    if not closed:
+        print(f"  all {len(open_)} position(s) still open -- nothing realised")
+        if open_:
+            marks = sorted(t["return_pct"] for t in open_)
+            print(f"  marked to market  : median {marks[len(marks) // 2]:+.2f}%"
+                  f"  worst {marks[0]:+.2f}%")
+        return None
+    rets = sorted(t["return_pct"] for t in closed)
     wins = [r for r in rets if r > 0]
     total = sum(rets)
-    held = sum(t["held_days"] for t in done)
+    held = sum(t["held_days"] for t in closed)
     outcomes = {}
     for t in done:
         outcomes[t["outcome"]] = outcomes.get(t["outcome"], 0) + 1
+    print(f"  closed            : {len(closed)}"
+          + (f"   STILL OPEN: {len(open_)}" if open_ else ""))
     print(f"  hit rate          : {len(wins)}/{len(rets)}"
           f" ({len(wins) / len(rets) * 100:.0f}%)   <- the misleading number")
     print(f"  median return     : {rets[len(rets) // 2]:+.2f}%")
@@ -465,8 +507,8 @@ def summarise(label, trades):
     print(f"  sum of returns    : {total:+.2f}%  (on capital secured per trade)")
     print(f"  capital-days used : {held}")
     # The alternatives, over exactly the days each trade was open.
-    holds = [t["hold_pct"] for t in done if t.get("hold_pct") is not None]
-    benches = [t["bench_pct"] for t in done if t.get("bench_pct") is not None]
+    holds = [t["hold_pct"] for t in closed if t.get("hold_pct") is not None]
+    benches = [t["bench_pct"] for t in closed if t.get("bench_pct") is not None]
     if holds:
         print(f"  -- owning it instead, same days: sum {sum(holds):+.2f}%,"
               f" median {sorted(holds)[len(holds) // 2]:+.2f}%"
@@ -477,17 +519,30 @@ def summarise(label, trades):
               f"  ({len(benches)}/{len(done)} priced)")
     for name, n in sorted(outcomes.items(), key=lambda kv: -kv[1]):
         print(f"      {n:3}  {name}")
+    if open_:
+        marks = sorted(t["return_pct"] for t in open_)
+        unreal = sum(marks)
+        print(f"  -- {len(open_)} position(s) STILL OPEN, marked to market:"
+              f" {unreal:+.2f}% unrealised, worst {marks[0]:+.2f}%")
+        print(f"     realised {total:+.2f}% and unrealised {unreal:+.2f}%"
+              f" together: {total + unreal:+.2f}%")
+        print(f"     capital still tied up in them:"
+              f" {sum(t['held_days'] for t in open_)} day(s)")
     losses = [r for r in rets if r <= 0]
     if losses:
         print(f"  losses total      : {sum(losses):+.2f}% across {len(losses)}")
         print(f"  wins total        : {sum(wins):+.2f}% across {len(wins)}")
     return {"n": len(rets), "median": rets[len(rets) // 2],
             "mean": total / len(rets), "worst": rets[0], "sum": total,
-            "hit": len(wins) / len(rets) * 100.0, "held": held}
+            "hit": len(wins) / len(rets) * 100.0, "held": held,
+            "open": len(open_),
+            "unrealised": sum(t["return_pct"] for t in open_),
+            "hold_sum": sum(holds) if holds else None}
 
 
 def run(tickers, clouds, drop_pct, budget_limit, control="spread",
-        target_yield=TARGET_YIELD, price_start=None):
+        target_yield=TARGET_YIELD, price_start=None,
+        on_assignment="realize"):
     if not POLYGON_KEY:
         print("POLYGON_API_KEY is not set.")
         return 2
@@ -515,6 +570,7 @@ def run(tickers, clouds, drop_pct, budget_limit, control="spread",
         conn, list(tickers) + [market_data.BENCHMARK])
     print(f"underlying prices: {fetched} fetched, {cached} cached,"
           f" {failed} failed  (from {market_data.HISTORY_START})")
+    print(f"on assignment: {on_assignment}")
 
     results = {}
     for ticker in tickers:
@@ -534,7 +590,8 @@ def run(tickers, clouds, drop_pct, budget_limit, control="spread",
         for day in signals:
             try:
                 trades.append(simulate(conn, ticker, day, by_day, days,
-                                       budget, POLYGON_KEY, target_yield))
+                                       budget, POLYGON_KEY, target_yield,
+                                       on_assignment))
             except RuntimeError as exc:
                 print(f"  stopped early: {exc}")
                 break
@@ -556,7 +613,7 @@ def run(tickers, clouds, drop_pct, budget_limit, control="spread",
                     try:
                         trades_c.append(simulate(conn, ticker, day, by_day,
                                                  days, budget, POLYGON_KEY,
-                                                 target_yield))
+                                                 target_yield, on_assignment))
                     except RuntimeError as exc:
                         print(f"  control {name} stopped early: {exc}")
                         break
@@ -610,6 +667,11 @@ def main():
                     choices=("spread", "shifted", "both", "none"),
                     help="which unfiltered comparison to run")
     ap.add_argument("--price-start", default=None)
+    ap.add_argument("--on-assignment", default="realize",
+                    choices=("realize", "hold"),
+                    help="realize books the loss at expiry; hold keeps the "
+                         "shares at strike minus premium and follows them "
+                         "back to that basis -- step 6's own promise")
     args = ap.parse_args()
     clouds = tuple(tuple(int(n) for n in p.split("/"))
                    for p in args.clouds.split(","))
@@ -617,7 +679,8 @@ def main():
     return run(tickers, clouds, args.drop, args.budget,
                control=None if args.control == "none" else args.control,
                target_yield=args.target_yield,
-               price_start=args.price_start)
+               price_start=args.price_start,
+               on_assignment=args.on_assignment)
 
 
 if __name__ == "__main__":
