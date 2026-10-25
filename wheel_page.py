@@ -154,11 +154,18 @@ def render_findings(path="wheel_findings.json"):
             data = json.load(fh)
     except (OSError, ValueError):
         return ""
-    tickers = data.get("tickers") or {}
+    runs = data.get("runs") or {}
+    if not runs:
+        return ""
+    # The most realistic rule leads; the others are shown beneath it because
+    # the disagreement between them is the point.
+    order = [k for k in ("wheel", "hold", "realize") if k in runs]
+    lead = runs[order[0]]
+    tickers = lead.get("tickers") or {}
     if not tickers:
         return ""
-    params = data.get("params") or {}
-    window = data.get("window") or {}
+    params = lead.get("params") or {}
+    window = lead.get("window") or {}
 
     rows = []
     for ticker, block in sorted(tickers.items()):
@@ -196,9 +203,38 @@ def render_findings(path="wheel_findings.json"):
         f'· {params.get("drop_pct", "?")}% red day · '
         f'{params.get("target_yield_pct", "?")}% target yield · on assignment: '
         f'{ed.html.escape(str(params.get("on_assignment", "?")))}</p>'
-        f'<p class="w-scope"><b>Scope.</b> '
-        f'{ed.html.escape(data.get("scope_note", ""))}</p>'
+        + _rule_rows(runs, order)
+        + f'<p class="w-scope"><b>Scope.</b> '
+        f'{ed.html.escape(lead.get("scope_note", ""))}</p>'
         '</section>')
+
+
+def _rule_rows(runs, order):
+    """The same trades under each assignment rule, which disagree."""
+    if len(order) < 2:
+        return ""
+    out = []
+    for rule in order:
+        block = (runs[rule].get("tickers") or {})
+        for ticker, arms in sorted(block.items()):
+            for name, d in [("filtered", arms.get("filtered"))] + sorted(
+                    (arms.get("controls") or {}).items()):
+                if not d:
+                    continue
+                open_n = d.get("open") or 0
+                unreal = d.get("unrealised") or 0.0
+                unreal_txt = f"{unreal:+.2f}% ({open_n})"
+                total = d["sum"] + unreal
+                out.append(
+                    f'<tr><th>{ed.html.escape(rule)} · '
+                    f'{ed.html.escape(ticker)} {ed.html.escape(name)}</th>'
+                    f'<td>{d["n"]}</td><td>{d["sum"]:+.2f}%</td>'
+                    f'<td>{"—" if not open_n else unreal_txt}</td>'
+                    f'<td>{total:+.2f}%</td></tr>')
+    return ("<h2>The same trades under each assignment rule</h2>"
+            "<table><thead><tr><th>rule · arm</th><th>n</th>"
+            "<th>realised</th><th>open</th><th>honest total</th></tr></thead>"
+            f"<tbody>{''.join(out)}</tbody></table>")
 
 
 def render_card(row):

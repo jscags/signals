@@ -793,8 +793,19 @@ def save_findings(path, results, tickers, clouds, drop_pct, target_yield,
             "filtered": filt,
             "controls": {k: v for k, v in (arms or {}).items()},
         }
+    # Merged by assignment rule rather than overwritten. The comparison
+    # BETWEEN the rules is the finding -- realize, hold and wheel give three
+    # different answers on the same trades -- and a file that keeps only the
+    # last one run would hide exactly that.
+    try:
+        with open(path) as fh:
+            existing = json.load(fh)
+    except (OSError, ValueError):
+        existing = {}
+    runs = existing.get("runs") or {}
+    runs[on_assignment] = payload
     with open(path, "w") as fh:
-        json.dump(payload, fh, indent=2, sort_keys=True)
+        json.dump({"runs": runs}, fh, indent=2, sort_keys=True)
         fh.write("\n")
     return path
 
