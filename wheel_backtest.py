@@ -92,22 +92,52 @@ CREATE TABLE IF NOT EXISTS option_meta (
     status     TEXT, n_days INTEGER, fetched_at TEXT, note TEXT
 );
 
--- The listed chain for one underlying and expiry, cached the same way.
+-- The listed chain for one underlying, expiry and side, cached the same way.
+-- `kind` is part of the key: the full wheel sells calls after assignment, and
+-- without it a cached put chain would be served for a call request and the
+-- covered-call leg would silently trade puts.
 CREATE TABLE IF NOT EXISTS option_chain (
     underlying TEXT NOT NULL,
     expiry     TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'put',
     strike     REAL NOT NULL,
     contract   TEXT NOT NULL,
-    PRIMARY KEY (underlying, expiry, strike)
+    PRIMARY KEY (underlying, expiry, kind, strike)
 );
 CREATE TABLE IF NOT EXISTS chain_meta (
     underlying TEXT NOT NULL,
     expiry     TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'put',
     n          INTEGER,
     fetched_at TEXT,
-    PRIMARY KEY (underlying, expiry)
+    PRIMARY KEY (underlying, expiry, kind)
 );
 """
+
+
+def migrate_chains(conn):
+    """Add `kind` to the chain tables without discarding the cache.
+
+    CREATE TABLE IF NOT EXISTS will not widen a primary key, so an older
+    database keeps the two-column one and every call chain would collide with
+    the put chain for the same expiry. The cache behind these tables cost an
+    hour and a half of paced requests, so it is migrated rather than dropped.
+    Everything already in it is a put, which is what the default records.
+    """
+    for table in ("option_chain", "chain_meta"):
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+        if not cols or "kind" in cols:
+            continue
+        conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
+        conn.executescript(SCHEMA)
+        shared = ", ".join(c for c in cols)
+        conn.execute(
+            f"INSERT OR IGNORE INTO {table} ({shared}, kind)"
+            f" SELECT {shared}, 'put' FROM {table}_old")
+        n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        conn.execute(f"DROP TABLE {table}_old")
+        conn.commit()
+        print(f"migrated {table}: {n} row(s) kept, tagged as puts")
 
 
 class Budget:
@@ -130,6 +160,8 @@ class Budget:
 
 def connect(path=None):
     conn = market_data.connect(path)
+    conn.executescript(SCHEMA)
+    migrate_chains(conn)
     conn.executescript(SCHEMA)
     return conn
 
@@ -171,40 +203,40 @@ def _get(url, budget, tries=4):
     return status, data
 
 
-def load_chain(conn, underlying, expiry, budget, key):
-    """Strikes listed for one underlying and expiry. Cached."""
+def load_chain(conn, underlying, expiry, budget, key, kind="put"):
+    """Strikes listed for one underlying, expiry and side. Cached."""
     row = conn.execute(
-        "SELECT n FROM chain_meta WHERE underlying = ? AND expiry = ?",
-        (underlying, expiry)).fetchone()
+        "SELECT n FROM chain_meta WHERE underlying = ? AND expiry = ?"
+        " AND kind = ?", (underlying, expiry, kind)).fetchone()
     if row is None:
         url = ("https://api.polygon.io/v3/reference/options/contracts"
-               f"?underlying_ticker={underlying}&contract_type=put"
+               f"?underlying_ticker={underlying}&contract_type={kind}"
                f"&expiration_date={expiry}&expired=true&limit=1000"
                f"&apiKey={key}")
         status, data = _get(url, budget)
         if status != 200:
             # NOT cached. A refused request is not an empty chain, and
             # writing it as one would make every later run agree.
-            print(f"    chain {underlying} {expiry}: http {status} "
+            print(f"    chain {underlying} {expiry} {kind}: http {status} "
                   f"-- not cached, will retry")
             return []
         results = data.get("results") or []
         conn.executemany(
             "INSERT OR REPLACE INTO option_chain"
-            " (underlying, expiry, strike, contract) VALUES (?,?,?,?)",
-            [(underlying, expiry, float(c["strike_price"]), c["ticker"])
+            " (underlying, expiry, kind, strike, contract) VALUES (?,?,?,?,?)",
+            [(underlying, expiry, kind, float(c["strike_price"]), c["ticker"])
              for c in results
              if c.get("strike_price") is not None and c.get("ticker")])
         conn.execute(
-            "INSERT OR REPLACE INTO chain_meta (underlying, expiry, n,"
-            " fetched_at) VALUES (?,?,?,?)",
-            (underlying, expiry, len(results),
+            "INSERT OR REPLACE INTO chain_meta (underlying, expiry, kind, n,"
+            " fetched_at) VALUES (?,?,?,?,?)",
+            (underlying, expiry, kind, len(results),
              datetime.now().isoformat(timespec="seconds")))
         conn.commit()
     return conn.execute(
         "SELECT strike, contract FROM option_chain"
-        " WHERE underlying = ? AND expiry = ? ORDER BY strike",
-        (underlying, expiry)).fetchall()
+        " WHERE underlying = ? AND expiry = ? AND kind = ? ORDER BY strike",
+        (underlying, expiry, kind)).fetchall()
 
 
 def load_contract(conn, contract, start, end, budget, key,
@@ -260,7 +292,7 @@ def load_contract(conn, contract, start, end, budget, key,
         (contract, start, end)).fetchall()
 
 
-def pick_expiry(conn, underlying, entry_day, budget, key):
+def pick_expiry(conn, underlying, entry_day, budget, key, kind="put"):
     """The listed expiry nearest DTE_TARGET days after entry.
 
     Expiries are probed rather than listed, because the contracts endpoint
@@ -272,7 +304,7 @@ def pick_expiry(conn, underlying, entry_day, budget, key):
     friday = target + timedelta(days=(4 - target.weekday()) % 7)
     for shift in (0, -7, 7, -14, 14):
         candidate = (friday + timedelta(days=shift)).isoformat()
-        chain = load_chain(conn, underlying, candidate, budget, key)
+        chain = load_chain(conn, underlying, candidate, budget, key, kind)
         if chain:
             return candidate, chain
     return None, []
@@ -364,7 +396,14 @@ def simulate(conn, ticker, signal_day, bars_by_day, days, budget, key,
     # closed never shows a loss. So a holding that has not recovered by the
     # end of the data is marked to market and flagged open, never counted as
     # though it had been closed.
-    if outcome == "assigned" and on_assignment == "hold":
+    if outcome == "assigned" and on_assignment == "wheel":
+        basis = best["strike"] - best["premium"]
+        pnl_sh, exit_day, outcome, cycles, still_open = covered_calls(
+            conn, ticker, basis, exit_day, days, bars_by_day, budget, key)
+        pnl = pnl_sh
+        held = (date.fromisoformat(exit_day)
+                - date.fromisoformat(entry_day)).days
+    elif outcome == "assigned" and on_assignment == "hold":
         basis = best["strike"] - best["premium"]
         after = [d for d in days if d > exit_day]
         recovered = next(
@@ -400,6 +439,67 @@ def simulate(conn, ticker, signal_day, bars_by_day, days, budget, key,
         "held_days": held, "contract": best["contract"],
         "hold_pct": hold, "bench_pct": bench, "still_open": still_open,
     }
+
+
+MAX_CALL_CYCLES = 12        # a year of monthlies; past that it is not a trade
+
+
+def covered_calls(conn, ticker, basis, from_day, days, bars_by_day,
+                  budget, key):
+    """Sell 30-day calls against assigned shares until called away.
+
+    The full wheel. After assignment you hold shares at `basis`; each cycle
+    sells a call and collects premium, which lowers the basis. If the
+    underlying finishes above the call strike the shares go at that strike
+    and the trade is over; otherwise the premium is kept and another call is
+    sold.
+
+    The strike is the lowest listed one AT OR ABOVE the current basis. That
+    is the rule wheel sellers actually describe -- never sell a call that
+    would force you to crystallise a loss on the shares -- and it is also
+    what makes the upside cap real: as the basis falls with each premium, the
+    strike you are willing to sell at falls with it, so a recovery gets sold
+    into earlier and earlier.
+
+    Returns (pnl_per_share, exit_day, outcome, n_cycles, still_open).
+    """
+    collected = 0.0
+    day = from_day
+    for cycle in range(MAX_CALL_CYCLES):
+        expiry, chain = pick_expiry(conn, ticker, day, budget, key, "call")
+        if not chain or expiry <= day:
+            break
+        above = [r for r in chain if r["strike"] >= basis - collected]
+        if not above:
+            break
+        picked = None
+        for row in above[:3]:       # nearest three at or above the basis
+            bars = load_contract(conn, row["contract"], day, expiry, budget,
+                                 key, ticker, row["strike"], expiry)
+            first = next((b for b in bars if b["day"] >= day), None)
+            if first and first["close"] > 0:
+                picked = (row["strike"], first["close"])
+                break
+        if picked is None:
+            break
+        strike, premium = picked
+        collected += premium
+        last = max((d for d in days if d <= expiry), default=None)
+        if last is None:
+            break
+        under = bars_by_day[last]["close"]
+        if under >= strike:
+            # Called away. The shares go at the strike, not at the market --
+            # this is where the cap bites, and the bigger the recovery the
+            # more of it is left on the table.
+            pnl = (strike - basis) + collected
+            return pnl, last, f"called away after {cycle + 1} call(s)", \
+                cycle + 1, False
+        day = last
+    # Never called away inside the data. Marked to market, flagged open.
+    last = days[-1]
+    pnl = (bars_by_day[last]["close"] - basis) + collected
+    return pnl, last, "wheeling, STILL HELD", MAX_CALL_CYCLES, True
 
 
 def benchmark_return(conn, start_day, end_day):
@@ -716,10 +816,11 @@ def main():
                     metavar="PATH",
                     help="write the summary to a JSON file for the page")
     ap.add_argument("--on-assignment", default="realize",
-                    choices=("realize", "hold"),
+                    choices=("realize", "hold", "wheel"),
                     help="realize books the loss at expiry; hold keeps the "
                          "shares at strike minus premium and follows them "
-                         "back to that basis -- step 6's own promise")
+                         "back to that basis; wheel sells covered calls "
+                         "against them until called away")
     args = ap.parse_args()
     clouds = tuple(tuple(int(n) for n in p.split("/"))
                    for p in args.clouds.split(","))

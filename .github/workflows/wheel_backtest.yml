@@ -33,7 +33,7 @@ on:
         description: 'Unfiltered comparison: spread, shifted, both or none'
         default: 'spread'
       on_assignment:
-        description: 'realize books the loss; hold keeps the shares'
+        description: 'realize | hold | wheel (covered calls after assignment)'
         default: 'realize'
       save:
         description: 'Commit wheel_findings.json so the page can show it'
