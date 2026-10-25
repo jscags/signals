@@ -6,6 +6,11 @@
 
 name: wheel-backtest
 
+# The commit step needs this. Without it the run reads fine and fails at
+# the push, which is how the first save attempt died.
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
