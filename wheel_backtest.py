@@ -613,8 +613,17 @@ def summarise(label, trades):
           f" ({len(wins) / len(rets) * 100:.0f}%)   <- the misleading number")
     print(f"  median return     : {rets[len(rets) // 2]:+.2f}%")
     print(f"  mean return       : {total / len(rets):+.2f}%")
-    print(f"  WORST             : {rets[0]:+.2f}%"
-          f"   best {rets[-1]:+.2f}%")
+    # WORST spans closed AND open. An open position marked below every
+    # closed trade is the worst thing that happened, and a column that
+    # excluded it would report the tail as better than it was -- which is
+    # the same omission, one statistic along, that the realised/open split
+    # exists to prevent.
+    all_marks = rets + sorted(t["return_pct"] for t in open_)
+    worst_all = min(all_marks)
+    print(f"  WORST             : {worst_all:+.2f}%"
+          + (f"  (closed only: {rets[0]:+.2f}%)"
+             if open_ and worst_all != rets[0] else "")
+          + f"   best {rets[-1]:+.2f}%")
     print(f"  sum of returns    : {total:+.2f}%  (on capital secured per trade)")
     print(f"  capital-days used : {held}")
     ys = sorted(t["yield_pct"] for t in closed if t.get("yield_pct") is not None)
@@ -655,7 +664,7 @@ def summarise(label, trades):
         print(f"  losses total      : {sum(losses):+.2f}% across {len(losses)}")
         print(f"  wins total        : {sum(wins):+.2f}% across {len(wins)}")
     return {"n": len(rets), "median": rets[len(rets) // 2],
-            "mean": total / len(rets), "worst": rets[0], "sum": total,
+            "mean": total / len(rets), "worst": worst_all, "sum": total,
             "hit": len(wins) / len(rets) * 100.0, "held": held,
             "open": len(open_),
             "yield_med": ys[len(ys) // 2] if ys else None,
