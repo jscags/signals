@@ -334,8 +334,19 @@ def simulate(conn, ticker, signal_day, bars_by_day, days, budget, key,
     if not below:
         return {"signal": signal_day, "entry": entry_day, "expiry": expiry,
                 "skipped": f"no strikes within 30% of spot {spot:.2f}"}
-    step = max(1, len(below) // N_CANDIDATES)
-    candidates = below[::step][-N_CANDIDATES:]
+    # Spread the candidates across the WHOLE range, not the top of it.
+    # The previous form sampled evenly and then kept the last six, which are
+    # the six nearest the money -- fine for a 5% target and useless for a
+    # sweep, because a 2% target would never see a strike far enough out to
+    # match it and would silently settle for 4%. A sweep whose arms all pick
+    # the same strike measures nothing.
+    if len(below) <= N_CANDIDATES:
+        candidates = list(below)
+    else:
+        last = len(below) - 1
+        picks = sorted({round(i * last / (N_CANDIDATES - 1))
+                        for i in range(N_CANDIDATES)})
+        candidates = [below[i] for i in picks]
 
     best, tried, empty = None, 0, 0
     for row in candidates:
@@ -606,6 +617,17 @@ def summarise(label, trades):
           f"   best {rets[-1]:+.2f}%")
     print(f"  sum of returns    : {total:+.2f}%  (on capital secured per trade)")
     print(f"  capital-days used : {held}")
+    ys = sorted(t["yield_pct"] for t in closed if t.get("yield_pct") is not None)
+    os_ = sorted(t["otm_pct"] for t in closed if t.get("otm_pct") is not None)
+    if ys:
+        print(f"  strike actually sold: median yield "
+              f"{ys[len(ys) // 2]:.2f}% of strike, "
+              f"{os_[len(os_) // 2]:+.1f}% out of the money"
+              if os_ else "")
+    assigned = sum(1 for t in done
+                   if "assigned" in (t.get("outcome") or ""))
+    print(f"  assignment rate   : {assigned}/{len(done)}"
+          f" ({assigned / len(done) * 100:.0f}%)")
     # The alternatives, over exactly the days each trade was open.
     holds = [t["hold_pct"] for t in closed if t.get("hold_pct") is not None]
     benches = [t["bench_pct"] for t in closed if t.get("bench_pct") is not None]
@@ -636,6 +658,9 @@ def summarise(label, trades):
             "mean": total / len(rets), "worst": rets[0], "sum": total,
             "hit": len(wins) / len(rets) * 100.0, "held": held,
             "open": len(open_),
+            "yield_med": ys[len(ys) // 2] if ys else None,
+            "otm_med": os_[len(os_) // 2] if os_ else None,
+            "assigned": assigned,
             "unrealised": sum(t["return_pct"] for t in open_),
             "hold_sum": sum(holds) if holds else None}
 
@@ -810,6 +835,73 @@ def save_findings(path, results, tickers, clouds, drop_pct, target_yield,
     return path
 
 
+def sweep(tickers, clouds, drop_pct, budget_limit, targets,
+          on_assignment="hold", price_start=None):
+    """The same entries at a range of strike distances.
+
+    Entry timing barely moved the result; moneyness is the dial that should.
+    Everything is held fixed except the premium the strike has to pay, so
+    the only thing varying is how far out of the money the put is sold.
+
+    The candidate CONTRACTS are identical across targets -- only which one
+    gets picked changes -- so after the first pass this costs almost nothing.
+    """
+    if not POLYGON_KEY:
+        print("POLYGON_API_KEY is not set.")
+        return 2
+    budget = Budget(budget_limit)
+    conn = connect()
+    if price_start:
+        market_data.HISTORY_START = price_start
+    market_data.refresh(conn, list(tickers) + [market_data.BENCHMARK])
+    print(f"on assignment: {on_assignment}\n")
+
+    table = []
+    for ticker in tickers:
+        bars = wheel.load_bars(conn, ticker)
+        if not bars:
+            print(f"{ticker}: NO PRICE DATA")
+            continue
+        rows = wheel.evaluate(bars, clouds, drop_pct)
+        days = [r["day"] for r in rows]
+        by_day = {b[0]: {"close": float(b[4])} for b in bars}
+        signals = [r["day"] for r in rows if r["qualifies"]]
+        for target in targets:
+            trades = []
+            for day in signals:
+                try:
+                    trades.append(simulate(conn, ticker, day, by_day, days,
+                                           budget, POLYGON_KEY, target,
+                                           on_assignment))
+                except RuntimeError as exc:
+                    print(f"  stopped early: {exc}")
+                    break
+            res = summarise(f"{ticker} @ target {target:g}% of strike", trades)
+            if res:
+                res["target"] = target
+                res["ticker"] = ticker
+                table.append(res)
+            print(f"  requests used: {budget.used}/{budget.limit}")
+
+    print(f"\n{'=' * 78}\nSTRIKE DISTANCE SWEEP\n{'=' * 78}")
+    print(f"{'target':>7} {'got':>7} {'OTM':>7} {'n':>4} {'assign':>7} "
+          f"{'median':>8} {'worst':>9} {'total':>9} {'owning it':>10}")
+    for r in table:
+        total = r["sum"] + (r.get("unrealised") or 0.0)
+        print(f"{r['target']:>6.0f}% "
+              f"{(r['yield_med'] or 0):>6.2f}% "
+              f"{(r['otm_med'] or 0):>+6.1f}% "
+              f"{r['n']:>4} "
+              f"{r['assigned']:>3}/{r['n']:<3} "
+              f"{r['median']:>+7.2f}% "
+              f"{r['worst']:>+8.2f}% "
+              f"{total:>+8.2f}% "
+              f"{(r.get('hold_sum') or 0):>+9.2f}%")
+    print("\nIf 'got' does not track 'target', the chain had nothing that far")
+    print("out and the arm is not testing what it was asked to test.")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--tickers", default="SOXL,TQQQ,SPXL")
@@ -823,6 +915,9 @@ def main():
                     choices=("spread", "shifted", "both", "none"),
                     help="which unfiltered comparison to run")
     ap.add_argument("--price-start", default=None)
+    ap.add_argument("--yield-sweep", default=None,
+                    help="comma-separated premium/strike targets to compare, "
+                         "e.g. 2,3,4,5,6,8,10")
     ap.add_argument("--save", dest="save_to", default=None,
                     metavar="PATH",
                     help="write the summary to a JSON file for the page")
@@ -836,6 +931,11 @@ def main():
     clouds = tuple(tuple(int(n) for n in p.split("/"))
                    for p in args.clouds.split(","))
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+    if args.yield_sweep:
+        targets = [float(x) for x in args.yield_sweep.split(",") if x.strip()]
+        return sweep(tickers, clouds, args.drop, args.budget, targets,
+                     on_assignment=args.on_assignment,
+                     price_start=args.price_start)
     return run(tickers, clouds, args.drop, args.budget,
                control=None if args.control == "none" else args.control,
                target_yield=args.target_yield,
