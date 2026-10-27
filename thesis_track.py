@@ -191,6 +191,21 @@ CONCEPTS = {
                     "AccountsReceivableNet"],
 }
 
+# A FLOW is measured over a span (capex, revenue); a STOCK is measured at an
+# instant (inventory, receivables). They are not interchangeable and the
+# distinction is not cosmetic: four quarters of a flow SUM to a year, while
+# four quarters of a stock do not sum to anything at all.
+#
+# It matters for a second reason. A filer tags revenue for the quarter AND
+# for the full year, and both rows carry the same period end. Reading them
+# alike -- which this module did -- lets an annual row stand in for a
+# quarter, so a trailing-four-quarter sum can quietly carry closer to seven
+# quarters of revenue. The growth rate computed from it is then wrong in a
+# way that still looks like a plausible percentage.
+KIND = {"capex": "flow", "revenue": "flow",
+        "inventory": "stock", "receivables": "stock"}
+QUARTER_DAYS = (60, 120)       # a reported quarter, generously bounded
+
 
 def _facts(cik, cache):
     """companyfacts for one issuer, fetched once per run."""
@@ -200,13 +215,29 @@ def _facts(cik, cache):
     return cache[cik]
 
 
-def _series(payload, names, today):
+def _span_days(start, end):
+    """Length of a reported period, or None for an instant."""
+    if not start:
+        return None
+    try:
+        return (date.fromisoformat(end) - date.fromisoformat(start)).days
+    except ValueError:
+        return None
+
+
+def _series(payload, names, today, kind="flow"):
     """Dated values for the first tag that has any, point in time.
 
     Point in time means a fact counts from the date it was FILED, never the
     date its period ended. A quarter ending in June and filed in August was
     not knowable in July, and letting it be is the look-ahead that makes a
     backtest lie. Same discipline setup_pit enforces for the setup rule.
+
+    A flow keeps only QUARTERLY rows and a stock keeps only instants, so an
+    annual row can never stand in for a quarter. Without that filter the
+    annual and quarterly facts for the same period end are indistinguishable
+    here, the later-filed one wins, and a four-quarter sum silently carries
+    more than four quarters.
     """
     facts = ((payload or {}).get("facts") or {}).get("us-gaap") or {}
     for name in names:
@@ -220,6 +251,13 @@ def _series(payload, names, today):
                 continue
             if filed > today:
                 continue                      # not knowable yet
+            span = _span_days(fact.get("start"), end)
+            if kind == "flow":
+                if span is None or not (
+                        QUARTER_DAYS[0] <= span <= QUARTER_DAYS[1]):
+                    continue                  # annual, or an instant
+            elif span is not None:
+                continue                      # a stock has no span
             out.append((end, filed, float(val), fact.get("fp"),
                         fact.get("form")))
         if out:
@@ -232,13 +270,22 @@ def _series(payload, names, today):
     return None, []
 
 
-def _ttm_yoy(series):
-    """Trailing-four-quarter sum, and its year-over-year growth."""
-    if len(series) < 8:
-        return None, None, f"only {len(series)} periods, need 8"
+def _ttm_yoy(series, kind="flow"):
+    """Year-over-year growth, computed the way the quantity allows.
+
+    A flow is summed over four quarters and compared with the four before
+    it. A stock is NOT summed -- four quarter-end inventory balances do not
+    add up to a year of inventory -- so the latest balance is compared with
+    the balance four quarters earlier.
+    """
+    need = 8 if kind == "flow" else 5
+    if len(series) < need:
+        return None, None, f"only {len(series)} periods, need {need}"
     vals = [v for _e, v in series]
-    now = sum(vals[-4:])
-    prior = sum(vals[-8:-4])
+    if kind == "flow":
+        now, prior = sum(vals[-4:]), sum(vals[-8:-4])
+    else:
+        now, prior = vals[-1], vals[-5]
     if not prior:
         return now, None, "prior-year base is zero"
     return now, (now - prior) / abs(prior) * 100.0, None
@@ -256,7 +303,7 @@ def eval_capex(trigger, today, cache):
         if outcome != setup_pit.OK:
             failed.append(f"{name}:{outcome}")
             continue
-        tag, series = _series(payload, CONCEPTS["capex"], today)
+        tag, series = _series(payload, CONCEPTS["capex"], today, "flow")
         if len(series) < 8:
             failed.append(f"{name}:thin({len(series)})")
             continue
@@ -293,10 +340,10 @@ def eval_divergence(trigger, today, cache, left, right, unit="pp"):
         if outcome != setup_pit.OK:
             failed.append(f"{name}:{outcome}")
             continue
-        _lt, ls = _series(payload, CONCEPTS[left], today)
-        _rt, rs = _series(payload, CONCEPTS[right], today)
-        _n1, lg, e1 = _ttm_yoy(ls)
-        _n2, rg, e2 = _ttm_yoy(rs)
+        _lt, ls = _series(payload, CONCEPTS[left], today, KIND[left])
+        _rt, rs = _series(payload, CONCEPTS[right], today, KIND[right])
+        _n1, lg, e1 = _ttm_yoy(ls, KIND[left])
+        _n2, rg, e2 = _ttm_yoy(rs, KIND[right])
         if lg is None or rg is None:
             failed.append(f"{name}:{e1 or e2}")
             continue
@@ -314,6 +361,62 @@ def eval_divergence(trigger, today, cache, left, right, unit="pp"):
     return state, worst, detail, (
         f"widest gap {worst:+.1f}{unit} "
         f"({max(detail, key=detail.get)}){note}")
+
+
+def eval_dso(trigger, today, cache):
+    """Days sales outstanding, and its year-over-year change IN DAYS.
+
+    This trigger was pre-registered as 'dso_change_days > 15'. It was being
+    evaluated as receivables growth minus revenue growth, in percentage
+    points, compared against that same 15 -- two different quantities
+    sharing a number. It fired on its first live run at '+48.8pp', which is
+    not a count of days and never was.
+
+    The threshold is not moved to match what the code computed. The
+    pre-registration said days, so the code computes days: receivables
+    divided by revenue per day, where revenue per day is the trailing four
+    quarters over 365.
+    """
+    ciks = trigger.get("ciks") or {}
+    if not ciks:
+        return STALE, None, {}, "no ciks named"
+    import setup_pit
+    detail, worst, failed = {}, None, []
+    for name, cik in ciks.items():
+        payload, outcome = _facts(int(cik), cache)
+        if outcome != setup_pit.OK:
+            failed.append(f"{name}:{outcome}")
+            continue
+        _rt, ar = _series(payload, CONCEPTS["receivables"], today, "stock")
+        _vt, rev = _series(payload, CONCEPTS["revenue"], today, "flow")
+        if len(ar) < 5 or len(rev) < 8:
+            failed.append(f"{name}:thin(ar={len(ar)},rev={len(rev)})")
+            continue
+        rv = [v for _e, v in rev]
+        now_rev, prior_rev = sum(rv[-4:]), sum(rv[-8:-4])
+        if not now_rev or not prior_rev:
+            failed.append(f"{name}:zero-revenue-base")
+            continue
+        av = [v for _e, v in ar]
+        dso_now = av[-1] / (now_rev / 365.0)
+        dso_prior = av[-5] / (prior_rev / 365.0)
+        change = dso_now - dso_prior
+        detail[name] = {"dso": round(dso_now, 1),
+                        "dso_prior": round(dso_prior, 1),
+                        "change_days": round(change, 1)}
+        worst = change if worst is None else max(worst, change)
+    if worst is None:
+        return STALE, None, detail, (
+            f"no issuer evaluable ({'; '.join(failed)})")
+    threshold = _threshold(trigger["fires_when"])
+    if threshold is None:
+        return STALE, worst, detail, "could not parse fires_when"
+    note = f"; could not read {', '.join(failed)}" if failed else ""
+    widest = max(detail, key=lambda k: detail[k]["change_days"])
+    return (FIRED if worst > threshold else DORMANT), worst, detail, (
+        f"widest DSO change {worst:+.1f} days ({widest}: "
+        f"{detail[widest]['dso_prior']:.0f} to "
+        f"{detail[widest]['dso']:.0f}){note}")
 
 
 def _threshold(expr):
@@ -338,9 +441,7 @@ HANDLERS = {
     "inventory-outgrows-revenue": (
         "facts", lambda t, today, cache: eval_divergence(
             t, today, cache, "inventory", "revenue")),
-    "receivables-stretching": (
-        "facts", lambda t, today, cache: eval_divergence(
-            t, today, cache, "receivables", "revenue")),
+    "receivables-stretching": ("facts", eval_dso),
     "ai-complex-drawdown": ("price", eval_price_drawdown),
     "curve-inversion": ("gauge", eval_curve),
     "credit-stress-proxy": ("price", eval_ratio_drawdown),
@@ -498,6 +599,80 @@ def selftest():
          "tickers": ["X"], "fires_when": "drawdown_pct > 20"}]}]}
     res = run(conn, boom, None, "2026-10-27")
     ok("a missing price database is STALE", res[0]["state"] == STALE)
+
+    # -- flows, stocks, and the annual row that pretends to be a quarter --
+    import setup_pit
+
+    def usd(rows):
+        return {"units": {"USD": rows}}
+
+    def q(end, val, filed, start):
+        return {"start": start, "end": end, "val": val, "filed": filed,
+                "form": "10-Q"}
+
+    # Eight quarters ending each March/June/September/December, 100 each,
+    # plus the ANNUAL row a 10-K files for the same December period end.
+    ends = [("2024-03-31", "2024-01-01"), ("2024-06-30", "2024-04-01"),
+            ("2024-09-30", "2024-07-01"), ("2024-12-31", "2024-10-01"),
+            ("2025-03-31", "2025-01-01"), ("2025-06-30", "2025-04-01"),
+            ("2025-09-30", "2025-07-01"), ("2025-12-31", "2025-10-01")]
+    rev_rows = [q(e, 100.0, e, s) for e, s in ends]
+    # Filed LATER than the quarter, so under the old "latest filing wins"
+    # rule the annual row displaced the quarter it shares an end with.
+    rev_rows += [{"start": "2024-01-01", "end": "2024-12-31", "val": 400.0,
+                  "filed": "2025-02-01", "form": "10-K"},
+                 {"start": "2025-01-01", "end": "2025-12-31", "val": 400.0,
+                  "filed": "2026-02-01", "form": "10-K"}]
+    # Receivables: a balance sheet instant, no start.
+    ar_rows = [{"end": e, "val": 50.0 + 10 * i, "filed": e, "form": "10-Q"}
+               for i, (e, _s) in enumerate(ends)]
+    pay = {"facts": {"us-gaap": {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": usd(rev_rows),
+        "AccountsReceivableNetCurrent": usd(ar_rows)}}}
+
+    _t, flow = _series(pay, CONCEPTS["revenue"], "2026-10-27", "flow")
+    ok("an annual row never stands in for a quarter",
+       len(flow) == 8 and all(v == 100.0 for _e, v in flow))
+    ttm, growth, _e = _ttm_yoy(flow, "flow")
+    ok("four quarters of a flow sum to four quarters, not seven",
+       ttm == 400.0 and growth == 0.0)
+
+    _t, stock = _series(pay, CONCEPTS["receivables"], "2026-10-27", "stock")
+    ok("a stock keeps its instants", len(stock) == 8)
+    ok("a flow filter would have discarded them",
+       _series(pay, CONCEPTS["receivables"], "2026-10-27", "flow")[1] == [])
+    bal, sgrowth, _e = _ttm_yoy(stock, "stock")
+    # 120 against 80 four quarters back: +50%, not a sum of balances.
+    ok("a stock is compared, not summed",
+       bal == 120.0 and round(sgrowth, 1) == 50.0)
+
+    # -- DSO is measured in days, because days is what was registered -----
+    cache = {7: (pay, setup_pit.OK)}
+    t4 = {"id": "receivables-stretching", "ciks": {"ZZZ": 7},
+          "fires_when": "dso_change_days > 15"}
+    state, value, detail, why = eval_dso(t4, "2026-10-27", cache)
+    # AR 120 on TTM revenue 400 is 109.5 days; 80 on 400 is 73.0. +36.5.
+    ok("DSO is reported in days", round(value, 1) == 36.5)
+    ok("and the reason says days, not points", "days" in why)
+    ok("the detail carries both ends of the comparison",
+       detail["ZZZ"]["dso_prior"] == 73.0 and detail["ZZZ"]["dso"] == 109.5)
+    ok("a 36-day stretch clears a 15-day threshold", state == FIRED)
+
+    t5 = dict(t4); t5["fires_when"] = "dso_change_days > 60"
+    ok("and the same 36 days is DORMANT against 60",
+       eval_dso(t5, "2026-10-27", cache)[0] == DORMANT)
+
+    # An issuer that cannot be read is STALE, never a smaller number.
+    bad = {11: ({}, setup_pit.OK)}
+    t6 = dict(t4); t6["ciks"] = {"ZZZ": 11}
+    state, _v, _d, why = eval_dso(t6, "2026-10-27", bad)
+    ok("an unreadable issuer is STALE, not DORMANT", state == STALE)
+    ok("and says which one and why", "ZZZ" in why and "thin" in why)
+
+    # Point in time still holds: nothing filed after the as-of date counts.
+    _t, early = _series(pay, CONCEPTS["revenue"], "2024-06-30", "flow")
+    ok("a fact filed later is not knowable earlier",
+       [e for e, _v in early] == ["2024-03-31", "2024-06-30"])
 
     print(f"thesis_track selftest: {checks} checks passed")
     return 0
