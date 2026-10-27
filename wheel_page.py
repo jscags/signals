@@ -33,6 +33,30 @@ SCHEMA = """
 -- `why` is stored rather than recomputed at render time because the reason a
 -- ticker is NOT set up is the most useful thing on the page, and a verdict
 -- without it is a number that cannot be argued with.
+-- What followed dips of each depth, per ticker. Small and committed; the
+-- prices behind it are reproducible and stay in the gitignored file.
+--
+-- n_episodes counts SELLOFFS, not days. Consecutive days inside one slide
+-- describe the same event, and counting them separately would turn a single
+-- drawdown into a body of evidence.
+CREATE TABLE IF NOT EXISTS dip_profile (
+    ticker     TEXT NOT NULL,
+    depth      REAL NOT NULL,
+    horizon    INTEGER NOT NULL,
+    n_episodes INTEGER,
+    n_outcomes INTEGER,
+    pending    INTEGER,
+    median     REAL,
+    worst      REAL,
+    best       REAL,
+    positive   INTEGER,
+    last_seen  TEXT,
+    window_first TEXT,
+    window_last  TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (ticker, depth, horizon)
+);
+
 CREATE TABLE IF NOT EXISTS wheel_state (
     ticker      TEXT PRIMARY KEY,
     as_of       TEXT,
@@ -87,6 +111,8 @@ WHEEL_CSS = """
 .w-find tbody th { text-align: left; }
 .w-find tr.ctrl { color: var(--muted); }
 .w-find i { font-style: normal; color: var(--warm); }
+.w-find td i { color: var(--muted); font-size: 10px; margin-left: 4px; }
+.w-find .thin { color: var(--muted); }
 .w-scope { font-size: 11px; color: var(--muted); line-height: 1.55;
            margin: 6px 0 0; }
 @media (max-width: 560px) { .w-grid { grid-template-columns: 1fr; } }
@@ -249,6 +275,93 @@ def _rule_rows(runs, order):
             f"<tbody>{''.join(out)}</tbody></table>")
 
 
+def refresh_dips(conn, tickers, price_db=None):
+    """Compute and store the dip profile for each ticker."""
+    import dips
+    prices = market_data.connect(price_db)
+    now = datetime.now().isoformat(timespec="seconds")
+    stored = 0
+    for ticker in tickers:
+        bars = wheel.load_bars(prices, ticker)
+        if len(bars) < dips.HIGH_LOOKBACK + 2:
+            print(f"  {ticker}: too few bars for a dip profile")
+            continue
+        days = [b[0] for b in bars]
+        closes = [float(b[4]) for b in bars]
+        for row in dips.profile(days, closes):
+            for horizon, h in row["horizons"].items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO dip_profile (ticker, depth,"
+                    " horizon, n_episodes, n_outcomes, pending, median,"
+                    " worst, best, positive, last_seen, window_first,"
+                    " window_last, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (ticker, row["depth"], horizon, row["n_episodes"],
+                     h.get("n", 0), h.get("pending", 0), h.get("median"),
+                     h.get("worst"), h.get("best"), h.get("positive"),
+                     row["last"], days[0], days[-1], now))
+                stored += 1
+    conn.commit()
+    print(f"dip profile: {stored} cell(s) stored")
+    return stored
+
+
+def render_dips(conn):
+    """Where each name sits, and what followed dips that deep before.
+
+    The sample size travels with every number. A median over four episodes
+    and a median over thirty are different kinds of statement and must not
+    look alike on a page someone reads in ten seconds.
+    """
+    import dips
+    rows = conn.execute(
+        "SELECT ticker, depth, horizon, n_episodes, n_outcomes, pending,"
+        " median, worst, best, positive, window_first, window_last"
+        " FROM dip_profile ORDER BY ticker, depth, horizon").fetchall()
+    if not rows:
+        return ""
+    by = {}
+    span = ("?", "?")
+    for r in rows:
+        by.setdefault((r["ticker"], r["depth"]), {})[r["horizon"]] = r
+        span = (r["window_first"], r["window_last"])
+
+    horizons = sorted({r["horizon"] for r in rows})
+    head = "".join(f"<th>{h}d</th>" for h in horizons)
+    body = []
+    for (ticker, depth), cells in sorted(by.items()):
+        any_cell = next(iter(cells.values()))
+        n_ep = any_cell["n_episodes"] or 0
+        thin = n_ep < dips.MIN_EPISODES
+        tds = []
+        for h in horizons:
+            c = cells.get(h)
+            if not c or not c["n_outcomes"]:
+                tds.append('<td class="thin">—</td>')
+                continue
+            cls = ' class="thin"' if thin else ""
+            tds.append(
+                f'<td{cls}>{c["median"]:+.1f}%'
+                f'<i> w {c["worst"]:+.0f}%</i></td>')
+        flag = ' <i>n too small</i>' if thin else ""
+        body.append(
+            f'<tr><th>{ed.html.escape(ticker)} '
+            f'−{depth:.0f}%</th><td>{n_ep}{flag}</td>{"".join(tds)}</tr>')
+    return (
+        '<section class="w-find"><h2>What followed a dip this deep</h2>'
+        f'<table><thead><tr><th>name · depth</th><th>episodes</th>{head}'
+        '</tr></thead>'
+        f'<tbody>{"".join(body)}</tbody></table>'
+        f'<p class="w-scope">Median forward return, with the worst episode '
+        f'beside it. Episodes are distinct selloffs, not days — a long slide '
+        f'counts once. Window {ed.html.escape(span[0] or "?")} to '
+        f'{ed.html.escape(span[1] or "?")}, which contains no sustained bear '
+        f'market: these funds reset leverage daily and can fail to recover '
+        f'even when their index does, and nothing in this window shows that '
+        f'happening. Fewer than {dips.MIN_EPISODES} episodes is marked and '
+        f'should not be read as a tendency.</p></section>')
+
+
 def render_card(row):
     """One ticker. The reason always travels with the verdict."""
     (ticker, as_of, close, move, green, qualifies, why, streak,
@@ -295,6 +408,7 @@ def write_page(conn, path="docs/wheel.html", clouds=wheel.CLOUDS,
     n_set = sum(1 for r in rows if r[11] == "OK" and r[5])
     gauges = ed.render_gauges(conn)
     findings = render_findings()
+    dip_panel = render_dips(conn)
     cloud_text = ", ".join(f"{f}/{s}" for f, s in clouds)
 
     steps = (
@@ -332,6 +446,7 @@ options chain, so steps 4–7 are a question for your broker. A premium
 modelled here would be the least reliable number on the page wearing the
 same typeface as the most reliable one.</p>
 <div class="w-grid">{cards}</div>
+{dip_panel}
 {findings}
 {steps}
 </div></body></html>"""
@@ -363,6 +478,7 @@ def main():
     conn.executescript(SCHEMA)
     if not args.no_refresh:
         refresh_state(conn, tickers, clouds, args.drop)
+        refresh_dips(conn, tickers)
     path, n_set, n = write_page(conn, args.out, clouds, args.drop)
     print(f"wrote {path} ({n_set} of {n} set up)")
     return 0
