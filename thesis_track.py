@@ -205,6 +205,8 @@ CONCEPTS = {
 KIND = {"capex": "flow", "revenue": "flow",
         "inventory": "stock", "receivables": "stock"}
 QUARTER_DAYS = (60, 120)       # a reported quarter, generously bounded
+# Nobody runs a year of receivables. Past this, the denominator is wrong.
+DSO_SANE_DAYS = 365.0
 
 
 def _facts(cik, cache):
@@ -270,6 +272,25 @@ def _series(payload, names, today, kind="flow"):
     return None, []
 
 
+def _not_consecutive(series, n=8):
+    """Why the last n periods are not adjacent quarters, or None.
+
+    Eight rows that survived the duration filter are not necessarily
+    adjacent. A filer who reports year-to-date spans leaves only its first
+    quarters behind, and summing four of those -- one per year -- produces
+    a confident number covering four separate years. The first run after
+    the duration filter went in halved combined capex and doubled its
+    growth rate, which is exactly what that looks like from outside.
+    """
+    ends = [e for e, _v in series[-n:]]
+    gaps = [(date.fromisoformat(b) - date.fromisoformat(a)).days
+            for a, b in zip(ends, ends[1:])]
+    if any(not (QUARTER_DAYS[0] <= g <= QUARTER_DAYS[1]) for g in gaps):
+        return (f"periods are not consecutive quarters "
+                f"({ends[0]}..{ends[-1]}, gaps {sorted(set(gaps))})")
+    return None
+
+
 def _ttm_yoy(series, kind="flow"):
     """Year-over-year growth, computed the way the quantity allows.
 
@@ -283,6 +304,16 @@ def _ttm_yoy(series, kind="flow"):
         return None, None, f"only {len(series)} periods, need {need}"
     vals = [v for _e, v in series]
     if kind == "flow":
+        # The eight periods must be CONSECUTIVE quarters. Eight rows that
+        # survived the duration filter are not necessarily adjacent: a
+        # filer who reports year-to-date spans leaves only its first
+        # quarters behind, and summing four of those -- one per year --
+        # produces a confident number covering four separate years. The
+        # first run after the filter went in halved combined capex and
+        # doubled its growth rate, which is what that looks like.
+        gap = _not_consecutive(series)
+        if gap:
+            return None, None, gap
         now, prior = sum(vals[-4:]), sum(vals[-8:-4])
     else:
         now, prior = vals[-1], vals[-5]
@@ -306,6 +337,10 @@ def eval_capex(trigger, today, cache):
         tag, series = _series(payload, CONCEPTS["capex"], today, "flow")
         if len(series) < 8:
             failed.append(f"{name}:thin({len(series)})")
+            continue
+        gap = _not_consecutive(series)
+        if gap:
+            failed.append(f"{name}:{gap}")
             continue
         vals = [v for _e, v in series]
         totals_now += sum(vals[-4:])
@@ -392,6 +427,10 @@ def eval_dso(trigger, today, cache):
         if len(ar) < 5 or len(rev) < 8:
             failed.append(f"{name}:thin(ar={len(ar)},rev={len(rev)})")
             continue
+        gap = _not_consecutive(rev)
+        if gap:
+            failed.append(f"{name}:revenue {gap}")
+            continue
         rv = [v for _e, v in rev]
         now_rev, prior_rev = sum(rv[-4:]), sum(rv[-8:-4])
         if not now_rev or not prior_rev:
@@ -400,6 +439,17 @@ def eval_dso(trigger, today, cache):
         av = [v for _e, v in ar]
         dso_now = av[-1] / (now_rev / 365.0)
         dso_prior = av[-5] / (prior_rev / 365.0)
+        # A company does not wait two years to collect a bill. A DSO
+        # outside any plausible range does not mean the issuer is in
+        # trouble, it means the revenue denominator is wrong -- and the
+        # first live run of this evaluator produced 2,108 days for NVDA,
+        # which it reported as a FIRED trigger. A number this module
+        # cannot stand behind is STALE, not a finding.
+        if not (0 < dso_now <= DSO_SANE_DAYS
+                and 0 < dso_prior <= DSO_SANE_DAYS):
+            failed.append(
+                f"{name}:implausible-dso({dso_prior:.0f}->{dso_now:.0f}d)")
+            continue
         change = dso_now - dso_prior
         detail[name] = {"dso": round(dso_now, 1),
                         "dso_prior": round(dso_prior, 1),
@@ -499,15 +549,58 @@ def run(conn, theses, prices=None, today=None):
     return out
 
 
+def explain(cik, today=None):
+    """Dump every USD row for one issuer's concepts, durations included.
+
+    A diagnostic, not part of the pipeline. The evaluators disagreed with
+    reality by two orders of magnitude and no amount of reading the code
+    settles why: the only way to find out which rows a filer actually
+    publishes is to look at them. data.sec.gov is not reachable from every
+    environment, so this exists to be run where it is.
+    """
+    import setup_pit
+    today = today or date.today().isoformat()
+    payload, outcome = setup_pit.fetch_facts(int(cik))
+    print(f"CIK {cik}: fetch {outcome}")
+    if outcome != setup_pit.OK:
+        return 1
+    facts = ((payload or {}).get("facts") or {}).get("us-gaap") or {}
+    for concept, tags in CONCEPTS.items():
+        print(f"\n== {concept} ({KIND[concept]})")
+        for tag in tags:
+            rows = (facts.get(tag) or {}).get("units", {}).get("USD") or []
+            if not rows:
+                print(f"  {tag}: absent")
+                continue
+            spans = {}
+            for r in rows:
+                spans[_span_days(r.get("start"), r.get("end"))] = \
+                    spans.get(_span_days(r.get("start"), r.get("end")), 0) + 1
+            print(f"  {tag}: {len(rows)} row(s); spans "
+                  f"{sorted(spans.items(), key=lambda kv: (kv[0] is not None, kv[0]))}")
+            for r in sorted(rows, key=lambda r: (r.get("end") or ""))[-6:]:
+                print(f"     start={r.get('start')} end={r.get('end')} "
+                      f"span={_span_days(r.get('start'), r.get('end'))} "
+                      f"filed={r.get('filed')} form={r.get('form')} "
+                      f"fp={r.get('fp')} val={r.get('val'):,.0f}")
+            _t, kept = _series(payload, [tag], today, KIND[concept])
+            print(f"     -> _series keeps {len(kept)}: {kept[-5:]}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--db", default="discovery.db")
     ap.add_argument("--price-db", default=None)
     ap.add_argument("--theses", default="theses.json")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--explain", type=int, default=None, metavar="CIK",
+                    help="dump one issuer's XBRL rows and stop")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
+    if args.explain:
+        return explain(args.explain)
     conn = sqlite3.connect(args.db)
     prices = None
     try:
@@ -668,6 +761,44 @@ def selftest():
     state, _v, _d, why = eval_dso(t6, "2026-10-27", bad)
     ok("an unreadable issuer is STALE, not DORMANT", state == STALE)
     ok("and says which one and why", "ZZZ" in why and "thin" in why)
+
+    # -- four first-quarters are not a year ------------------------------
+    # What a year-to-date filer leaves behind once the duration filter has
+    # run: one quarter per year, eight years apart-ish, summing to a
+    # perfectly plausible-looking number that covers four separate years.
+    yearly = [(f"{y}-03-31", 50.0) for y in range(2018, 2026)]
+    ok("non-consecutive quarters are refused",
+       _not_consecutive(yearly) is not None)
+    ok("and the refusal shows the gaps", "gaps" in _not_consecutive(yearly))
+    _n, g, err = _ttm_yoy(yearly, "flow")
+    ok("so no growth rate is produced from them", g is None and err)
+    ok("consecutive quarters pass", _not_consecutive(flow) is None)
+
+    sparse = {"facts": {"us-gaap": {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": usd(
+            [q(e, 50.0, e, f"{e[:4]}-01-01") for e, _v in yearly]),
+        "AccountsReceivableNetCurrent": usd(ar_rows)}}}
+    t7 = {"id": "receivables-stretching", "ciks": {"YTD": 9},
+          "fires_when": "dso_change_days > 15"}
+    state, _v, _d, why = eval_dso(t7, "2026-10-27", {9: (sparse, setup_pit.OK)})
+    ok("a year-to-date filer is STALE, not a finding", state == STALE)
+    ok("and the reason names the gap", "consecutive" in why)
+
+    # -- an impossible DSO is a broken denominator, not a discovery ------
+    # NVDA came back at 2,108 days on the first live run and was published
+    # as FIRED. Nobody waits five years to collect a bill.
+    huge_ar = [{"end": e, "val": 1e12, "filed": e, "form": "10-Q"}
+               for e, _s in ends]
+    absurd = {"facts": {"us-gaap": {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": usd(rev_rows),
+        "AccountsReceivableNetCurrent": usd(huge_ar)}}}
+    t8 = {"id": "receivables-stretching", "ciks": {"BAD": 13},
+          "fires_when": "dso_change_days > 15"}
+    state, _v, _d, why = eval_dso(
+        t8, "2026-10-27", {13: (absurd, setup_pit.OK)})
+    ok("an implausible DSO is STALE, never FIRED", state == STALE)
+    ok("and says the denominator is what is wrong",
+       "implausible-dso" in why)
 
     # Point in time still holds: nothing filed after the as-of date counts.
     _t, early = _series(pay, CONCEPTS["revenue"], "2024-06-30", "flow")
