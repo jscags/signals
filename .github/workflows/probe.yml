@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Which probe: buybacks, contracts, setup, setup-population, sic, gauges, brent or history'
+        description: 'Which probe: buybacks, contracts, setup, setup-population, sic, gauges, brent, history or xbrl (sample = a CIK)'
         default: 'buybacks'
       sample:
         description: 'Sample size, or a CIK for the setup probe (Axon = 1069183)'
@@ -36,6 +36,12 @@ jobs:
           # the right failure, but only if the caller does not keep handing it
           # an argument it never asked for.
           case "$TARGET" in
+            # Not an edgar_discovery probe: dumps one issuer's XBRL rows
+            # with their period spans, to settle why the thesis evaluators
+            # disagree with reality by two orders of magnitude. SAMPLE is a
+            # CIK here (NVDA = 1045810, MSFT = 789019, AVGO = 1730168).
+            xbrl)
+              python3 thesis_track.py --explain "$SAMPLE" ;;
             gauges|brent|history)
               python3 edgar_discovery.py "--probe-${TARGET}" ;;
             *)
