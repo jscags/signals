@@ -5684,7 +5684,8 @@ def render_state_panel(counts, n_moves, window_days, truncated=False,
     )
 
 
-def write_html(conn, path="dashboard.html", window_days=14, cap=None):
+def write_html(conn, path="dashboard.html", window_days=14, cap=None,
+               body_only=False):
     """The page is built from TRANSITIONS, not from standing state.
 
     An issuer that has been CONFIRMED for three weeks is not news on day
@@ -5891,7 +5892,11 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
                 by_entity.get(m["ticker"]) or []) for m in moves]
     # Above the controls, and above the state panel: this is the backdrop the
     # rest of the page is read against, not another thing to filter.
-    sections = [render_gauges(conn),
+    # The gauges are kept separable because the merged page places them
+    # itself, above both lanes. Folding them into sections unconditionally
+    # put them on that page twice.
+    gauges_html = render_gauges(conn)
+    sections = [gauges_html,
                 render_controls([g for g in grouped if g[1]],
                                 evidence_free)] + sections
 
@@ -5927,6 +5932,22 @@ def write_html(conn, path="dashboard.html", window_days=14, cap=None):
         )
     else:
         watch_html = ""
+
+    # The merged page composes this body with the leveraged-ETF sections
+    # rather than duplicating any of the work above. Returning the pieces
+    # keeps one builder for the dashboard instead of two that drift.
+    if body_only:
+        return {
+            # Without the gauges: the caller renders those itself.
+            "sections": "".join(x for x in sections if x is not gauges_html),
+            "gauges": gauges_html,
+            "watch_html": watch_html,
+            "n_moves": len(moves),
+            "n_issuers": sum(counts.values()),
+            "covered": covered,
+            "docs": docs,
+            "n_events": len(events),
+        }
 
     doc = f"""<!doctype html>
 <html lang="en"><head>

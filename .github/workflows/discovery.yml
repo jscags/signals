@@ -29,6 +29,9 @@ on:
 
 permissions:
   contents: write
+  # The dip alert opens issues. Without this the run reads fine and dies at
+  # the POST, which is how the findings commit failed the first time.
+  issues: write
 
 concurrency:
   group: discovery
@@ -111,9 +114,30 @@ jobs:
             echo "::warning::POLYGON_API_KEY not set; setups page not rebuilt"
             exit 0
           fi
-          python3 wheel_page.py \
+          # --merge writes ONE page: leveraged-ETF state and the dip
+          # table on top, EDGAR transitions beneath. It overwrites the
+          # dashboard edgar_discovery just wrote, so if this step fails
+          # the page degrades to the EDGAR-only version rather than
+          # vanishing.
+          python3 wheel_page.py --merge \
             --db discovery.db \
-            --out docs/wheel.html \
+            --out docs/index.html \
+            --tickers "${WHEEL_TICKERS:-TQQQ,SOXL,SPXL}"
+
+      - name: Dip alerts
+        continue-on-error: true
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRICE_DB: prices.db
+          WHEEL_TICKERS: ${{ vars.WHEEL_TICKERS }}
+        run: |
+          if [ -z "${POLYGON_API_KEY}" ]; then
+            echo "::warning::no key; dip alerts skipped"
+            exit 0
+          fi
+          python3 dip_alert.py \
+            --db discovery.db \
             --tickers "${WHEEL_TICKERS:-TQQQ,SOXL,SPXL}"
 
       - name: Commit state and dashboard
@@ -123,6 +147,8 @@ jobs:
           git add discovery.db docs/index.html
           # -- so a missing wheel.html (first run, or a skipped step) does not
           # fail the commit that carries the dashboard.
+          # The alert state lives in discovery.db and must be committed, or
+          # every run starts re-armed and alerts the same dip again.
           git add docs/wheel.html 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "nothing new"

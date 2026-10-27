@@ -113,6 +113,10 @@ WHEEL_CSS = """
 .w-find i { font-style: normal; color: var(--warm); }
 .w-find td i { color: var(--muted); font-size: 10px; margin-left: 4px; }
 .w-find .thin { color: var(--muted); }
+.w-split { border: 0; border-top: 1px solid var(--rule); margin: 26px 0 14px; }
+.w-h2 { font-family: "IBM Plex Mono", monospace; font-size: 13px;
+        letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+        font-weight: 600; margin: 0 0 12px; }
 .w-scope { font-size: 11px; color: var(--muted); line-height: 1.55;
            margin: 6px 0 0; }
 @media (max-width: 560px) { .w-grid { grid-template-columns: 1fr; } }
@@ -455,6 +459,61 @@ same typeface as the most reliable one.</p>
     return path, n_set, len(rows)
 
 
+def write_merged(conn, path="docs/index.html", clouds=wheel.CLOUDS,
+                 drop_pct=wheel.DROP_PCT, window_days=14, cap=None):
+    """One page: leveraged-ETF state on top, EDGAR transitions beneath.
+
+    The dashboard body comes from edgar_discovery rather than being rebuilt
+    here, so there is one builder for it and not two that drift apart. If
+    that call fails the merge fails loudly, which is better than publishing
+    a page that silently lost half its content.
+    """
+    rows = conn.execute(
+        "SELECT ticker, as_of, close, move_pct, clouds_green, qualifies, why,"
+        " green_streak, last_qualified, qualified_count, sessions, status,"
+        " updated_at FROM wheel_state"
+        " ORDER BY qualifies DESC, (status = 'OK') DESC, ticker"
+    ).fetchall()
+    cards = "".join(render_card(tuple(r)) for r in rows)
+    n_set = sum(1 for r in rows if r[11] == "OK" and r[5])
+    body = ed.write_html(conn, window_days=window_days, cap=cap,
+                         body_only=True)
+    cloud_text = ", ".join(f"{f}/{s}" for f, s in clouds)
+
+    doc = f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<title>Signals — {date.today()}</title>
+<meta name="color-scheme" content="light dark">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>{ed.CSS}{WHEEL_CSS}</style>
+</head><body><div class="wrap">
+<h1>Signals</h1>
+<p class="meta">{n_set} of {len(rows)} set up &nbsp;·&nbsp; {body["n_moves"]} transition{"" if body["n_moves"] == 1 else "s"} &nbsp;·&nbsp; {body["n_issuers"]:,} issuers tracked &nbsp;·&nbsp; built {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
+{ed.render_gauges(conn)}
+<p class="w-note"><b>Leveraged ETFs, steps 1–3, 8 and 9 only.</b> No strike
+and no premium appear here: the price feed's free tier refuses a live
+options chain. These funds also reset leverage daily and can fail to recover
+even when their index does — the dip table below says what actually followed
+dips of each depth, and over how few episodes.</p>
+<div class="w-grid">{cards}</div>
+{render_dips(conn)}
+{render_findings()}
+<hr class="w-split">
+<h2 class="w-h2">EDGAR discovery</h2>
+{body["sections"]}
+{body["watch_html"]}
+</div><div id="tip" role="status" aria-live="polite"></div>
+<script>{ed.SCRIPT}</script></body></html>"""
+    with open(path, "w") as fh:
+        fh.write(doc)
+    return path, n_set, len(rows)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--db", default="discovery.db")
@@ -462,6 +521,8 @@ def main():
     ap.add_argument("--tickers", default="TQQQ,SOXL,SPXL")
     ap.add_argument("--clouds", default="5/12,34/50")
     ap.add_argument("--drop", type=float, default=wheel.DROP_PCT)
+    ap.add_argument("--merge", action="store_true",
+                    help="write ONE page carrying both lanes")
     ap.add_argument("--no-refresh", action="store_true",
                     help="render from stored state without fetching prices")
     args = ap.parse_args()
@@ -479,7 +540,10 @@ def main():
     if not args.no_refresh:
         refresh_state(conn, tickers, clouds, args.drop)
         refresh_dips(conn, tickers)
-    path, n_set, n = write_page(conn, args.out, clouds, args.drop)
+    if args.merge:
+        path, n_set, n = write_merged(conn, args.out, clouds, args.drop)
+    else:
+        path, n_set, n = write_page(conn, args.out, clouds, args.drop)
     print(f"wrote {path} ({n_set} of {n} set up)")
     return 0
 
