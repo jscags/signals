@@ -227,25 +227,79 @@ def _span_days(start, end):
         return None
 
 
+def _quarters(rows):
+    """Discrete quarters from rows that may be reported cumulatively.
+
+    Cash-flow concepts are filed YEAR TO DATE: NVDA's capital expenditure
+    arrives as spans of 90, 181, 272 and 363 days, all starting on the same
+    fiscal-year day. Keeping only the ~90-day rows leaves one quarter per
+    year, and four of those summed is a figure covering four years.
+
+    So the cumulative rows are differenced back into quarters -- Q2 is the
+    half year minus the first quarter, and so on -- and used where no
+    discrete row exists. A derived quarter is kept only if the period it
+    implies is really a quarter long; anything else is a gap in the filings
+    and is left as one.
+
+    `rows` are (start, end, filed, value), already filtered to what was
+    knowable on the as-of date.
+    """
+    best = {}
+    for start, end, filed, val in rows:
+        if _span_days(start, end) is None:
+            continue                          # an instant, not a flow
+        key = (start, end)
+        # Latest filing wins for a period, so a restatement supersedes.
+        if key not in best or filed >= best[key][0]:
+            best[key] = (filed, float(val))
+
+    # Rows sharing a start are one year-to-date ladder; a row whose own
+    # span is already a quarter is a rung that needs no arithmetic.
+    by_start = {}
+    for (start, end), (_filed, val) in best.items():
+        by_start.setdefault(start, []).append((end, val))
+
+    direct, derived = {}, {}
+    for start, items in by_start.items():
+        items.sort()
+        prev_end, prev_val = start, 0.0
+        for end, val in items:
+            own = _span_days(start, end)
+            step = _span_days(prev_end, end)
+            if own is not None and QUARTER_DAYS[0] <= own <= QUARTER_DAYS[1]:
+                direct[end] = val
+            elif step is not None and QUARTER_DAYS[0] <= step <= QUARTER_DAYS[1]:
+                derived[end] = val - prev_val
+            prev_end, prev_val = end, val
+
+    out = dict(derived)
+    out.update(direct)                        # a filed quarter is believed
+    return sorted(out.items())
+
+
 def _series(payload, names, today, kind="flow"):
-    """Dated values for the first tag that has any, point in time.
+    """Dated values for the best tag among `names`, point in time.
 
     Point in time means a fact counts from the date it was FILED, never the
     date its period ended. A quarter ending in June and filed in August was
     not knowable in July, and letting it be is the look-ahead that makes a
     backtest lie. Same discipline setup_pit enforces for the setup rule.
 
-    A flow keeps only QUARTERLY rows and a stock keeps only instants, so an
-    annual row can never stand in for a quarter. Without that filter the
-    annual and quarterly facts for the same period end are indistinguishable
-    here, the later-filed one wins, and a four-quarter sum silently carries
-    more than four quarters.
+    BEST, not first. The rule used to be "the first tag that has any rows",
+    which is wrong in a way that is invisible from the code: NVDA stopped
+    tagging RevenueFromContractWithCustomerExcludingAssessedTax after 2020
+    but the old rows are still in companyfacts, so that tag always had
+    some, the alternates were never reached, and 2026 receivables were
+    divided by 2019 revenue. That produced a days-sales-outstanding of
+    2,108 and published it as a fired trigger. A tag a filer abandoned
+    still answers; it just answers about the wrong decade. So every tag is
+    read and the one reaching furthest forward wins.
     """
     facts = ((payload or {}).get("facts") or {}).get("us-gaap") or {}
+    best_name, best = None, []
     for name in names:
-        unit_map = (facts.get(name) or {}).get("units") or {}
-        rows = unit_map.get("USD") or []
-        out = []
+        rows = ((facts.get(name) or {}).get("units") or {}).get("USD") or []
+        keep = []
         for fact in rows:
             end, filed, val = (fact.get("end"), fact.get("filed"),
                                fact.get("val"))
@@ -253,23 +307,24 @@ def _series(payload, names, today, kind="flow"):
                 continue
             if filed > today:
                 continue                      # not knowable yet
-            span = _span_days(fact.get("start"), end)
-            if kind == "flow":
-                if span is None or not (
-                        QUARTER_DAYS[0] <= span <= QUARTER_DAYS[1]):
-                    continue                  # annual, or an instant
-            elif span is not None:
-                continue                      # a stock has no span
-            out.append((end, filed, float(val), fact.get("fp"),
-                        fact.get("form")))
-        if out:
-            # Latest filing wins for a given period end, so a restatement
-            # supersedes rather than duplicating.
-            best = {}
-            for end, filed, val, fp, form in sorted(out, key=lambda r: r[1]):
-                best[end] = (filed, val, fp, form)
-            return name, sorted((e, v[1]) for e, v in best.items())
-    return None, []
+            keep.append((fact.get("start"), end, filed, val))
+        if kind == "flow":
+            series = _quarters(keep)
+        else:
+            # A stock is an instant and has no span. Latest filing wins.
+            best_by_end = {}
+            for start, end, filed, val in keep:
+                if start is not None:
+                    continue
+                if end not in best_by_end or filed >= best_by_end[end][0]:
+                    best_by_end[end] = (filed, float(val))
+            series = sorted((e, v) for e, (_f, v) in best_by_end.items())
+        if not series:
+            continue
+        # Furthest-forward wins; length breaks a tie.
+        if not best or (series[-1][0], len(series)) > (best[-1][0], len(best)):
+            best_name, best = name, series
+    return best_name, best
 
 
 def _not_consecutive(series, n=8):
@@ -799,6 +854,52 @@ def selftest():
     ok("an implausible DSO is STALE, never FIRED", state == STALE)
     ok("and says the denominator is what is wrong",
        "implausible-dso" in why)
+
+    # -- year-to-date cash flow, differenced back into quarters ----------
+    # NVDA's capital expenditure, exactly as filed: one fiscal year's rows
+    # all start on the same day and run 90, 181, 272 and 363 days.
+    ytd = [("2025-01-27", "2025-04-27", "2025-05-28", 1227e6),
+           ("2025-01-27", "2025-07-27", "2025-08-27", 3122e6),
+           ("2025-01-27", "2025-10-26", "2025-11-19", 4758e6),
+           ("2025-01-27", "2026-01-25", "2026-02-25", 6042e6)]
+    qs = dict(_quarters(ytd))
+    ok("a year-to-date first quarter is itself",
+       round(qs["2025-04-27"] / 1e6) == 1227)
+    ok("the second quarter is the half year minus the first",
+       round(qs["2025-07-27"] / 1e6) == 1895)
+    ok("the third is the difference again",
+       round(qs["2025-10-26"] / 1e6) == 1636)
+    ok("and the fourth comes out of the full year",
+       round(qs["2026-01-25"] / 1e6) == 1284)
+    ok("four derived quarters sum back to the filed year",
+       round(sum(qs.values()) / 1e6) == 6042)
+    ok("and they are consecutive",
+       _not_consecutive(sorted(qs.items()), n=4) is None)
+
+    # A filed quarter is believed over a derived one.
+    mixed = ytd + [("2025-04-28", "2025-07-27", "2025-08-27", 9e9)]
+    ok("a discrete filing beats a derived quarter",
+       dict(_quarters(mixed))["2025-07-27"] == 9e9)
+
+    # A year with a missing interim leaves a gap rather than inventing one.
+    holey = [ytd[0], ytd[3]]
+    ok("a jump from Q1 to the full year derives nothing",
+       "2026-01-25" not in dict(_quarters(holey)))
+
+    # -- a tag the filer abandoned must not win ---------------------------
+    # This is what produced the 2,108-day DSO: the first tag still had
+    # rows, they just stopped in 2020.
+    abandoned = {"facts": {"us-gaap": {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": usd(
+            [q(e, 3e9, e, s) for e, s in
+             [("2019-10-27", "2019-07-29"), ("2020-01-26", "2019-10-28")]]),
+        "Revenues": usd(rev_rows)}}}
+    tag, picked = _series(abandoned, CONCEPTS["revenue"], "2026-10-27",
+                          "flow")
+    ok("the tag reaching furthest forward wins, not the first listed",
+       tag == "Revenues")
+    ok("so the series is current, not a decade old",
+       picked[-1][0] == "2025-12-31")
 
     # Point in time still holds: nothing filed after the as-of date counts.
     _t, early = _series(pay, CONCEPTS["revenue"], "2024-06-30", "flow")
