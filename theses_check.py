@@ -96,6 +96,15 @@ def check(path="theses.json"):
                                         or trigger.get("source")):
                 problems.append(
                     f"trigger {gid!r}: a price trigger needs tickers")
+            # An event trigger that counts issuers must say WHICH issuers.
+            # "The AI complex" is not a set a tracker can evaluate, and a
+            # numeric threshold over an undefined universe is the same
+            # vagueness as "capex slows" one level up.
+            if kind == "event" and not (trigger.get("tickers")
+                                        or trigger.get("ciks")):
+                problems.append(
+                    f"trigger {gid!r}: an event trigger needs an explicit "
+                    f"tickers or ciks universe, not a described one")
 
     # Not a failure, but worth saying out loud every run.
     unmeasurable = data.get("_not_measurable") or {}
@@ -170,6 +179,12 @@ def selftest():
         dict(bad["theses"][0]["triggers"][0]))
     ok("a duplicated trigger id is caught",
        any("duplicate id" in p for p in check(write(bad))[0]))
+
+    bad = json.loads(json.dumps(good))
+    bad["theses"][0]["triggers"][0]["type"] = "event"
+    bad["theses"][0]["triggers"][0].pop("tickers")
+    ok("an event trigger over an undefined universe is refused",
+       any("explicit" in p for p in check(write(bad))[0]))
 
     bad = json.loads(json.dumps(good))
     bad["theses"][0]["triggers"][0]["type"] = "metric"

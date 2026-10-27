@@ -18,7 +18,6 @@
     "DORMANT means we looked and the condition did not hold. STALE means we",
     "could not look. They must never be rendered the same."
   ],
-
   "theses": [
     {
       "id": "ai-capex-cycle",
@@ -31,7 +30,12 @@
           "type": "metric",
           "what": "Combined trailing-four-quarter capital expenditure, four hyperscalers",
           "source": "XBRL companyfacts, PaymentsToAcquirePropertyPlantAndEquipment",
-          "ciks": {"MSFT": 789019, "GOOGL": 1652044, "AMZN": 1018724, "META": 1326801},
+          "ciks": {
+            "MSFT": 789019,
+            "GOOGL": 1652044,
+            "AMZN": 1018724,
+            "META": 1326801
+          },
           "fires_when": "yoy_growth_pct < 0",
           "note": "Point-in-time: a quarter counts from its FILED date, never its period end."
         },
@@ -40,13 +44,17 @@
           "type": "metric",
           "what": "Same series, second derivative",
           "source": "XBRL companyfacts, PaymentsToAcquirePropertyPlantAndEquipment",
-          "ciks": {"MSFT": 789019, "GOOGL": 1652044, "AMZN": 1018724, "META": 1326801},
+          "ciks": {
+            "MSFT": 789019,
+            "GOOGL": 1652044,
+            "AMZN": 1018724,
+            "META": 1326801
+          },
           "fires_when": "yoy_growth_pct < 15 for two consecutive quarters",
           "note": "An early, weaker version of the one above. Expected to fire first and to be wrong more often."
         }
       ]
     },
-
     {
       "id": "semi-inventory-divergence",
       "title": "Inventory outgrowing revenue is what the top looks like in the accounts",
@@ -58,7 +66,12 @@
           "type": "metric",
           "what": "Inventory growth minus revenue growth, year over year",
           "source": "XBRL companyfacts, InventoryNet and RevenueFromContractWithCustomerExcludingAssessedTax",
-          "ciks": {"NVDA": 1045810, "AMD": 2488, "AVGO": 1730168, "MU": 723125},
+          "ciks": {
+            "NVDA": 1045810,
+            "AMD": 2488,
+            "AVGO": 1730168,
+            "MU": 723125
+          },
           "fires_when": "inventory_yoy_pct - revenue_yoy_pct > 20",
           "note": "Twenty points is the threshold because smaller gaps are ordinary seasonality."
         },
@@ -67,13 +80,16 @@
           "type": "metric",
           "what": "Days sales outstanding, year over year change",
           "source": "XBRL companyfacts, AccountsReceivableNetCurrent and revenue",
-          "ciks": {"NVDA": 1045810, "AMD": 2488, "AVGO": 1730168},
+          "ciks": {
+            "NVDA": 1045810,
+            "AMD": 2488,
+            "AVGO": 1730168
+          },
           "fires_when": "dso_change_days > 15",
           "note": "What vendor financing looks like from outside: revenue recognised, cash not collected."
         }
       ]
     },
-
     {
       "id": "insiders-leaving",
       "title": "The people with the most information are selling",
@@ -86,11 +102,28 @@
           "what": "Distinct issuers in the AI complex with officer or director sales above the value floor, in a rolling window",
           "source": "insider_sales, already collected from Form 4",
           "fires_when": "distinct_issuers >= 4 within 90 days with value >= 5000000",
-          "note": "Uses the suspect flag to exclude the implausible-price rows that rescore already catches."
+          "note": "UNIVERSE NAMED EXPLICITLY. 'The AI complex' is not a set a tracker can evaluate; these fifteen tickers are. GOOGL is absent from our Form 4 data entirely. NOT YET EVALUABLE: 18,647 of 18,701 insider_sales rows are dated 2026-06-01 or later, so these names carry about four months of history, not four years. Every candidate threshold calibrated to the same figure -- one episode, ~3.1/yr -- which is an artifact of one continuous window rather than a base rate. Until the history is backfilled this reports STALE. A threshold chosen now would be a number with nothing behind it.",
+          "tickers": [
+            "NVDA",
+            "AMD",
+            "AVGO",
+            "MU",
+            "SMCI",
+            "MRVL",
+            "ANET",
+            "VRT",
+            "CRWV",
+            "DELL",
+            "MSFT",
+            "META",
+            "AMZN",
+            "ORCL",
+            "PLTR"
+          ],
+          "requires_history_days": 730
         }
       ]
     },
-
     {
       "id": "financing-conditions",
       "title": "The buildout is partly debt-funded and rates are the constraint",
@@ -114,7 +147,6 @@
         }
       ]
     },
-
     {
       "id": "complex-breaking-down",
       "title": "Price confirms, late and without explanation",
@@ -126,13 +158,16 @@
           "type": "price",
           "what": "Drawdown from the 20-session high",
           "source": "Polygon daily closes",
-          "tickers": ["NVDA", "SMH", "SOXX"],
+          "tickers": [
+            "NVDA",
+            "SMH",
+            "SOXX"
+          ],
           "fires_when": "drawdown_pct > 20"
         }
       ]
     }
   ],
-
   "_not_measurable": {
     "_note": "Named explicitly so their absence is a stated limit of this tracker rather than a silent gap. A trigger that cannot be evaluated must not exist here pretending to be DORMANT.",
     "datacenter_power_and_permits": "No free structured source. Utility interconnection queues are published inconsistently and per-region.",
@@ -142,5 +177,11 @@
     "inference_cost_curves": "Not disclosed by anyone in a comparable form.",
     "circular_and_vendor_financing_deals": "Visible only in filing prose. Lane D Phase 0 measured free-text extraction from 8-K exhibits at 21 HIT, 2 MISSED, 37 ABSENT over 60 releases, so a trigger built on it would report ABSENT most of the time and could not be trusted when it did not.",
     "depreciation_useful_life_changes": "Stated in accounting-policy prose rather than a comparable XBRL tag. Same extraction problem as above."
+  },
+  "_data_defects": {
+    "_note": "Found while calibrating. Recorded because a tracker that reads these tables should know what is wrong with them.",
+    "insider_sales_bad_prices": "Seven sales priced above $2,000/share, six of them IHT between $22,593 and $52,316 on a single-digit stock. Only two carry the suspect flag, so the flag under-catches.",
+    "insider_sales_duplicates": "FANG 2026-09-16 appears twice with identical shares and price. Co-filer double-counting, already on the backlog as W2.",
+    "insider_sales_depth": "18,647 of 18,701 rows are dated 2026-06-01 or later. Anything calibrated against this table is calibrated against four months."
   }
 }

@@ -124,6 +124,19 @@ jobs:
             --out docs/index.html \
             --tickers "${WHEEL_TICKERS:-TQQQ,SOXL,SPXL}"
 
+      # Thesis triggers. The file is validated first: a malformed
+      # hand-edit must fail the run rather than silently drop a trigger,
+      # because a dropped trigger is indistinguishable from one that never
+      # fired.
+      - name: Thesis triggers
+        continue-on-error: true
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          PRICE_DB: prices.db
+        run: |
+          python3 theses_check.py
+          python3 thesis_track.py --db discovery.db
+
       - name: Dip alerts
         continue-on-error: true
         env:

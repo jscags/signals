@@ -366,6 +366,87 @@ def render_dips(conn):
         f'should not be read as a tendency.</p></section>')
 
 
+THESIS_CSS = """
+.t-wrap { margin: 0 0 18px; }
+.t-row { display: flex; align-items: baseline; gap: 10px; padding: 5px 0;
+         border-bottom: 1px solid var(--rule); font-size: 12.5px; }
+.t-state { font-family: "IBM Plex Mono", monospace; font-size: 10px;
+           letter-spacing: .08em; padding: 1px 6px; border-radius: 2px;
+           flex: none; min-width: 62px; text-align: center; }
+/* STALE must not look like DORMANT. One is a reading, the other is an
+   outage, and rendering them alike turns every failure into reassurance. */
+.t-state.fired   { background: var(--warm); color: var(--card);
+                   font-weight: 600; }
+.t-state.dormant { color: var(--muted); border: 1px solid var(--rule); }
+.t-state.stale   { color: var(--warm); border: 1px dashed var(--warm);
+                   font-weight: 600; }
+.t-id { font-family: "IBM Plex Mono", monospace; color: var(--ink); }
+.t-why { color: var(--muted); margin-left: auto; text-align: right;
+         font-size: 11.5px; }
+.t-thesis { margin: 14px 0 2px; font-size: 12.5px; }
+.t-thesis b { font-size: 13px; }
+.t-dis { color: var(--muted); font-size: 11.5px; margin: 2px 0 6px; }
+"""
+
+
+def render_theses(conn, path="theses.json"):
+    """The pre-registered triggers and today's reading of each.
+
+    STALE is rendered unmistakably differently from DORMANT. They are
+    different sentences -- "we looked and the answer is no" versus "we could
+    not look" -- and a page that draws them alike converts every outage into
+    a reassuring row.
+    """
+    try:
+        with open(path) as fh:
+            spec = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    rows = conn.execute(
+        "SELECT trigger_id, state, reason, as_of FROM thesis_state"
+        " WHERE as_of = (SELECT MAX(as_of) FROM thesis_state)").fetchall()
+    if not rows:
+        return ""
+    latest = {r["trigger_id"]: r for r in rows}
+    as_of = rows[0]["as_of"]
+
+    out = []
+    counts = {"FIRED": 0, "DORMANT": 0, "STALE": 0}
+    for thesis in spec.get("theses", []):
+        body = []
+        for trigger in thesis.get("triggers", []):
+            r = latest.get(trigger["id"])
+            state = (r["state"] if r else "STALE")
+            why = (r["reason"] if r else "not evaluated in the latest run")
+            counts[state] = counts.get(state, 0) + 1
+            body.append(
+                f'<div class="t-row">'
+                f'<span class="t-state {state.lower()}">{state}</span>'
+                f'<span class="t-id">{ed.html.escape(trigger["id"])}</span>'
+                f'<span class="t-why">{ed.html.escape(why)}</span></div>')
+        out.append(
+            f'<div class="t-thesis"><b>{ed.html.escape(thesis["title"])}</b>'
+            f'</div>'
+            f'<div class="t-dis">Would be wrong if: '
+            f'{ed.html.escape(thesis.get("disconfirms", "—"))}</div>'
+            + "".join(body))
+
+    blind = [k for k in (spec.get("_not_measurable") or {})
+             if not k.startswith("_")]
+    return (
+        '<section class="w-find t-wrap"><h2>Pre-registered triggers</h2>'
+        f'<p class="w-scope">{counts.get("FIRED",0)} fired · '
+        f'{counts.get("DORMANT",0)} dormant · <b>{counts.get("STALE",0)} '
+        f'could not be evaluated</b> · as of {ed.html.escape(as_of)}. '
+        f'Thresholds were written down before the evidence was looked at; '
+        f'the file is hand-edited and the pipeline never writes it.</p>'
+        + "".join(out)
+        + f'<p class="w-scope"><b>Not measurable on free data, and therefore '
+          f'not tracked at all:</b> {ed.html.escape(", ".join(blind))}. '
+          f'Named so their absence stays a stated limit rather than being '
+          f'read as absence of evidence.</p></section>')
+
+
 def render_card(row):
     """One ticker. The reason always travels with the verdict."""
     (ticker, as_of, close, move, green, qualifies, why, streak,
@@ -413,6 +494,7 @@ def write_page(conn, path="docs/wheel.html", clouds=wheel.CLOUDS,
     gauges = ed.render_gauges(conn)
     findings = render_findings()
     dip_panel = render_dips(conn)
+    thesis_panel = render_theses(conn)
     cloud_text = ", ".join(f"{f}/{s}" for f, s in clouds)
 
     steps = (
@@ -439,7 +521,7 @@ def write_page(conn, path="docs/wheel.html", clouds=wheel.CLOUDS,
 <meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
-<style>{ed.CSS}{WHEEL_CSS}</style>
+<style>{ed.CSS}{WHEEL_CSS}{THESIS_CSS}</style>
 </head><body><div class="wrap">
 <h1>Setups</h1>
 <p class="meta">{n_set} of {len(rows)} set up &nbsp;·&nbsp; clouds {ed.html.escape(cloud_text)} &nbsp;·&nbsp; red day {drop_pct:g}% &nbsp;·&nbsp; built {datetime.now().strftime("%Y-%m-%d %H:%M")} &nbsp;·&nbsp; <a href="index.html">EDGAR discovery</a></p>
@@ -451,6 +533,7 @@ modelled here would be the least reliable number on the page wearing the
 same typeface as the most reliable one.</p>
 <div class="w-grid">{cards}</div>
 {dip_panel}
+{thesis_panel}
 {findings}
 {steps}
 </div></body></html>"""
@@ -490,7 +573,7 @@ def write_merged(conn, path="docs/index.html", clouds=wheel.CLOUDS,
 <meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
-<style>{ed.CSS}{WHEEL_CSS}</style>
+<style>{ed.CSS}{WHEEL_CSS}{THESIS_CSS}</style>
 </head><body><div class="wrap">
 <h1>Signals</h1>
 <p class="meta">{n_set} of {len(rows)} set up &nbsp;·&nbsp; {body["n_moves"]} transition{"" if body["n_moves"] == 1 else "s"} &nbsp;·&nbsp; {body["n_issuers"]:,} issuers tracked &nbsp;·&nbsp; built {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
