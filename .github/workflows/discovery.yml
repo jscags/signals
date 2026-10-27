@@ -98,6 +98,24 @@ jobs:
           echo "running: python3 edgar_discovery.py $ARGS"
           python3 edgar_discovery.py $ARGS
 
+      # Thesis triggers. The file is validated first: a malformed
+      # hand-edit must fail the run rather than silently drop a trigger,
+      # because a dropped trigger is indistinguishable from one that never
+      # fired.
+      #
+      # Evaluated BEFORE the page is built, not after. Built after, the
+      # published page carried the PREVIOUS run's trigger states while
+      # wearing this run's timestamp -- and on a first run it showed every
+      # pre-registered trigger as STALE no matter what the evidence said.
+      - name: Thesis triggers
+        continue-on-error: true
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          PRICE_DB: prices.db
+        run: |
+          python3 theses_check.py
+          python3 thesis_track.py --db discovery.db
+
       # The setups page. A separate step so a failure here cannot cost the
       # EDGAR dashboard its run -- the two lanes answer different questions
       # and neither should be able to take the other down. continue-on-error
@@ -123,19 +141,6 @@ jobs:
             --db discovery.db \
             --out docs/index.html \
             --tickers "${WHEEL_TICKERS:-TQQQ,SOXL,SPXL}"
-
-      # Thesis triggers. The file is validated first: a malformed
-      # hand-edit must fail the run rather than silently drop a trigger,
-      # because a dropped trigger is indistinguishable from one that never
-      # fired.
-      - name: Thesis triggers
-        continue-on-error: true
-        env:
-          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
-          PRICE_DB: prices.db
-        run: |
-          python3 theses_check.py
-          python3 thesis_track.py --db discovery.db
 
       - name: Dip alerts
         continue-on-error: true

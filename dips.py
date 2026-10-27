@@ -38,6 +38,10 @@ distribution is quoted with its worst case next to its median.
 import sys
 
 DEPTHS = (3.0, 5.0, 8.0, 12.0, 20.0)   # percent below the rolling high
+# A finer grid, for the calibration slider only. The ALERT bands stay the
+# coarse set above: a slider exists to choose a threshold before committing
+# to it, not to move one that has already been committed.
+SLIDER_DEPTHS = tuple(float(d) for d in range(2, 31))
 HORIZONS = (5, 10, 21, 63)             # sessions forward
 HIGH_LOOKBACK = 20                     # sessions in the rolling high
 COOLDOWN = 10                          # sessions before a new episode counts

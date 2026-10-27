@@ -19,6 +19,7 @@ gitignored file, conclusions are small and get committed.
 
 import argparse
 import json
+import sqlite3
 import sys
 from datetime import date, datetime
 
@@ -292,7 +293,8 @@ def refresh_dips(conn, tickers, price_db=None):
             continue
         days = [b[0] for b in bars]
         closes = [float(b[4]) for b in bars]
-        for row in dips.profile(days, closes):
+        for row in dips.profile(days, closes,
+                                 depths=dips.SLIDER_DEPTHS):
             for horizon, h in row["horizons"].items():
                 conn.execute(
                     "INSERT OR REPLACE INTO dip_profile (ticker, depth,"
@@ -402,13 +404,19 @@ def render_theses(conn, path="theses.json"):
             spec = json.load(fh)
     except (OSError, ValueError):
         return ""
-    rows = conn.execute(
-        "SELECT trigger_id, state, reason, as_of FROM thesis_state"
-        " WHERE as_of = (SELECT MAX(as_of) FROM thesis_state)").fetchall()
-    if not rows:
-        return ""
+    # A thesis file with eight triggers and no evaluations is not the same
+    # page as a thesis file with nothing in it. If the tracker has never run
+    # -- or has not created its table yet -- the panel is still drawn, with
+    # every trigger STALE, because returning "" here would publish a page on
+    # which pre-registered triggers simply do not appear.
+    try:
+        rows = conn.execute(
+            "SELECT trigger_id, state, reason, as_of FROM thesis_state"
+            " WHERE as_of = (SELECT MAX(as_of) FROM thesis_state)").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
     latest = {r["trigger_id"]: r for r in rows}
-    as_of = rows[0]["as_of"]
+    as_of = rows[0]["as_of"] if rows else "never evaluated"
 
     out = []
     counts = {"FIRED": 0, "DORMANT": 0, "STALE": 0}
@@ -445,6 +453,168 @@ def render_theses(conn, path="theses.json"):
           f'not tracked at all:</b> {ed.html.escape(", ".join(blind))}. '
           f'Named so their absence stays a stated limit rather than being '
           f'read as absence of evidence.</p></section>')
+
+
+SLIDER_JS = """
+(function () {
+  var data = window.__dipProfile || {};
+  var el = document.getElementById('dip-slider');
+  if (!el) return;
+  var out = document.getElementById('dip-readout');
+  var tickerSel = document.getElementById('dip-ticker');
+  var MIN = Number(el.dataset.minEpisodes || 8);
+  var committed = (el.dataset.committed || '').split(',').map(Number);
+  // The slider indexes the depths the database actually holds rather than
+  // sweeping a numeric range, so every position shows a profile. A position
+  // that reads "no profile stored" teaches the reader nothing except that
+  // the grid and the control disagree.
+  var depths = (el.dataset.depths || '').split(',');
+
+  function cell(text, cls) {
+    var td = document.createElement('td');
+    td.textContent = text;              // textContent, never innerHTML
+    if (cls) td.className = cls;
+    return td;
+  }
+
+  function draw() {
+    var t = tickerSel.value, depth = depths[Number(el.value)];
+    var row = (data[t] || {})[depth];
+    var label = document.getElementById('dip-depth');
+    if (label) label.textContent = '−' + depth + '%';
+    out.innerHTML = '';
+    var head = document.createElement('div');
+    head.className = 'sl-head';
+    var isCommitted = committed.indexOf(Number(depth)) !== -1;
+    head.textContent = t + ' at \u2212' + depth + '%'
+      + (isCommitted ? '  \u00b7 a committed alert band' : '');
+    out.appendChild(head);
+    if (!row) {
+      var p = document.createElement('p');
+      p.className = 'sl-none';
+      p.textContent = 'no profile stored for this depth';
+      out.appendChild(p);
+      return;
+    }
+    var thin = row.n < MIN;
+    var warn = document.createElement('p');
+    warn.className = thin ? 'sl-thin' : 'sl-ok';
+    warn.textContent = thin
+      ? row.n + ' episode(s) \u2014 too few to read as a tendency'
+      : row.n + ' episodes';
+    out.appendChild(warn);
+    var tbl = document.createElement('table');
+    var tr = document.createElement('tr');
+    ['horizon', 'median', 'worst', 'positive'].forEach(function (h) {
+      var th = document.createElement('th'); th.textContent = h; tr.appendChild(th);
+    });
+    tbl.appendChild(tr);
+    (row.h || []).forEach(function (h) {
+      var r = document.createElement('tr');
+      r.appendChild(cell(h[0] + 'd'));
+      r.appendChild(cell(h[1] === null ? '\u2014' : h[1].toFixed(1) + '%',
+                         thin ? 'sl-dim' : ''));
+      r.appendChild(cell(h[2] === null ? '\u2014' : h[2].toFixed(1) + '%',
+                         thin ? 'sl-dim' : ''));
+      r.appendChild(cell(h[3] === null ? '\u2014' : h[3] + '/' + h[4]));
+      tbl.appendChild(r);
+    });
+    out.appendChild(tbl);
+  }
+  el.addEventListener('input', draw);
+  tickerSel.addEventListener('change', draw);
+  draw();
+})();
+"""
+
+SLIDER_CSS = """
+.sl { margin: 0 0 18px; }
+.sl-ctl { display: flex; align-items: center; gap: 12px; margin: 8px 0; }
+.sl-ctl input[type=range] { flex: 1 1 auto; accent-color: var(--signal); }
+.sl-ctl select, .sl-ctl output {
+  font-family: "IBM Plex Mono", monospace; font-size: 12px;
+  background: var(--field); color: var(--ink);
+  border: 1px solid var(--rule); border-radius: 2px; padding: 2px 6px;
+}
+.sl-head { font-family: "IBM Plex Mono", monospace; font-size: 12px;
+           color: var(--ink); margin-bottom: 4px; }
+.sl-ok { font-size: 11.5px; color: var(--muted); margin: 0 0 6px; }
+.sl-thin { font-size: 11.5px; color: var(--warm); margin: 0 0 6px;
+           font-weight: 600; }
+.sl-none { font-size: 11.5px; color: var(--muted); }
+.sl table { border-collapse: collapse; font-size: 11.5px;
+            font-family: "IBM Plex Mono", monospace; width: 100%; }
+.sl th { text-align: right; color: var(--muted); font-weight: 400;
+         font-size: 10px; letter-spacing: .06em; padding: 2px 6px;
+         border-bottom: 1px solid var(--rule); }
+.sl td { text-align: right; padding: 2px 6px; font-variant-numeric: tabular-nums;
+         border-bottom: 1px solid var(--rule); }
+.sl th:first-child, .sl td:first-child { text-align: left; }
+.sl .sl-dim { color: var(--muted); }
+"""
+
+
+def render_slider(conn):
+    """A calibration slider: what a threshold WOULD have done.
+
+    It changes nothing. The alert bands are committed in code and the thesis
+    thresholds are committed in a hand-edited file; this is for choosing a
+    number before committing to it, and for seeing how little is behind one
+    that has already been chosen.
+
+    The thing it is built to make visible is the sample collapsing. Drag the
+    depth out and the episode count falls away underneath the median, which
+    keeps printing a confident-looking number long after it has stopped
+    meaning anything. That is the failure this repo has hit repeatedly, and
+    it is far more obvious as a thing you drag than as a column you read.
+    """
+    import dips
+    rows = conn.execute(
+        "SELECT ticker, depth, horizon, n_episodes, median, worst,"
+        " positive, n_outcomes FROM dip_profile"
+        " ORDER BY ticker, depth, horizon").fetchall()
+    if not rows:
+        return ""
+    data = {}
+    for r in rows:
+        d = data.setdefault(r["ticker"], {}).setdefault(
+            str(int(r["depth"])), {"n": r["n_episodes"], "h": []})
+        d["h"].append([r["horizon"], r["median"], r["worst"],
+                       r["positive"], r["n_outcomes"]])
+    tickers = sorted(data)
+    depths = sorted({int(r["depth"]) for r in rows})
+    options = "".join(f'<option value="{ed.html.escape(t)}">'
+                      f'{ed.html.escape(t)}</option>' for t in tickers)
+    committed = ",".join(str(int(d)) for d in dips.DEPTHS)
+    # Start on a band that is actually committed, so the first thing on
+    # screen is a threshold the alerts really use.
+    start = next((i for i, d in enumerate(depths)
+                  if d in {int(x) for x in dips.DEPTHS}), 0)
+    # Ticks on the track mark the bands the alerts actually use, so the
+    # committed thresholds are visible while dragging past them.
+    ticks = "".join(
+        f'<option value="{i}" label="{d}"></option>'
+        for i, d in enumerate(depths) if d in {int(x) for x in dips.DEPTHS})
+    return (
+        '<section class="w-find sl"><h2>What a different threshold would '
+        'have done</h2>'
+        '<p class="w-scope">A calibration tool. It records nothing and '
+        'changes no alert — the bands that actually fire are committed in '
+        'code, and the thesis thresholds in a hand-edited file. Drag it to '
+        'see how quickly the sample disappears underneath the median.</p>'
+        f'<div class="sl-ctl">'
+        f'<select id="dip-ticker">{options}</select>'
+        f'<input type="range" id="dip-slider" min="0" '
+        f'max="{len(depths) - 1}" step="1" value="{start}" '
+        f'aria-label="dip depth" '
+        f'data-depths="{",".join(str(d) for d in depths)}" '
+        f'data-min-episodes="{dips.MIN_EPISODES}" '
+        f'data-committed="{committed}" list="dip-ticks">'
+        f'<output id="dip-depth" for="dip-slider"></output>'
+        f'<datalist id="dip-ticks">{ticks}</datalist>'
+        f'</div><div id="dip-readout"></div>'
+        f'<script>window.__dipProfile = {json.dumps(data)};</script>'
+        '</section>')
 
 
 def render_card(row):
@@ -495,6 +665,7 @@ def write_page(conn, path="docs/wheel.html", clouds=wheel.CLOUDS,
     findings = render_findings()
     dip_panel = render_dips(conn)
     thesis_panel = render_theses(conn)
+    slider_panel = render_slider(conn)
     cloud_text = ", ".join(f"{f}/{s}" for f, s in clouds)
 
     steps = (
@@ -521,7 +692,7 @@ def write_page(conn, path="docs/wheel.html", clouds=wheel.CLOUDS,
 <meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
-<style>{ed.CSS}{WHEEL_CSS}{THESIS_CSS}</style>
+<style>{ed.CSS}{WHEEL_CSS}{THESIS_CSS}{SLIDER_CSS}</style>
 </head><body><div class="wrap">
 <h1>Setups</h1>
 <p class="meta">{n_set} of {len(rows)} set up &nbsp;·&nbsp; clouds {ed.html.escape(cloud_text)} &nbsp;·&nbsp; red day {drop_pct:g}% &nbsp;·&nbsp; built {datetime.now().strftime("%Y-%m-%d %H:%M")} &nbsp;·&nbsp; <a href="index.html">EDGAR discovery</a></p>
@@ -533,6 +704,7 @@ modelled here would be the least reliable number on the page wearing the
 same typeface as the most reliable one.</p>
 <div class="w-grid">{cards}</div>
 {dip_panel}
+{slider_panel}
 {thesis_panel}
 {findings}
 {steps}
@@ -540,6 +712,23 @@ same typeface as the most reliable one.</p>
     with open(path, "w") as fh:
         fh.write(doc)
     return path, n_set, len(rows)
+
+
+def check_placed(panels, doc):
+    """Refuse a page that built a panel and then left it out.
+
+    The failure this exists for left no trace: the slider's CSS and its JS
+    were both in the merged page while the panel itself was not, so nothing
+    errored and the page simply came out short. A panel missing from the
+    page is indistinguishable from a panel with nothing to say, which is
+    the same confusion as a 403 logged as "no triggers fired".
+    """
+    missing = sorted(n for n, html in panels.items() if html and html not in doc)
+    if missing:
+        raise SystemExit(
+            f"panel(s) rendered but not placed in the page: "
+            f"{', '.join(missing)} -- refusing to publish a page that "
+            f"drops content it built")
 
 
 def write_merged(conn, path="docs/index.html", clouds=wheel.CLOUDS,
@@ -563,6 +752,18 @@ def write_merged(conn, path="docs/index.html", clouds=wheel.CLOUDS,
                          body_only=True)
     cloud_text = ", ".join(f"{f}/{s}" for f, s in clouds)
 
+    # Each panel renders once, into a named variable, so the template can be
+    # checked against them below. The slider and the thesis panel were both
+    # wired into write_page and silently left out of this one for a while:
+    # their CSS and their JS were here, so nothing errored and the page just
+    # came out short. That is the same failure as logging a 403 as "no
+    # triggers fired" -- a panel absent from the page is indistinguishable
+    # from a panel that had nothing to say -- so it is checked, not trusted.
+    panels = {"dips": render_dips(conn),
+              "slider": render_slider(conn),
+              "theses": render_theses(conn),
+              "findings": render_findings()}
+
     doc = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -573,7 +774,7 @@ def write_merged(conn, path="docs/index.html", clouds=wheel.CLOUDS,
 <meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
-<style>{ed.CSS}{WHEEL_CSS}{THESIS_CSS}</style>
+<style>{ed.CSS}{WHEEL_CSS}{THESIS_CSS}{SLIDER_CSS}</style>
 </head><body><div class="wrap">
 <h1>Signals</h1>
 <p class="meta">{n_set} of {len(rows)} set up &nbsp;·&nbsp; {body["n_moves"]} transition{"" if body["n_moves"] == 1 else "s"} &nbsp;·&nbsp; {body["n_issuers"]:,} issuers tracked &nbsp;·&nbsp; built {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
@@ -584,14 +785,19 @@ options chain. These funds also reset leverage daily and can fail to recover
 even when their index does — the dip table below says what actually followed
 dips of each depth, and over how few episodes.</p>
 <div class="w-grid">{cards}</div>
-{render_dips(conn)}
-{render_findings()}
+{panels["dips"]}
+{panels["slider"]}
+{panels["theses"]}
+{panels["findings"]}
 <hr class="w-split">
 <h2 class="w-h2">EDGAR discovery</h2>
 {body["sections"]}
 {body["watch_html"]}
 </div><div id="tip" role="status" aria-live="polite"></div>
-<script>{ed.SCRIPT}</script></body></html>"""
+<script>{ed.SCRIPT}</script>\n<script>{SLIDER_JS}</script></body></html>"""
+
+    check_placed(panels, doc)
+
     with open(path, "w") as fh:
         fh.write(doc)
     return path, n_set, len(rows)
@@ -616,7 +822,6 @@ def main():
     # Opened directly rather than through edgar_discovery.connect(), which
     # takes no path and would also run the collection schema's migrations on
     # a database this script only reads gauges from.
-    import sqlite3
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
@@ -631,5 +836,115 @@ def main():
     return 0
 
 
+def selftest():
+    """The checks here are all about CONTENT GOING MISSING SILENTLY.
+
+    The slider and the thesis panel were both built, both given their CSS
+    and their JS in the merged page, and both left out of its body. Nothing
+    raised. The page came out short and looked complete, which is the exact
+    failure this repo keeps re-inventing: an absence that reads as a result.
+    """
+    checks = 0
+
+    def ok(label, cond):
+        nonlocal checks
+        assert cond, "FAILED: " + label
+        checks += 1
+
+    def fresh():
+        c = sqlite3.connect(":memory:")
+        c.row_factory = sqlite3.Row
+        c.executescript(SCHEMA)
+        return c
+
+    def seed_dips(c, ticker="T", depths=(3, 5, 8, 12, 20)):
+        for d in depths:
+            for h in (5, 10, 21, 63):
+                c.execute(
+                    "INSERT OR REPLACE INTO dip_profile (ticker, depth,"
+                    " horizon, n_episodes, n_outcomes, pending, median,"
+                    " worst, best, positive, last_seen, window_first,"
+                    " window_last, updated_at) VALUES"
+                    " (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (ticker, float(d), h, 30 - d, 30 - d, 0, 1.5, -9.0, 9.0,
+                     15, "2026-10-01", "2024-01-01", "2026-10-01", "now"))
+        c.commit()
+
+    # -- the slider indexes stored depths, never a numeric sweep ----------
+    conn = fresh()
+    seed_dips(conn)
+    html = render_slider(conn)
+    ok("the slider spans exactly the depths that are stored",
+       'min="0"' in html and 'max="4"' in html)
+    ok("the stored depths travel with the control",
+       'data-depths="3,5,8,12,20"' in html)
+    ok("it opens on a committed band",
+       any(f'value="{i}"' in html for i in range(5)))
+    ok("the committed bands are named so a reader can see which are real",
+       'data-committed=' in html)
+
+    conn = fresh()
+    seed_dips(conn, depths=range(2, 31))
+    html = render_slider(conn)
+    ok("a finer grid gives a position per depth and no dead stops",
+       'max="28"' in html and 'data-depths="2,3,4' in html)
+
+    ok("an empty profile renders nothing rather than an empty control",
+       render_slider(fresh()) == "")
+
+    # -- a panel that cannot be evaluated is still drawn ------------------
+    conn = fresh()
+    conn.execute("DROP TABLE IF EXISTS thesis_state")
+    panel = render_theses(conn)
+    ok("a tracker that has never run still shows its pre-registered "
+       "triggers, as STALE",
+       "STALE" in panel and "never evaluated" in panel)
+    ok("and does not quietly report them as dormant",
+       panel.count(">DORMANT<") == 0)
+
+    # -- the guard that would have caught this bug ------------------------
+    panels = {"dips": "<section>a</section>", "slider": "<section>b</section>",
+              "theses": "", "findings": "<section>c</section>"}
+    whole = "<html>" + "".join(panels.values()) + "</html>"
+    raised = ""
+    try:
+        check_placed(panels, whole)
+    except SystemExit as exc:
+        raised = str(exc)
+    ok("a page carrying every panel is allowed through", raised == "")
+
+    short = whole.replace("<section>b</section>", "")
+    try:
+        check_placed(panels, short)
+    except SystemExit as exc:
+        raised = str(exc)
+    ok("a page that drops a panel it built is refused, not published",
+       "slider" in raised and "not placed" in raised)
+    ok("the refusal names the panel that went missing",
+       "dips" not in raised and "findings" not in raised)
+
+    # An empty panel is a panel with nothing to say, which is allowed. A
+    # NON-empty panel that vanished is the bug.
+    try:
+        check_placed(panels, whole)
+        raised = ""
+    except SystemExit as exc:
+        raised = str(exc)
+    ok("a panel that rendered empty is not mistaken for a dropped one",
+       raised == "" and panels["theses"] == "")
+
+    # -- the merged page really does carry both late additions -----------
+    src = open(__file__).read()
+    merged_body = src.split("def write_merged")[1]
+    for name in ("dips", "slider", "theses", "findings"):
+        ok(f"write_merged places the {name} panel",
+           f'{{panels["{name}"]}}' in merged_body)
+
+    print(f"wheel_page selftest: {checks} checks passed")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     sys.exit(main())
