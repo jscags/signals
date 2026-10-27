@@ -178,6 +178,144 @@ def eval_insider_cluster(trigger, conn, today):
         f"{len(issuers)} issuer(s) with sales >= ${floor/1e6:.0f}m in 90d")
 
 
+# The XBRL tags each metric trigger reads. Several alternates per concept
+# because filers do not all use the same tag, and a concept that silently
+# resolved to nothing would report DORMANT when it means ABSENT.
+CONCEPTS = {
+    "capex": ["PaymentsToAcquirePropertyPlantAndEquipment",
+              "PaymentsToAcquireProductiveAssets"],
+    "revenue": ["RevenueFromContractWithCustomerExcludingAssessedTax",
+                "Revenues", "RevenueFromContractWithCustomerIncludingAssessedTax"],
+    "inventory": ["InventoryNet"],
+    "receivables": ["AccountsReceivableNetCurrent",
+                    "AccountsReceivableNet"],
+}
+
+
+def _facts(cik, cache):
+    """companyfacts for one issuer, fetched once per run."""
+    import setup_pit
+    if cik not in cache:
+        cache[cik] = setup_pit.fetch_facts(cik)
+    return cache[cik]
+
+
+def _series(payload, names, today):
+    """Dated values for the first tag that has any, point in time.
+
+    Point in time means a fact counts from the date it was FILED, never the
+    date its period ended. A quarter ending in June and filed in August was
+    not knowable in July, and letting it be is the look-ahead that makes a
+    backtest lie. Same discipline setup_pit enforces for the setup rule.
+    """
+    facts = ((payload or {}).get("facts") or {}).get("us-gaap") or {}
+    for name in names:
+        unit_map = (facts.get(name) or {}).get("units") or {}
+        rows = unit_map.get("USD") or []
+        out = []
+        for fact in rows:
+            end, filed, val = (fact.get("end"), fact.get("filed"),
+                               fact.get("val"))
+            if not end or not filed or val is None:
+                continue
+            if filed > today:
+                continue                      # not knowable yet
+            out.append((end, filed, float(val), fact.get("fp"),
+                        fact.get("form")))
+        if out:
+            # Latest filing wins for a given period end, so a restatement
+            # supersedes rather than duplicating.
+            best = {}
+            for end, filed, val, fp, form in sorted(out, key=lambda r: r[1]):
+                best[end] = (filed, val, fp, form)
+            return name, sorted((e, v[1]) for e, v in best.items())
+    return None, []
+
+
+def _ttm_yoy(series):
+    """Trailing-four-quarter sum, and its year-over-year growth."""
+    if len(series) < 8:
+        return None, None, f"only {len(series)} periods, need 8"
+    vals = [v for _e, v in series]
+    now = sum(vals[-4:])
+    prior = sum(vals[-8:-4])
+    if not prior:
+        return now, None, "prior-year base is zero"
+    return now, (now - prior) / abs(prior) * 100.0, None
+
+
+def eval_capex(trigger, today, cache):
+    """Combined trailing-four-quarter capex growth across the named CIKs."""
+    ciks = trigger.get("ciks") or {}
+    if not ciks:
+        return STALE, None, {}, "no ciks named"
+    import setup_pit
+    detail, totals_now, totals_prior, failed = {}, 0.0, 0.0, []
+    for name, cik in ciks.items():
+        payload, outcome = _facts(int(cik), cache)
+        if outcome != setup_pit.OK:
+            failed.append(f"{name}:{outcome}")
+            continue
+        tag, series = _series(payload, CONCEPTS["capex"], today)
+        if len(series) < 8:
+            failed.append(f"{name}:thin({len(series)})")
+            continue
+        vals = [v for _e, v in series]
+        totals_now += sum(vals[-4:])
+        totals_prior += sum(vals[-8:-4])
+        detail[name] = {"tag": tag, "ttm": round(sum(vals[-4:]) / 1e9, 2)}
+    # Any issuer missing makes the COMBINED figure wrong, not merely smaller.
+    if failed:
+        return STALE, None, detail, (
+            f"combined figure needs all {len(ciks)} issuers; missing "
+            f"{', '.join(failed)}")
+    if not totals_prior:
+        return STALE, None, detail, "prior-year combined base is zero"
+    growth = (totals_now - totals_prior) / abs(totals_prior) * 100.0
+    threshold = _threshold(trigger["fires_when"])
+    if threshold is None:
+        return STALE, growth, detail, "could not parse fires_when"
+    state = FIRED if growth < threshold else DORMANT
+    detail["combined_ttm_bn"] = round(totals_now / 1e9, 1)
+    return state, growth, detail, (
+        f"combined TTM capex ${totals_now/1e9:.0f}bn, {growth:+.1f}% YoY")
+
+
+def eval_divergence(trigger, today, cache, left, right, unit="pp"):
+    """Growth of one concept minus growth of another, per issuer."""
+    ciks = trigger.get("ciks") or {}
+    if not ciks:
+        return STALE, None, {}, "no ciks named"
+    import setup_pit
+    detail, worst, failed = {}, None, []
+    for name, cik in ciks.items():
+        payload, outcome = _facts(int(cik), cache)
+        if outcome != setup_pit.OK:
+            failed.append(f"{name}:{outcome}")
+            continue
+        _lt, ls = _series(payload, CONCEPTS[left], today)
+        _rt, rs = _series(payload, CONCEPTS[right], today)
+        _n1, lg, e1 = _ttm_yoy(ls)
+        _n2, rg, e2 = _ttm_yoy(rs)
+        if lg is None or rg is None:
+            failed.append(f"{name}:{e1 or e2}")
+            continue
+        gap = lg - rg
+        detail[name] = round(gap, 1)
+        worst = gap if worst is None else max(worst, gap)
+    if worst is None:
+        return STALE, None, detail, (
+            f"no issuer evaluable ({'; '.join(failed)})")
+    threshold = _threshold(trigger["fires_when"])
+    if threshold is None:
+        return STALE, worst, detail, "could not parse fires_when"
+    note = f"; could not read {', '.join(failed)}" if failed else ""
+    state = FIRED if worst > threshold else DORMANT
+    return state, worst, detail, (
+        f"widest gap {worst:+.1f}{unit} "
+        f"({max(detail, key=detail.get)}){note}")
+
+
 def _threshold(expr):
     import re
     m = re.search(r"[<>]=?\s*(-?\d+(?:\.\d+)?)", expr or "")
@@ -195,6 +333,14 @@ def _cluster_terms(expr):
 # Which evaluator handles which trigger. Unknown ids are STALE rather than
 # silently skipped: a trigger nobody implemented must not read as DORMANT.
 HANDLERS = {
+    "capex-growth-negative": ("facts", eval_capex),
+    "capex-growth-decelerating": ("facts", eval_capex),
+    "inventory-outgrows-revenue": (
+        "facts", lambda t, today, cache: eval_divergence(
+            t, today, cache, "inventory", "revenue")),
+    "receivables-stretching": (
+        "facts", lambda t, today, cache: eval_divergence(
+            t, today, cache, "receivables", "revenue")),
     "ai-complex-drawdown": ("price", eval_price_drawdown),
     "curve-inversion": ("gauge", eval_curve),
     "credit-stress-proxy": ("price", eval_ratio_drawdown),
@@ -205,6 +351,7 @@ HANDLERS = {
 def run(conn, theses, prices=None, today=None):
     today = today or date.today().isoformat()
     conn.executescript(SCHEMA)
+    facts_cache = {}          # one companyfacts fetch per issuer per run
     out = []
     for thesis in theses["theses"]:
         for trigger in thesis["triggers"]:
@@ -225,6 +372,9 @@ def run(conn, theses, prices=None, today=None):
                     elif kind == "gauge" or kind == "db":
                         state, value, detail, reason = fn(
                             trigger, conn, today)
+                    elif kind == "facts":
+                        state, value, detail, reason = fn(
+                            trigger, today, facts_cache)
                 except Exception as exc:
                     # An exception is STALE, never DORMANT. This is the line
                     # that stops an outage reading as reassurance.
