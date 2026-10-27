@@ -1,0 +1,146 @@
+{
+  "_README": [
+    "HAND-EDITED. The pipeline reads this file and never writes it.",
+    "",
+    "This is a pre-registration, not a watchlist. The thresholds are written",
+    "down BEFORE the evidence is looked at, because a tracker for a thesis",
+    "you already hold will otherwise find whatever you went looking for. If",
+    "a trigger never fires, that is a result. If you move a threshold after",
+    "seeing the data, write down that you moved it and why.",
+    "",
+    "Three trigger types only: metric, price, event.",
+    "",
+    "Every trigger must state a direction and a number. 'Capex slows' is not",
+    "a trigger. 'Combined trailing-four-quarter capex growth below 0% year",
+    "over year' is.",
+    "",
+    "A trigger that cannot be evaluated reports STALE, which is not DORMANT.",
+    "DORMANT means we looked and the condition did not hold. STALE means we",
+    "could not look. They must never be rendered the same."
+  ],
+
+  "theses": [
+    {
+      "id": "ai-capex-cycle",
+      "title": "The AI buildout is funded by four balance sheets",
+      "statement": "Hyperscaler capital expenditure is the demand under the AI complex. If the four largest spenders decelerate together, the revenue underneath the semiconductor and power trades goes with it, regardless of end-user demand for the models themselves.",
+      "disconfirms": "Capex keeps compounding while semiconductor revenue stalls anyway, which would mean the bottleneck is elsewhere and this thesis is watching the wrong variable.",
+      "triggers": [
+        {
+          "id": "capex-growth-negative",
+          "type": "metric",
+          "what": "Combined trailing-four-quarter capital expenditure, four hyperscalers",
+          "source": "XBRL companyfacts, PaymentsToAcquirePropertyPlantAndEquipment",
+          "ciks": {"MSFT": 789019, "GOOGL": 1652044, "AMZN": 1018724, "META": 1326801},
+          "fires_when": "yoy_growth_pct < 0",
+          "note": "Point-in-time: a quarter counts from its FILED date, never its period end."
+        },
+        {
+          "id": "capex-growth-decelerating",
+          "type": "metric",
+          "what": "Same series, second derivative",
+          "source": "XBRL companyfacts, PaymentsToAcquirePropertyPlantAndEquipment",
+          "ciks": {"MSFT": 789019, "GOOGL": 1652044, "AMZN": 1018724, "META": 1326801},
+          "fires_when": "yoy_growth_pct < 15 for two consecutive quarters",
+          "note": "An early, weaker version of the one above. Expected to fire first and to be wrong more often."
+        }
+      ]
+    },
+
+    {
+      "id": "semi-inventory-divergence",
+      "title": "Inventory outgrowing revenue is what the top looks like in the accounts",
+      "statement": "In every prior semiconductor cycle, inventory kept building after demand turned, because orders were placed against a forecast that had already broken. The divergence shows up in the accounts a quarter or two before it shows up in guidance.",
+      "disconfirms": "Inventory builds and revenue keeps compounding anyway, which has happened during genuine supply constraint and would mean the build is deliberate rather than stranded.",
+      "triggers": [
+        {
+          "id": "inventory-outgrows-revenue",
+          "type": "metric",
+          "what": "Inventory growth minus revenue growth, year over year",
+          "source": "XBRL companyfacts, InventoryNet and RevenueFromContractWithCustomerExcludingAssessedTax",
+          "ciks": {"NVDA": 1045810, "AMD": 2488, "AVGO": 1730168, "MU": 723125},
+          "fires_when": "inventory_yoy_pct - revenue_yoy_pct > 20",
+          "note": "Twenty points is the threshold because smaller gaps are ordinary seasonality."
+        },
+        {
+          "id": "receivables-stretching",
+          "type": "metric",
+          "what": "Days sales outstanding, year over year change",
+          "source": "XBRL companyfacts, AccountsReceivableNetCurrent and revenue",
+          "ciks": {"NVDA": 1045810, "AMD": 2488, "AVGO": 1730168},
+          "fires_when": "dso_change_days > 15",
+          "note": "What vendor financing looks like from outside: revenue recognised, cash not collected."
+        }
+      ]
+    },
+
+    {
+      "id": "insiders-leaving",
+      "title": "The people with the most information are selling",
+      "statement": "Officers and directors at the AI complex sell for many reasons and most of them are uninformative. A sharp CLUSTER of large sales across several issuers in a short window is a different object from steady scheduled selling.",
+      "disconfirms": "A cluster fires and the complex keeps rising, which is the base rate and the reason this trigger is weak on its own.",
+      "triggers": [
+        {
+          "id": "insider-sale-cluster",
+          "type": "event",
+          "what": "Distinct issuers in the AI complex with officer or director sales above the value floor, in a rolling window",
+          "source": "insider_sales, already collected from Form 4",
+          "fires_when": "distinct_issuers >= 4 within 90 days with value >= 5000000",
+          "note": "Uses the suspect flag to exclude the implausible-price rows that rescore already catches."
+        }
+      ]
+    },
+
+    {
+      "id": "financing-conditions",
+      "title": "The buildout is partly debt-funded and rates are the constraint",
+      "statement": "Datacenter construction and GPU purchases are increasingly financed rather than paid from cash flow. A widening in credit stress raises the hurdle rate on the marginal datacenter before it shows up in any company's accounts.",
+      "disconfirms": "Credit widens sharply and capex continues, meaning the spending is cash-funded and insensitive to financing cost.",
+      "triggers": [
+        {
+          "id": "credit-stress-proxy",
+          "type": "price",
+          "what": "High-yield versus long Treasury, as a ratio",
+          "source": "Polygon daily closes, HYG and TLT",
+          "fires_when": "ratio_drawdown_pct_from_60d_high > 8",
+          "note": "A proxy, not a spread. Real option-adjusted spreads are not available on free data and this must not be described as one."
+        },
+        {
+          "id": "curve-inversion",
+          "type": "price",
+          "what": "Ten-year minus two-year Treasury par yield",
+          "source": "Treasury daily yield curve, already collected as a gauge",
+          "fires_when": "spread_bp < 0"
+        }
+      ]
+    },
+
+    {
+      "id": "complex-breaking-down",
+      "title": "Price confirms, late and without explanation",
+      "statement": "Price is the weakest evidence here and the only one that is never ABSENT. It is included so the record shows what the complex was doing while every other trigger sat dormant.",
+      "disconfirms": "Nothing. This is a thermometer, not a thesis, and it is labelled as one.",
+      "triggers": [
+        {
+          "id": "ai-complex-drawdown",
+          "type": "price",
+          "what": "Drawdown from the 20-session high",
+          "source": "Polygon daily closes",
+          "tickers": ["NVDA", "SMH", "SOXX"],
+          "fires_when": "drawdown_pct > 20"
+        }
+      ]
+    }
+  ],
+
+  "_not_measurable": {
+    "_note": "Named explicitly so their absence is a stated limit of this tracker rather than a silent gap. A trigger that cannot be evaluated must not exist here pretending to be DORMANT.",
+    "datacenter_power_and_permits": "No free structured source. Utility interconnection queues are published inconsistently and per-region.",
+    "private_ai_company_finances": "OpenAI, Anthropic, xAI and similar do not file. The largest demand signals in this thesis are invisible to EDGAR by construction.",
+    "export_controls": "Policy events have no structured feed and arrive as prose.",
+    "gpu_spot_and_rental_rates": "No free source with history.",
+    "inference_cost_curves": "Not disclosed by anyone in a comparable form.",
+    "circular_and_vendor_financing_deals": "Visible only in filing prose. Lane D Phase 0 measured free-text extraction from 8-K exhibits at 21 HIT, 2 MISSED, 37 ABSENT over 60 releases, so a trigger built on it would report ABSENT most of the time and could not be trusted when it did not.",
+    "depreciation_useful_life_changes": "Stated in accounting-policy prose rather than a comparable XBRL tag. Same extraction problem as above."
+  }
+}
