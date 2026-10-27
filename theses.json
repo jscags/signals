@@ -135,8 +135,9 @@
           "type": "price",
           "what": "High-yield versus long Treasury, as a ratio",
           "source": "Polygon daily closes, HYG and TLT",
+          "pair": ["HYG", "TLT"],
           "fires_when": "ratio_drawdown_pct_from_60d_high > 8",
-          "note": "A proxy, not a spread. Real option-adjusted spreads are not available on free data and this must not be described as one."
+          "note": "A proxy, not a spread. Real option-adjusted spreads are not available on free data and this must not be described as one. The pair is named explicitly rather than left to a default in code, for the same reason the insider trigger lists its fifteen tickers: a universe the tracker infers is one nobody can check. No threshold was changed when this was added."
         },
         {
           "id": "curve-inversion",

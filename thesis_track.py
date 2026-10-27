@@ -604,6 +604,22 @@ def run(conn, theses, prices=None, today=None):
     return out
 
 
+def price_tickers(spec):
+    """Every ticker a price trigger needs, so they can be fetched.
+
+    Read from the thesis file rather than hard-coded, so adding a price
+    trigger does not silently add a trigger whose data nobody collects.
+    """
+    out = set()
+    for thesis in (spec or {}).get("theses", []):
+        for trigger in thesis.get("triggers", []):
+            if trigger.get("type") != "price":
+                continue
+            out.update(trigger.get("tickers") or [])
+            out.update(trigger.get("pair") or [])
+    return out
+
+
 def explain(cik, today=None):
     """Dump every USD row for one issuer's concepts, durations included.
 
@@ -657,14 +673,24 @@ def main():
     if args.explain:
         return explain(args.explain)
     conn = sqlite3.connect(args.db)
+    spec = load(args.theses)
     prices = None
     try:
         import market_data
         prices = market_data.connect(args.price_db)
+        # The price triggers name tickers nothing else in this pipeline
+        # fetches -- the setups page only collects the leveraged ETFs. For
+        # three runs that made credit-stress-proxy and ai-complex-drawdown
+        # report STALE, which was true but for a plumbing reason rather
+        # than anything about the market. A trigger whose data was never
+        # requested is not evidence of anything.
+        wanted = price_tickers(spec)
+        if wanted:
+            market_data.refresh(prices, sorted(wanted))
     except Exception as exc:
         print(f"no price database ({exc}); price triggers will be STALE")
     print(f"evaluating {args.theses}\n")
-    run(conn, load(args.theses), prices)
+    run(conn, spec, prices)
     return 0
 
 
@@ -900,6 +926,18 @@ def selftest():
        tag == "Revenues")
     ok("so the series is current, not a decade old",
        picked[-1][0] == "2025-12-31")
+
+    # -- the price triggers must declare what to fetch --------------------
+    spec = load("theses.json")
+    want = price_tickers(spec)
+    ok("the price triggers name the tickers they need",
+       {"HYG", "TLT", "NVDA", "SMH", "SOXX"} <= want)
+    ok("and a gauge trigger contributes none",
+       price_tickers({"theses": [{"triggers": [
+           {"type": "price", "id": "curve-inversion"}]}]}) == set())
+    ok("a metric trigger's issuers are not fetched as prices",
+       price_tickers({"theses": [{"triggers": [
+           {"type": "metric", "tickers": ["XXX"]}]}]}) == set())
 
     # Point in time still holds: nothing filed after the as-of date counts.
     _t, early = _series(pay, CONCEPTS["revenue"], "2024-06-30", "flow")
