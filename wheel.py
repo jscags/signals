@@ -206,6 +206,18 @@ def report(tickers, clouds=CLOUDS, drop_pct=DROP_PCT):
             print()
         if hits:
             print(f"  most recent: {', '.join(r['day'] for r in hits[-5:])}")
+        # Corporate actions, before any statistic derived from the series.
+        import dips as _dips
+        gaps = _dips.suspect_gaps(
+            [b[0] for b in bars], [float(b[4]) for b in bars])
+        for g in gaps:
+            kind = (f"SPLIT-LIKE (ratio {g['ratio']:.3f} ~ "
+                    f"{g['split_like']})" if g["split_like"]
+                    else "large but not split-like")
+            print(f"  !! {g['day']}: {g['prev']:.2f} -> {g['close']:.2f}"
+                  f"  {g['move']:+.1f}%  {kind}")
+        if not gaps:
+            print("  no suspect single-session gaps")
         print(f"  TODAY ({state['day']}): "
               f"{'SET UP' if state['qualifies'] else 'no'} -- {state['why']}")
         print(f"    clouds green {state['green_streak']} session(s) running")

@@ -206,6 +206,27 @@ def run(conn, tickers, price_db=None, repo=None, token=None, dry_run=False):
             continue
         days = [b[0] for b in bars]
         closes = [float(b[4]) for b in bars]
+
+        # Refuse to alert on a series carrying a corporate action. An
+        # unadjusted split reads as an overnight collapse, and the alert
+        # would fire on it with full confidence and a tidy evidence table.
+        # Silence here is correct: there is no dip, there is bad data.
+        window = days[-(dips.HIGH_LOOKBACK + 1):]
+        recent = dips.suspect_gaps(
+            window, closes[-(dips.HIGH_LOOKBACK + 1):])
+        splits = [g for g in recent if g["split_like"]]
+        if splits:
+            g = splits[0]
+            print(f"{ticker}: SUSPECT SPLIT on {g['day']} "
+                  f"({g['prev']:.2f} -> {g['close']:.2f}, "
+                  f"ratio {g['ratio']:.3f}) -- no alert, the drawdown here "
+                  f"is a corporate action, not a price move")
+            continue
+        if recent:
+            g = recent[0]
+            print(f"{ticker}: note, {g['move']:+.1f}% on {g['day']} "
+                  f"is large but not split-like")
+
         state = dips.current(days, closes)
         depth, why = decide(conn, ticker, state and state["drawdown"])
         print(f"{ticker}: -{state['drawdown']:.1f}% -> {why}")

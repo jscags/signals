@@ -44,6 +44,46 @@ COOLDOWN = 10                          # sessions before a new episode counts
 MIN_EPISODES = 8                       # below this, report but do not imply
 
 
+# A 3x fund moves hard, but not this hard. Anything past this in one
+# session is treated as suspect until proven otherwise.
+GAP_SUSPECT_PCT = 25.0
+# Ratios a split produces. A "crash" that lands on one of these to within a
+# couple of percent is almost certainly a corporate action that the price
+# series has not been adjusted for.
+SPLIT_RATIOS = (0.25, 1 / 3.0, 0.5, 2.0, 3.0, 4.0)
+SPLIT_TOLERANCE = 0.03
+
+
+def suspect_gaps(days, closes, threshold=GAP_SUSPECT_PCT):
+    """Single sessions too large to be a market move. Returns a list.
+
+    This exists because of what a split does to a price series. If the
+    history is not adjusted, a 2-for-1 shows up as a 50% overnight collapse,
+    and every statistic downstream -- drawdown, dip depth, forward return,
+    the alert threshold -- reads a corporate action as a crash. It would not
+    error. It would produce confident, wrong numbers, which is worse.
+
+    A move is flagged when it exceeds the threshold, and separately marked
+    when the ratio lands on a common split factor, because that is the
+    difference between "unusual day" and "not a price move at all".
+    """
+    out = []
+    for i in range(1, len(closes)):
+        prev, close = closes[i - 1], closes[i]
+        if not prev or not close:
+            continue
+        move = (close - prev) / prev * 100.0
+        if abs(move) < threshold:
+            continue
+        ratio = close / prev
+        near = next((r for r in SPLIT_RATIOS
+                     if abs(ratio - r) <= SPLIT_TOLERANCE), None)
+        out.append({"day": days[i], "prev_day": days[i - 1],
+                    "move": move, "ratio": ratio,
+                    "split_like": near, "prev": prev, "close": close})
+    return out
+
+
 def rolling_high(closes, lookback=HIGH_LOOKBACK):
     """Highest close of the preceding `lookback` sessions, inclusive.
 
@@ -193,6 +233,18 @@ def selftest():
     rows = profile(list(range(len(path))), path, depths=(8.0,), horizons=(63,))
     ok("an episode with no outcome yet is pending",
        rows[0]["horizons"][63]["pending"] == rows[0]["n_episodes"])
+
+    # A split must be caught, and told apart from a violent but real day.
+    split = [100.0] * 10 + [50.0] * 10
+    found = suspect_gaps([f"d{i}" for i in range(20)], split)
+    ok("a 2-for-1 is flagged", len(found) == 1)
+    ok("and identified as split-like", found[0]["split_like"] == 0.5)
+    rough = [100.0] * 10 + [72.0] * 10          # -28%, violent but not a split
+    r2 = suspect_gaps([f"d{i}" for i in range(20)], rough)
+    ok("a violent real day is flagged too", len(r2) == 1)
+    ok("but not called a split", r2[0]["split_like"] is None)
+    ok("an ordinary 9% day is not flagged",
+       suspect_gaps(["a", "b"], [100.0, 91.0]) == [])
 
     cur = current(days, [100.0] * 39 + [92.0])
     ok("current reports the drawdown", abs(cur["drawdown"] - 8.0) < 1e-9)
