@@ -390,6 +390,11 @@ THESIS_CSS = """
              border: 1px solid var(--rule); border-radius: 2px;
              padding: 0 4px; vertical-align: 1px; }
 .t-breadth.lone { color: var(--warm); border-color: var(--warm); }
+/* A threshold changed after the evidence was seen. Marked, not hidden:
+   a fitted number must not sit unmarked beside pre-registered ones. */
+.t-moved { font-family: "IBM Plex Mono", monospace; font-size: 10px;
+           color: var(--muted); margin-left: 6px; letter-spacing: .04em;
+           border-bottom: 1px dotted var(--muted); cursor: help; }
 .t-why { color: var(--muted); margin-left: auto; text-align: right;
          font-size: 11.5px; }
 .t-thesis { margin: 14px 0 2px; font-size: 12.5px; }
@@ -438,7 +443,7 @@ def render_theses(conn, path="theses.json"):
                 f'<div class="t-row">'
                 f'<span class="t-state {state.lower()}">{state}</span>'
                 f'<span class="t-id">{ed.html.escape(trigger["id"])}'
-                f'{breadth_badge(r)}</span>'
+                f'{breadth_badge(r)}{moved_badge(spec, trigger["id"])}</span>'
                 f'<span class="t-why">{ed.html.escape(why)}</span></div>')
         out.append(
             f'<div class="t-thesis"><b>{ed.html.escape(thesis["title"])}</b>'
@@ -449,13 +454,25 @@ def render_theses(conn, path="theses.json"):
 
     blind = [k for k in (spec.get("_not_measurable") or {})
              if not k.startswith("_")]
+    # Say how many thresholds are no longer pre-registrations. The sentence
+    # above this one claims they were written down before the evidence was
+    # looked at, and for a moved threshold that is no longer true.
+    n_moved = sum(1 for v in (spec.get("_threshold_moves") or {}).values()
+                  if isinstance(v, dict)
+                  and v.get("moved") not in (None, "not moved"))
+    moved_note = (
+        f' {n_moved} ha{"s" if n_moved == 1 else "ve"} since been moved '
+        f'after calibration and {"is" if n_moved == 1 else "are"} marked '
+        f'<span class="t-moved">moved</span> — a fitted threshold is '
+        f'weaker evidence than one that was never touched.') if n_moved else ""
     return (
         '<section class="w-find t-wrap"><h2>Pre-registered triggers</h2>'
         f'<p class="w-scope">{counts.get("FIRED",0)} fired · '
         f'{counts.get("DORMANT",0)} dormant · <b>{counts.get("STALE",0)} '
         f'could not be evaluated</b> · as of {ed.html.escape(as_of)}. '
         f'Thresholds were written down before the evidence was looked at; '
-        f'the file is hand-edited and the pipeline never writes it.</p>'
+        f'the file is hand-edited and the pipeline never writes it.'
+        f'{moved_note}</p>'
         + "".join(out)
         + f'<p class="w-scope"><b>Not measurable on free data, and therefore '
           f'not tracked at all:</b> {ed.html.escape(", ".join(blind))}. '
@@ -560,6 +577,27 @@ SLIDER_CSS = """
 .sl th:first-child, .sl td:first-child { text-align: left; }
 .sl .sl-dim { color: var(--muted); }
 """
+
+
+def moved_badge(spec, trigger_id):
+    """Mark a threshold that was changed after the evidence was seen.
+
+    The panel's own blurb says the thresholds were written down before the
+    evidence was looked at. For a threshold that has since been moved that
+    sentence is no longer true, and a fitted number sitting unmarked beside
+    pre-registered ones borrows credibility it is not owed. The move is
+    recorded in theses.json; this puts it on the page.
+    """
+    move = (spec.get("_threshold_moves") or {}).get(trigger_id)
+    if not isinstance(move, dict):
+        return ""
+    when = move.get("moved")
+    if not when or when == "not moved":
+        return ""
+    title = (f"threshold moved {when} after calibration: "
+             f"{move.get('from', '?')} -> {move.get('to', '?')}")
+    return (f'<span class="t-moved" title="{ed.html.escape(title)}">'
+            f'moved</span>')
 
 
 def breadth_badge(row):
@@ -946,6 +984,23 @@ def selftest():
                 None):
         ok("a trigger with no breadth to report renders nothing",
            breadth_badge(bad) == "")
+
+    # -- a moved threshold is not a pre-registration ----------------------
+    spec = {"_threshold_moves": {
+        "_note": "not a trigger",
+        "a": {"moved": "2026-10-27", "from": "x > 20", "to": "x > 50"},
+        "b": {"moved": "not moved", "why": "nothing to calibrate against"}}}
+    ok("a moved threshold is marked on the page",
+       "moved" in moved_badge(spec, "a"))
+    ok("and the move travels in the tooltip",
+       "x &gt; 20 -&gt; x &gt; 50" in moved_badge(spec, "a"))
+    ok("a threshold deliberately NOT moved is not marked",
+       moved_badge(spec, "b") == "")
+    ok("an untouched trigger is not marked",
+       moved_badge(spec, "c") == "")
+    ok("the bookkeeping note is not mistaken for a trigger",
+       moved_badge(spec, "_note") == "")
+    ok("and no moves means no mark", moved_badge({}, "a") == "")
 
     # -- the guard that would have caught this bug ------------------------
     panels = {"dips": "<section>a</section>", "slider": "<section>b</section>",

@@ -37,7 +37,7 @@
             "META": 1326801
           },
           "fires_when": "yoy_growth_pct < 0",
-          "note": "Point-in-time: a quarter counts from its FILED date, never its period end."
+          "note": "Point-in-time: a quarter counts from its FILED date, never its period end. NOT CALIBRATABLE on available history: every candidate threshold from -20% to +25% produces exactly ONE episode over 36 months, because the window contains a single regime change and nothing else. The threshold was not moved, because there is nothing here to move it against. This fires on judgment, not on evidence about its own behaviour, and should be read that way until the history is deeper."
         },
         {
           "id": "capex-growth-decelerating",
@@ -51,7 +51,7 @@
             "META": 1326801
           },
           "fires_when": "yoy_growth_pct < 15 for two consecutive quarters",
-          "note": "An early, weaker version of the one above. Expected to fire first and to be wrong more often."
+          "note": "An early, weaker version of the one above. Expected to fire first and to be wrong more often. It has not been a different instrument so far: over 36 months it is IDENTICAL to capex-growth-negative at thresholds of 10 and 15 -- same nine months, same single episode. Kept because the expectation was pre-registered and a trigger that turns out to duplicate another is a result worth leaving visible, not deleting."
         }
       ]
     },
@@ -72,8 +72,8 @@
             "AVGO": 1730168,
             "MU": 723125
           },
-          "fires_when": "inventory_yoy_pct - revenue_yoy_pct > 20",
-          "note": "Twenty points is the threshold because smaller gaps are ordinary seasonality."
+          "fires_when": "inventory_yoy_pct - revenue_yoy_pct > 50",
+          "note": "MOVED 2026-10-27 from 20 to 50 points, after calibration. See _threshold_moves. Twenty points was chosen on the reasoning that smaller gaps are ordinary seasonality; the data says the gap has been positive at EVERY one of 36 monthly as-of dates, minimum +2.9pp, so twenty points described a standing condition rather than a change."
         },
         {
           "id": "receivables-stretching",
@@ -85,8 +85,8 @@
             "AMD": 2488,
             "AVGO": 1730168
           },
-          "fires_when": "dso_change_days > 15",
-          "note": "What vendor financing looks like from outside: revenue recognised, cash not collected."
+          "fires_when": "dso_change_days > 20",
+          "note": "MOVED 2026-10-27 from 15 to 20 days, after calibration. See _threshold_moves. What vendor financing looks like from outside: revenue recognised, cash not collected."
         }
       ]
     },
@@ -169,6 +169,28 @@
       ]
     }
   ],
+  "_threshold_moves": {
+    "_note": "Every threshold changed after the evidence was looked at, with what the evidence actually said. The README says a moved threshold must be written down; this is where. A number here is NOT a pre-registration any more and should carry less weight than one that was never touched.",
+    "_method": "thesis_track.py --calibrate 36, run 2026-10-27 over 36 monthly as-of dates (2023-11-27..2026-10-27), point in time: each date saw only facts FILED by then. Caveat recorded at the time: monthly sampling of quarterly filings means each quarter is sampled about three times, so the 'months over' figures are inflated roughly 3x as a count of independent observations. The episode counts are not affected and were the basis for these decisions.",
+    "inventory-outgrows-revenue": {
+      "moved": "2026-10-27",
+      "from": "inventory_yoy_pct - revenue_yoy_pct > 20",
+      "to": "inventory_yoy_pct - revenue_yoy_pct > 50",
+      "why": "At 20 points the trigger was over the line for 22 of 36 months and fired on the FIRST date in the window. The gap was positive at every single as-of date, minimum +2.9pp, maximum +93.3pp. That is a description of a standing condition, not a detector of change. At 50 points: 13 months, 3 episodes -- the first threshold in the sweep that separates.",
+      "cost": "This is a weaker claim than the original. The threshold now sits where the data says something changes, which means it was chosen with the data in view and could be fitted to this window. AVGO at +58.8pp still crosses it today, so the move does not silence the current finding -- worth stating, because a move that happens to keep your existing signal deserves more suspicion, not less."
+    },
+    "receivables-stretching": {
+      "moved": "2026-10-27",
+      "from": "dso_change_days > 15",
+      "to": "dso_change_days > 20",
+      "why": "At 15 days the trigger was over the line for 20 of 36 months. At 20 days it keeps BOTH episodes but falls to 6 months -- same number of distinct events, far less time spent describing a state. Range over the window was -2.2 to +25.4 days. 25 days was rejected: 3 months but only ONE episode, which is the sample collapsing.",
+      "cost": "AVGO sat at +16.6 days when this was moved, so raising the threshold to 20 turns the current FIRED into DORMANT. The move was made knowing it switches off a live signal, which is the correct direction for this kind of edit -- a threshold moved after seeing data should be moved against your own prior, not toward it."
+    },
+    "capex-growth-negative": {
+      "moved": "not moved",
+      "why": "Every candidate from -20% to +25% produces exactly ONE episode across 36 months. There is nothing to calibrate against: the window holds a single regime change. Recorded here so the absence of a move is a decision rather than an oversight."
+    }
+  },
   "_not_measurable": {
     "_note": "Named explicitly so their absence is a stated limit of this tracker rather than a silent gap. A trigger that cannot be evaluated must not exist here pretending to be DORMANT.",
     "datacenter_power_and_permits": "No free structured source. Utility interconnection queues are published inconsistently and per-region.",
