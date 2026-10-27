@@ -383,6 +383,13 @@ THESIS_CSS = """
 .t-state.stale   { color: var(--warm); border: 1px dashed var(--warm);
                    font-weight: 600; }
 .t-id { font-family: "IBM Plex Mono", monospace; color: var(--ink); }
+/* Breadth, not state: how many named issuers crossed. Recessive by
+   default; a lone crosser out of several is the case worth seeing. */
+.t-breadth { font-family: "IBM Plex Mono", monospace; font-size: 10px;
+             color: var(--muted); margin-left: 6px;
+             border: 1px solid var(--rule); border-radius: 2px;
+             padding: 0 4px; vertical-align: 1px; }
+.t-breadth.lone { color: var(--warm); border-color: var(--warm); }
 .t-why { color: var(--muted); margin-left: auto; text-align: right;
          font-size: 11.5px; }
 .t-thesis { margin: 14px 0 2px; font-size: 12.5px; }
@@ -411,7 +418,7 @@ def render_theses(conn, path="theses.json"):
     # which pre-registered triggers simply do not appear.
     try:
         rows = conn.execute(
-            "SELECT trigger_id, state, reason, as_of FROM thesis_state"
+            "SELECT trigger_id, state, reason, detail, as_of FROM thesis_state"
             " WHERE as_of = (SELECT MAX(as_of) FROM thesis_state)").fetchall()
     except sqlite3.OperationalError:
         rows = []
@@ -430,7 +437,8 @@ def render_theses(conn, path="theses.json"):
             body.append(
                 f'<div class="t-row">'
                 f'<span class="t-state {state.lower()}">{state}</span>'
-                f'<span class="t-id">{ed.html.escape(trigger["id"])}</span>'
+                f'<span class="t-id">{ed.html.escape(trigger["id"])}'
+                f'{breadth_badge(r)}</span>'
                 f'<span class="t-why">{ed.html.escape(why)}</span></div>')
         out.append(
             f'<div class="t-thesis"><b>{ed.html.escape(thesis["title"])}</b>'
@@ -552,6 +560,30 @@ SLIDER_CSS = """
 .sl th:first-child, .sl td:first-child { text-align: left; }
 .sl .sl-dim { color: var(--muted); }
 """
+
+
+def breadth_badge(row):
+    """How many of a trigger's named issuers crossed, as its own mark.
+
+    These triggers fire on the widest gap across the issuers they name,
+    which is how they were pre-registered. One of four firing is a weaker
+    finding than four of four, and the page said only "widest gap (AVGO)"
+    -- true, and easy to read as a statement about the four semiconductor
+    names rather than about one of them. A lone crosser is marked so the
+    breadth is visible without reading the sentence.
+    """
+    if row is None:
+        return ""
+    try:
+        detail = json.loads(row["detail"] or "{}")
+    except (ValueError, TypeError):
+        return ""
+    crossed, n = detail.get("crossed"), detail.get("evaluated")
+    if crossed is None or not n:
+        return ""
+    cls = "t-breadth" + (" lone" if crossed == 1 and n > 1 else "")
+    return (f'<span class="{cls}" title="{crossed} of {n} named issuer(s) '
+            f'crossed the threshold">{crossed}/{n}</span>')
 
 
 def render_slider(conn):
@@ -901,6 +933,19 @@ def selftest():
        "STALE" in panel and "never evaluated" in panel)
     ok("and does not quietly report them as dormant",
        panel.count(">DORMANT<") == 0)
+
+    # -- breadth is shown, so one name does not read as a complex ---------
+    lone = breadth_badge({"detail": json.dumps(
+        {"crossed": 1, "evaluated": 4})})
+    ok("a lone crosser out of four is marked", "1/4" in lone)
+    ok("and marked distinctly, not just counted", "lone" in lone)
+    ok("a unanimous crossing is not marked as lone",
+       "lone" not in breadth_badge({"detail": json.dumps(
+           {"crossed": 4, "evaluated": 4})}))
+    for bad in ({"detail": None}, {"detail": "{}"}, {"detail": "not json"},
+                None):
+        ok("a trigger with no breadth to report renders nothing",
+           breadth_badge(bad) == "")
 
     # -- the guard that would have caught this bug ------------------------
     panels = {"dips": "<section>a</section>", "slider": "<section>b</section>",

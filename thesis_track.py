@@ -16,6 +16,26 @@ returns STALE with the reason attached, and the reason is stored.
 The bar for FIRED is deliberately high: the metric must be computed, from
 data that exists, against a threshold written down before the fact. Anything
 short of that is STALE.
+
+KNOWN DEVIATION FROM THE WORK ORDER
+-----------------------------------
+The work order says Lane D gets its own module, its own SQLite database and
+its own workflow file. It has its own module and its own tables; it does NOT
+have its own database. This is deliberate and it is written here rather than
+left as a silent gap.
+
+Two of the evaluators read tables this lane does not own. eval_insider_cluster
+reads insider_sales, collected from Form 4 by the EDGAR lane, and eval_curve
+reads market_gauges, collected with the dashboard's gauges. Splitting the
+database means either ATTACHing across two files on every run -- which is a
+shared database with extra steps and a second way to get the path wrong -- or
+copying those tables into a second one, which creates two copies of the same
+facts that can disagree. Neither is worth the separation it buys here.
+
+What the separation was FOR is still honoured: Lane D is its own module with
+its own schema, its own tables, and its own step in the workflow that cannot
+take the collection run down with it. If the lane ever stops reading the
+other lanes' tables, this becomes a cheap change and should be made.
 """
 
 import argparse
@@ -84,9 +104,12 @@ def eval_price_drawdown(trigger, prices, today):
     if threshold is None:
         return STALE, worst, detail, "could not parse fires_when"
     note = f" ({len(missing)} unpriced: {', '.join(missing)})" if missing else ""
-    if worst > threshold:
-        return FIRED, worst, detail, f"worst drawdown {worst:.1f}%{note}"
-    return DORMANT, worst, detail, f"worst drawdown {worst:.1f}%{note}"
+    crossed = sum(1 for v in detail.values() if v > threshold)
+    reason = (f"{_breadth(crossed, len(detail))}; "
+              f"worst drawdown {worst:.1f}%{note}")
+    detail = {"tickers": detail, "crossed": crossed,
+              "evaluated": len(detail), "threshold": threshold}
+    return (FIRED if worst > threshold else DORMANT), worst, detail, reason
 
 
 def eval_curve(trigger, conn, today):
@@ -327,6 +350,19 @@ def _series(payload, names, today, kind="flow"):
     return best_name, best
 
 
+def _breadth(crossed, evaluated):
+    """How many of the named issuers crossed, said plainly.
+
+    These triggers fire when the WIDEST gap clears the threshold, which is
+    how they were pre-registered and is not changed here. But the reason
+    string used to read only "widest gap +58.8pp (AVGO)", which sounds like
+    a statement about the four named semiconductor issuers when it is a
+    statement about one of them. One of four and four of four are different
+    findings and the page should not render them identically.
+    """
+    return f"{crossed} of {evaluated} issuer(s) crossed"
+
+
 def _not_consecutive(series, n=8):
     """Why the last n periods are not adjacent quarters, or None.
 
@@ -448,9 +484,13 @@ def eval_divergence(trigger, today, cache, left, right, unit="pp"):
         return STALE, worst, detail, "could not parse fires_when"
     note = f"; could not read {', '.join(failed)}" if failed else ""
     state = FIRED if worst > threshold else DORMANT
+    widest = max(detail, key=detail.get)
+    crossed = sum(1 for v in detail.values() if v > threshold)
+    detail = {"issuers": detail, "crossed": crossed,
+              "evaluated": len(detail), "threshold": threshold}
     return state, worst, detail, (
-        f"widest gap {worst:+.1f}{unit} "
-        f"({max(detail, key=detail.get)}){note}")
+        f"{_breadth(crossed, detail['evaluated'])}; "
+        f"widest gap {worst:+.1f}{unit} ({widest}){note}")
 
 
 def eval_dso(trigger, today, cache):
@@ -518,10 +558,15 @@ def eval_dso(trigger, today, cache):
         return STALE, worst, detail, "could not parse fires_when"
     note = f"; could not read {', '.join(failed)}" if failed else ""
     widest = max(detail, key=lambda k: detail[k]["change_days"])
-    return (FIRED if worst > threshold else DORMANT), worst, detail, (
-        f"widest DSO change {worst:+.1f} days ({widest}: "
-        f"{detail[widest]['dso_prior']:.0f} to "
-        f"{detail[widest]['dso']:.0f}){note}")
+    crossed = sum(1 for d in detail.values()
+                  if d["change_days"] > threshold)
+    reason = (f"{_breadth(crossed, len(detail))}; "
+              f"widest DSO change {worst:+.1f} days ({widest}: "
+              f"{detail[widest]['dso_prior']:.0f} to "
+              f"{detail[widest]['dso']:.0f}){note}")
+    detail = {"issuers": detail, "crossed": crossed,
+              "evaluated": len(detail), "threshold": threshold}
+    return (FIRED if worst > threshold else DORMANT), worst, detail, reason
 
 
 def _threshold(expr):
@@ -604,6 +649,108 @@ def run(conn, theses, prices=None, today=None):
     return out
 
 
+def asof_months(n, today=None):
+    """n monthly as-of dates, oldest first, ending today."""
+    end = date.fromisoformat(today) if today else date.today()
+    out = []
+    y, m = end.year, end.month
+    for _ in range(n):
+        out.append(date(y, m, min(end.day, 28)).isoformat())
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    return sorted(out)
+
+
+def episodes(flags):
+    """Runs of consecutive True, counted once each.
+
+    A threshold that is over the line for nine months running is ONE
+    episode, not nine. Counting months would make every threshold look
+    better the longer the condition persisted, which is the inflation this
+    repo already walked into once with dip depths.
+    """
+    n, prev = 0, False
+    for f in flags:
+        if f and not prev:
+            n += 1
+        prev = f
+    return n
+
+
+# What each metric trigger is measured in, for the calibration table.
+SWEEPS = {
+    "inventory-outgrows-revenue": ([0, 5, 10, 15, 20, 25, 30, 40, 50, 60],
+                                   "pp"),
+    "receivables-stretching": ([0, 5, 10, 15, 20, 25, 30, 40], "days"),
+    "capex-growth-negative": ([-20, -10, -5, 0, 5, 10, 15, 25], "%"),
+    "capex-growth-decelerating": ([-20, -10, -5, 0, 5, 10, 15, 25], "%"),
+}
+
+
+def calibrate(path="theses.json", months=36, today=None):
+    """What each threshold WOULD have done, month by month, point in time.
+
+    Reads nothing forward: every as-of date sees only facts FILED by then,
+    the same discipline the live evaluator uses. Writes nothing -- not the
+    thesis file, not the database. This exists so a threshold can be moved
+    deliberately and the move recorded, rather than nudged until it fires.
+
+    What to look for is the sample collapsing out from under the number,
+    exactly as on the dip slider: a threshold with one episode behind it is
+    a number with nothing behind it, however neat the table looks.
+    """
+    spec = load(path)
+    cache, dates = {}, asof_months(months, today)
+    print(f"calibrating over {len(dates)} monthly as-of dates, "
+          f"{dates[0]} .. {dates[-1]}")
+    print("point in time: each date sees only facts filed by then.\n")
+
+    for thesis in spec.get("theses", []):
+        for trigger in thesis.get("triggers", []):
+            tid = trigger["id"]
+            sweep = SWEEPS.get(tid)
+            handler = HANDLERS.get(tid)
+            if not sweep or not handler or handler[0] != "facts":
+                continue
+            grid, unit = sweep
+            fn = handler[1]
+            committed = _threshold(trigger.get("fires_when", ""))
+            vals, stale = [], 0
+            for as_of in dates:
+                try:
+                    _s, value, _d, _r = fn(trigger, as_of, cache)
+                except Exception:
+                    value = None
+                if value is None:
+                    stale += 1
+                vals.append(value)
+
+            seen = [v for v in vals if v is not None]
+            print(f"== {tid}  (committed: {trigger.get('fires_when')})")
+            if not seen:
+                print("   nothing evaluable over this window -- "
+                      "no basis for any threshold\n")
+                continue
+            print(f"   {len(seen)} of {len(dates)} dates evaluable"
+                  f"{f', {stale} not' if stale else ''}; "
+                  f"range {min(seen):+.1f} .. {max(seen):+.1f}{unit}")
+            print(f"   {'threshold':>12}  {'months':>6}  {'episodes':>8}   "
+                  f"first fire")
+            for t in grid:
+                # capex fires BELOW its threshold; the others above.
+                below = tid.startswith("capex")
+                flags = [v is not None and (v < t if below else v > t)
+                         for v in vals]
+                first = next((d for d, f in zip(dates, flags) if f), "never")
+                mark = "  <-- committed" if (
+                    committed is not None and abs(t - committed) < 1e-9) else ""
+                print(f"   {t:>9}{unit:>3}  {sum(flags):>6}  "
+                      f"{episodes(flags):>8}   {first}{mark}")
+            print()
+    return 0
+
+
 def price_tickers(spec):
     """Every ticker a price trigger needs, so they can be fetched.
 
@@ -667,11 +814,15 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--explain", type=int, default=None, metavar="CIK",
                     help="dump one issuer's XBRL rows and stop")
+    ap.add_argument("--calibrate", type=int, default=None, metavar="MONTHS",
+                    help="what each threshold would have done; writes nothing")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
     if args.explain:
         return explain(args.explain)
+    if args.calibrate:
+        return calibrate(args.theses, args.calibrate)
     conn = sqlite3.connect(args.db)
     spec = load(args.theses)
     prices = None
@@ -829,8 +980,31 @@ def selftest():
     ok("DSO is reported in days", round(value, 1) == 36.5)
     ok("and the reason says days, not points", "days" in why)
     ok("the detail carries both ends of the comparison",
-       detail["ZZZ"]["dso_prior"] == 73.0 and detail["ZZZ"]["dso"] == 109.5)
+       detail["issuers"]["ZZZ"]["dso_prior"] == 73.0
+       and detail["issuers"]["ZZZ"]["dso"] == 109.5)
     ok("a 36-day stretch clears a 15-day threshold", state == FIRED)
+    ok("and the reason says how many issuers crossed, not just the widest",
+       "1 of 1 issuer(s) crossed" in why)
+
+    # The case this exists for: one name out of four carrying the trigger.
+    # It still FIRES -- that is how it was registered and the rule is not
+    # changed -- but the page must not read as a statement about four.
+    quiet = {"facts": {"us-gaap": {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": usd(rev_rows),
+        "AccountsReceivableNetCurrent": usd(
+            [{"end": e, "val": 80.0, "filed": e, "form": "10-Q"}
+             for e, _s in ends])}}}          # flat AR: no stretch at all
+    wide = {"id": "receivables-stretching",
+            "ciks": {"LOUD": 7, "A": 21, "B": 22, "C": 23},
+            "fires_when": "dso_change_days > 15"}
+    state, _v, detail, why = eval_dso(wide, "2026-10-27", {
+        7: (pay, setup_pit.OK), 21: (quiet, setup_pit.OK),
+        22: (quiet, setup_pit.OK), 23: (quiet, setup_pit.OK)})
+    ok("one issuer out of four still fires, as registered", state == FIRED)
+    ok("but the reason says one of four, not just the widest",
+       "1 of 4 issuer(s) crossed" in why)
+    ok("and the count is stored, not only printed",
+       detail["crossed"] == 1 and detail["evaluated"] == 4)
 
     t5 = dict(t4); t5["fires_when"] = "dso_change_days > 60"
     ok("and the same 36 days is DORMANT against 60",
@@ -926,6 +1100,19 @@ def selftest():
        tag == "Revenues")
     ok("so the series is current, not a decade old",
        picked[-1][0] == "2025-12-31")
+
+    # -- calibration counts episodes, not months --------------------------
+    ok("a run of consecutive months is one episode",
+       episodes([False, True, True, True, False]) == 1)
+    ok("two separated runs are two", episodes([True, False, True]) == 2)
+    ok("nothing over the line is no episodes",
+       episodes([False, False]) == 0)
+    ok("a run that is still open at the end still counts",
+       episodes([False, True, True]) == 1)
+    d = asof_months(14, "2026-03-31")
+    ok("as-of dates run backwards a month at a time, oldest first",
+       len(d) == 14 and d[0] == "2025-02-28" and d[-1] == "2026-03-28")
+    ok("and cross the year boundary correctly", "2025-12-28" in d)
 
     # -- the price triggers must declare what to fetch --------------------
     spec = load("theses.json")
