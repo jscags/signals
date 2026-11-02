@@ -2881,13 +2881,41 @@ FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata
 # 32-character key; Stooq hangs or 404s; Yahoo returns 429 from a runner's
 # shared address.
 #
-# The cost of a mirror is that it can quietly stop updating, and a frozen
-# number still renders as a tile. BRENT_MAX_AGE_DAYS is the guard: past that,
-# the reading is refused and the gauge goes stale rather than presenting a
-# stale price as today's.
+# Re-probed 2026-11-02, after the tile was noticed showing a week-old price.
+# Still the only usable keyless source, and the alternatives failed in three
+# different ways, none of which a status code alone would have revealed:
+#
+#   datahub_mirror   200, newest 2026-10-27, SIX DAYS OLD
+#   fred_api_nokey   400, "api_key is not a 32 character ... string"
+#   stooq_quote      404, the path has moved or been withdrawn
+#   stooq_daily_*    200 -- carrying a JavaScript bot challenge, not a series
+#   yahoo_chart      429, rate-limited on the runner's shared address
+#
+# The Stooq result is the instructive one: HTTP 200, 796 bytes, "This site
+# requires JavaScript to verify your browser". A success code wrapped around
+# a refusal. Getting past it would mean defeating a bot check, which is not
+# something this repo will do for an oil price.
+#
+# So six days of publication lag is what this gauge COSTS, not a fault. The
+# series itself is sound -- gaps across the last ninety rows are 1, 3 and 4
+# days: weekends and a holiday.
+#
+# Two different jobs, which were conflated in one number until now:
+#
+#   BRENT_MAX_AGE_DAYS refuses a reading outright. It should mean "this feed
+#   has STOPPED", so it sits well clear of any legitimate lag. Normal lag
+#   reaches 6-7 days, and the schedule adds up to 2 more across a weekend
+#   (3 over a holiday), so a perfectly healthy reading can be 10 days old at
+#   render time. At 14 this was one day from refusing a working feed, which
+#   is far too tight for a tripwire.
+#
+#   gauge_lag() + the g-lag mark TELL THE READER how far behind the number
+#   is, every day, without refusing anything. That is the job the old 14 was
+#   failing at, and it is the one that actually matters here: the number was
+#   never wrong, it was just older than it looked.
 BRENT_URL = ("https://raw.githubusercontent.com/datasets/oil-prices"
              "/main/data/brent-daily.csv")
-BRENT_MAX_AGE_DAYS = 14
+BRENT_MAX_AGE_DAYS = 21
 TREASURY_YIELD_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
     "pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={year}")
@@ -3432,7 +3460,7 @@ def selftest_gauges():
     ok("a weekend-old reading is not nagged about",
        "g-lag" not in tile("2026-10-30"))
     behind = tile("2026-10-27")
-    ok("a source a few days behind says so", "source is 6 days behind" in behind)
+    ok("a source a few days behind says so", "source 6d behind" in behind)
     ok("and says it quietly at that distance", "warn" not in behind)
     old = tile("2026-10-20")
     ok("a week-plus behind is marked warm", 'class="g-lag warn"' in old)
@@ -3467,6 +3495,16 @@ def selftest_gauges():
     except FetchError:
         refused = True
     ok("a reading past the age limit is refused, not rendered", refused)
+    # The limit must clear a HEALTHY worst case: ~7 days of publication lag
+    # plus a weekend or holiday with no scheduled run. At 14 it was one day
+    # from refusing a working feed.
+    ok("a healthy reading at the worst realistic lag is NOT refused",
+       parse_brent("Date,Price\n" + rows,
+                   today=date(2026, 10, 30))["as_of"] == "2026-10-20")
+    ok("the refusal limit clears normal lag by a clear margin",
+       BRENT_MAX_AGE_DAYS >= 21)
+    ok("and the lag mark fires long before the refusal does",
+       GAUGE_LAG_WARN_DAYS < BRENT_MAX_AGE_DAYS)
     try:
         parse_brent("Date,Price\n2026-10-01,.\n2026-10-02,NA", today=t)
         empty = False
@@ -4611,6 +4649,9 @@ h1 {
 .g-lag {
   margin-left: 8px; color: var(--muted); border: 1px dotted var(--rule);
   border-radius: 2px; padding: 0 4px;
+  /* The footer is narrow and this phrase was breaking across two lines
+     mid-sentence, with the border torn in half around it. */
+  white-space: nowrap; display: inline-block;
 }
 .g-lag.warn { color: var(--warm); border-color: var(--warm); }
 /* ---- 90-day lines ---- */
@@ -5716,7 +5757,7 @@ def _gauge_tile(title, hero, unit, label, warm, track, scale, detail,
     lag = gauge_lag(as_of, today)
     if not stale and lag is not None and lag > GAUGE_LAG_NOTE_DAYS:
         cls = "g-lag warn" if lag > GAUGE_LAG_WARN_DAYS else "g-lag"
-        aging += (f'<span class="{cls}">source is {lag} days behind</span>')
+        aging += (f'<span class="{cls}">source {lag}d behind</span>')
     return (
         f'<div class="gauge">'
         f'<div class="g-head">{html.escape(title)}</div>'
