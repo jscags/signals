@@ -3352,9 +3352,128 @@ BRENT_CANDIDATES = (
 )
 
 
+def newest_observation(text, today=None):
+    """The most recent date a payload mentions, and how old it is.
+
+    Reachability stopped being the question. Every candidate answers; what
+    separates them is PUBLICATION LAG, and that is not visible in a status
+    code. The mirror in use returns HTTP 200 with a clean business-daily
+    series whose newest row is several days old, so the gauge renders a
+    price from last week wearing today's styling.
+
+    Dates are looked for in two shapes -- ISO yyyy-mm-dd and bare unix
+    seconds -- because the candidates are a mix of CSV and JSON. Anything
+    in the future, or absurdly old, is ignored rather than trusted: a
+    payload can carry a copyright year or a request echo, and the point is
+    to be hard to fool, not to find a number.
+    """
+    today = today or date.today()
+    best = None
+    for raw in re.findall(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            d = date.fromisoformat(raw)
+        except ValueError:
+            continue
+        if date(2000, 1, 1) <= d <= today and (best is None or d > best):
+            best = d
+    for raw in re.findall(r"\b1[0-9]{9}\b", text):
+        try:
+            d = datetime.fromtimestamp(int(raw), UTC).date()
+        except (ValueError, OSError, OverflowError):
+            continue
+        if date(2000, 1, 1) <= d <= today and (best is None or d > best):
+            best = d
+    return (best, (today - best).days) if best else (None, None)
+
+
+def selftest_gauges():
+    """Offline checks for the gauge parsing and the two kinds of oldness.
+
+    This module has no test harness of its own and is far too large to grow
+    one here, so these cover the functions this change touches and nothing
+    else. Every check runs without a network.
+    """
+    checks = 0
+
+    def ok(label, cond):
+        nonlocal checks
+        assert cond, "FAILED: " + label
+        checks += 1
+
+    t = date(2026, 11, 2)
+
+    # -- how old is the reading, and can we even tell ---------------------
+    ok("a reading from today is zero days behind",
+       gauge_lag("2026-11-02", t) == 0)
+    ok("a Friday close read on Monday is two days behind",
+       gauge_lag("2026-10-31", t) == 2)
+    ok("the lag the mirror actually had is measured",
+       gauge_lag("2026-10-20", t) == 13)
+    for junk in (None, "", "unknown", "not-a-date", "2026-13-45"):
+        ok("an unreadable date gives no lag rather than a wrong one",
+           gauge_lag(junk, t) is None)
+
+    # -- a lagging source is marked, and NOT as a failed refresh ----------
+    def tile(as_of, stale=False):
+        return _gauge_tile("T", "1", "u", "l", False, "", "", [],
+                           as_of=as_of, stale=stale, today=t)
+
+    fresh = tile("2026-11-01")
+    ok("a current reading carries no mark",
+       "g-lag" not in fresh and "g-stale" not in fresh)
+    ok("a weekend-old reading is not nagged about",
+       "g-lag" not in tile("2026-10-30"))
+    behind = tile("2026-10-27")
+    ok("a source a few days behind says so", "source is 6 days behind" in behind)
+    ok("and says it quietly at that distance", "warn" not in behind)
+    old = tile("2026-10-20")
+    ok("a week-plus behind is marked warm", 'class="g-lag warn"' in old)
+    ok("a failed refresh still says the refresh failed",
+       "last refresh failed" in tile("2026-10-20", stale=True))
+    ok("and a failed refresh is not ALSO called a lagging source -- "
+       "they are different sentences",
+       "g-lag" not in tile("2026-10-20", stale=True))
+
+    # -- the freshness the probe reports ----------------------------------
+    ok("the newest ISO date in a payload wins",
+       newest_observation("2026-10-01\n2026-10-30\n2026-10-15", t)[0]
+       == date(2026, 10, 30))
+    ok("and its age is reported",
+       newest_observation("2026-10-30", t)[1] == 3)
+    ok("a future date is not trusted",
+       newest_observation("2099-01-01", t)[0] is None)
+    ok("nor one from before the series could exist",
+       newest_observation("1823-05-01", t)[0] is None)
+    ok("a payload with no date reports none",
+       newest_observation("no dates here", t) == (None, None))
+    ok("a unix timestamp is read too",
+       newest_observation('{"timestamp":[1793491200]}', t)[0] is not None)
+
+    # -- parse_brent still refuses what it was built to refuse ------------
+    rows = "\n".join(f"2026-10-{d:02d},100.0" for d in range(1, 21))
+    out = parse_brent("Date,Price\n" + rows, today=date(2026, 10, 25))
+    ok("the newest dated row wins", out["as_of"] == "2026-10-20")
+    try:
+        parse_brent("Date,Price\n" + rows, today=date(2026, 11, 20))
+        refused = False
+    except FetchError:
+        refused = True
+    ok("a reading past the age limit is refused, not rendered", refused)
+    try:
+        parse_brent("Date,Price\n2026-10-01,.\n2026-10-02,NA", today=t)
+        empty = False
+    except FetchError:
+        empty = True
+    ok("a feed of no observations is refused, not read as zero", empty)
+
+    print(f"gauge selftest: {checks} checks passed")
+    return 0
+
+
 def probe_brent_sources(timeout=20):
-    """Reachability of each Brent candidate. Writes nothing, parses nothing."""
+    """How FRESH each Brent candidate is, not merely whether it answers."""
     print("BRENT CANDIDATE PROBE -- writes nothing, adopts nothing\n")
+    summary = []
     answered = 0
     for name, url in BRENT_CANDIDATES:
         print(f"{name}\n  {url[:110]}")
@@ -3372,17 +3491,38 @@ def probe_brent_sources(timeout=20):
         except (urllib.error.URLError, OSError, ValueError) as exc:
             print(f"  NO ANSWER after {time.time() - started:.1f}s  "
                   f"{type(exc).__name__}: {exc}\n")
+            summary.append((name, None, None, None))
             continue
         answered += 1
         text = body.decode("utf-8", "replace")
         print(f"  HTTP {status}  {len(body)}B in {time.time() - started:.1f}s")
+        newest, age = newest_observation(text)
+        if newest:
+            print(f"  NEWEST OBSERVATION {newest}  ({age} day(s) old)")
+        else:
+            print(f"  NEWEST OBSERVATION none found -- no usable date in "
+                  f"the payload (a 4xx body, or a shape not parsed here)")
+        summary.append((name, status, newest, age))
         print(f"  first 200B: {text[:200]!r}")
         # A chronological file puts the newest observation at the END, so the
         # head alone cannot tell a live feed from an abandoned one.
         if len(text) > 200:
             print(f"  last 200B:  {text[-200:]!r}")
         print()
-    print(f"{answered} of {len(BRENT_CANDIDATES)} candidates answered")
+    print(f"{answered} of {len(BRENT_CANDIDATES)} candidates answered\n")
+    # Ranked by lag, because lag is the decision. Reachability was settled
+    # the first time this ran; what matters now is which source is least
+    # far behind, and whether ANY of them is fresh enough to be worth
+    # swapping to. "Answers quickly" and "knows today's price" are
+    # different properties and only one of them is on the page.
+    print(f"{'candidate':>16}  {'http':>5}  {'newest':>10}  {'age':>5}")
+    for name, status, newest, age in sorted(
+            summary, key=lambda r: (r[3] is None, r[3])):
+        print(f"{name:>16}  {str(status or '-'):>5}  "
+              f"{str(newest or '-'):>10}  "
+              f"{(str(age) + 'd') if age is not None else '-':>5}")
+    print(f"\nin use: {BRENT_URL[:70]}\n"
+          f"refused past {BRENT_MAX_AGE_DAYS} days old")
     # Every candidate answering is the expected outcome; this probe reports,
     # it does not grade. A non-zero exit would say "something is broken",
     # and nothing here is broken -- the question is which source to adopt.
@@ -4456,6 +4596,15 @@ h1 {
   margin-left: 8px; color: var(--warm); border: 1px solid var(--warm);
   border-radius: 2px; padding: 0 4px;
 }
+/* A fetch that SUCCEEDED and returned an old reading. Deliberately not
+   styled like .g-stale: a failed refresh and a lagging source call for
+   different reactions, and drawing them alike is how an outage starts
+   reading as reassurance. Muted at a few days, warm past a week. */
+.g-lag {
+  margin-left: 8px; color: var(--muted); border: 1px dotted var(--rule);
+  border-radius: 2px; padding: 0 4px;
+}
+.g-lag.warn { color: var(--warm); border-color: var(--warm); }
 /* ---- 90-day lines ---- */
 /* The line is recessive on purpose: the hero number is the headline and this
    is the shape behind it. Only the current point wears the accent. */
@@ -5524,10 +5673,42 @@ def _gauge_track(position, midpoint, warm):
         f'<div class="g-mark {side}" style="left:{position:.4g}%"></div></div>')
 
 
+def gauge_lag(as_of, today=None):
+    """How many days behind a reading is, or None if it cannot be told.
+
+    Separate from `stale`, which means the FETCH FAILED. A gauge can be
+    fetched successfully and still be showing last week: the Brent mirror
+    answers HTTP 200 with a clean series whose newest row is several days
+    old. "We could not refresh this" and "we refreshed it and the source
+    is behind" are different sentences that were rendering identically,
+    which is the same confusion as STALE versus DORMANT one level up.
+    """
+    try:
+        d = date.fromisoformat(as_of)
+    except (TypeError, ValueError):
+        return None
+    return ((today or market_today()) - d).days
+
+
+# A reading is dated by its OBSERVATION day, so a Friday close read on a
+# Monday is two days old and perfectly current. Past a long weekend it is
+# worth saying; past a week the number is old enough that a reader should
+# be told before they act on it.
+GAUGE_LAG_NOTE_DAYS = 3
+GAUGE_LAG_WARN_DAYS = 7
+
+
 def _gauge_tile(title, hero, unit, label, warm, track, scale, detail,
-                as_of, stale, note="", spark=""):
+                as_of, stale, note="", spark="", today=None):
     bits = "".join(f"<span>{html.escape(d)}</span>" for d in detail)
     aging = ('<span class="g-stale">last refresh failed</span>' if stale else "")
+    # A successful fetch of an old number gets its own mark. Without it the
+    # footer reads "as of 2026-10-20" in small grey text beside a hero
+    # number in large type, and the hero wins.
+    lag = gauge_lag(as_of, today)
+    if not stale and lag is not None and lag > GAUGE_LAG_NOTE_DAYS:
+        cls = "g-lag warn" if lag > GAUGE_LAG_WARN_DAYS else "g-lag"
+        aging += (f'<span class="{cls}">source is {lag} days behind</span>')
     return (
         f'<div class="gauge">'
         f'<div class="g-head">{html.escape(title)}</div>'
@@ -5605,7 +5786,7 @@ def render_gauges(conn, today=None):
             detail=bits,
             spark=history("brent", lambda v: f"${v:,.2f}",
                           "Brent crude, spot"),
-            as_of=row["as_of"] or "unknown", stale=bool(row["stale"]),
+            as_of=row["as_of"] or "unknown", stale=bool(row["stale"]), today=today,
             note=("beyond the scale" if not (lo <= usd <= hi) else "")))
 
     row = rows.get("fear_greed")
@@ -5623,7 +5804,8 @@ def render_gauges(conn, today=None):
             spark=history("fear_greed", lambda v: f"{v:.0f}",
                           "CNN fear & greed", baseline=50.0,
                           baseline_label="50 neutral"),
-            as_of=row["as_of"] or "unknown", stale=bool(row["stale"])))
+            as_of=row["as_of"] or "unknown", stale=bool(row["stale"]),
+            today=today))
 
     row = rows.get("yield_spread")
     if row is not None and row["value"] is not None:
@@ -5642,7 +5824,7 @@ def render_gauges(conn, today=None):
             spark=history("yield_spread", lambda v: f"{v:+.0f} bp",
                           "10-year minus 2-year", baseline=0.0,
                           baseline_label="0 inversion"),
-            as_of=row["as_of"] or "unknown", stale=bool(row["stale"]),
+            as_of=row["as_of"] or "unknown", stale=bool(row["stale"]), today=today,
             note=("beyond the scale" if abs(bp) > GAUGE_SPREAD_DOMAIN else "")))
 
     if not tiles:
@@ -6030,6 +6212,8 @@ def main():
                     help="diagnostic: which Brent candidate sources answer "
                          "from wherever this runs, and how fast -- adopts "
                          "nothing and writes nothing")
+    ap.add_argument("--selftest-gauges", action="store_true",
+                    help="check the gauge parsing and staleness logic offline")
     ap.add_argument("--probe-form4", metavar="ACCESSION",
                     help="diagnostic: print one Form 4's transactions as filed")
     ap.add_argument("--transition-cap", type=int, metavar="N",
@@ -6039,6 +6223,12 @@ def main():
     ap.add_argument("--rescore", action="store_true",
                     help="backfill significance onto events stored before the scale")
     args = ap.parse_args()
+
+    # Before the database and before the collector's User-Agent is required:
+    # these checks touch neither, and a test that cannot run without the
+    # whole program configured is a test nobody runs.
+    if args.selftest_gauges:
+        return selftest_gauges()
 
     conn = connect()
     signal_state.set_user_agent(USER_AGENT)
