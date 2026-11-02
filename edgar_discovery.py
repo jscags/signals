@@ -3337,8 +3337,16 @@ BRENT_CANDIDATES = (
     ("fred_api_nokey", "https://api.stlouisfed.org/fred/series/observations"
      "?series_id=DCOILBRENTEU&file_type=json&limit=2&sort_order=desc"
      "&api_key=probe_no_key"),
-    # Stooq's published CSV download. Keyless, continuous Brent future.
-    ("stooq_csv", "https://stooq.com/q/l/?s=cb.f&f=sd2t2ohlc&h&e=csv"),
+    # Stooq's live-quote endpoint. Answered 404 on 2026-11-02 -- the path
+    # has moved or been withdrawn. Kept so the next probe re-checks it
+    # rather than someone re-deriving the same dead URL from memory.
+    ("stooq_quote", "https://stooq.com/q/l/?s=cb.f&f=sd2t2ohlc&h&e=csv"),
+    # Stooq's HISTORICAL daily download, a different endpoint from the one
+    # above and the one that serves a dated series. Keyless. Two Brent
+    # symbols are tried because stooq's naming is not documented and a
+    # wrong symbol returns a page, not an error.
+    ("stooq_daily_cb_f", "https://stooq.com/q/d/l/?s=cb.f&i=d"),
+    ("stooq_daily_cb_c", "https://stooq.com/q/d/l/?s=cb.c&i=d"),
     # Yahoo's chart endpoint. Undocumented and unsanctioned -- included so the
     # choice is informed, NOT because it is adopted.
     ("yahoo_chart", "https://query1.finance.yahoo.com/v8/finance/chart/"
