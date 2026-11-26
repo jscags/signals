@@ -520,6 +520,45 @@ day they first appeared and graded against prices afterward. Manual grades
     return path
 
 
+# ------------------------------------------------------------------ summary
+
+def write_summary(graded, conn, path):
+    """The few numbers the main Signals page shows, as JSON.
+
+    The main page is built by a different workflow that has no reason to
+    price these tickers, so it reads this file rather than grading again.
+    It carries its own build time so that page can say when it is stale.
+    """
+    priced = {g["ticker"] for g in graded if g["test"] in PRICED}
+    through = max((last_day(conn, t) or "" for t in priced), default="") or None
+    cats = [{"category": r["category"], "label": CATEGORY_LABEL[r["category"]],
+             "rate": r["rate"], "graded": r["graded"],
+             "hits": r["counts"].get(HIT, 0), "misses": r["counts"].get(MISS, 0)}
+            for r in by_category(graded)]
+    cal = calibration(graded)
+    # A restated target replaces the one it supersedes; listing both would
+    # show the same opinion three times as "next to settle".
+    replaced = {g.get("supersedes") for g in graded if g.get("supersedes")}
+    open_calls = sorted((g for g in graded if g["headline"] == PENDING),
+                        key=lambda g: (g["by"], g["made"]))
+    shown = [g for g in open_calls if g["id"] not in replaced]
+    summary = {
+        "built": datetime.now().isoformat(timespec="minutes"),
+        "through": through,
+        "n": len(graded),
+        "open": len(open_calls),
+        "unpriced": sum(1 for g in graded if g["headline"] == UNPRICED),
+        "categories": cats,
+        "calibration": (None if not cal else
+                        {k: cal[k] for k in ("n", "expected", "actual", "brier")}),
+        "next_open": [{"by": g["by"], "ticker": g["ticker"], "say": g["say"]}
+                      for g in shown[:3]],
+    }
+    with open(path, "w") as fh:
+        json.dump(summary, fh, indent=1)
+    return path
+
+
 # ------------------------------------------------------------------ selftest
 
 def selftest():
@@ -597,6 +636,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--calls", default="calls.json")
     ap.add_argument("--out", default="docs/calls.html")
+    ap.add_argument("--summary", default="docs/calls_summary.json",
+                    help="small JSON the main Signals page reads")
     ap.add_argument("--check", action="store_true", help="validate only")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--fetch", action="store_true",
@@ -637,6 +678,7 @@ def main():
         print(f"  calibration: {cal['expected']:.1f} expected, "
               f"{cal['actual']:.0f} actual, brier {cal['brier']:.3f}")
     print("wrote", render(graded, conn, args.out))
+    print("wrote", write_summary(graded, conn, args.summary))
     return 0
 
 

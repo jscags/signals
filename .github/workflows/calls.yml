@@ -1,4 +1,6 @@
-# Grades calls.json against daily prices and republishes docs/calls.html.
+# Grades calls.json against daily prices and republishes docs/calls.html,
+# plus docs/calls_summary.json, which the discovery workflow reads to put a
+# scorecard on the main Signals page.
 #
 # Runs after the close on weekdays. 23:30 UTC is 18:30 EST / 19:30 EDT, late
 # enough that the free tier's end-of-day bar for the session exists. A run
@@ -55,7 +57,7 @@ jobs:
         run: |
           git config user.name  "calls-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/calls.html
+          git add docs/calls.html docs/calls_summary.json
           if git diff --staged --quiet; then
             echo "nothing new"
             exit 0
