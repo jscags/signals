@@ -1,0 +1,88 @@
+{
+ "built": "2026-11-26T10:26",
+ "through": "2026-11-25",
+ "n": 60,
+ "open": 6,
+ "unpriced": 0,
+ "categories": [
+  {
+   "category": "level",
+   "label": "Support / floor levels",
+   "rate": 0.5,
+   "graded": 12,
+   "hits": 6,
+   "misses": 6
+  },
+  {
+   "category": "target",
+   "label": "Upside targets",
+   "rate": 0.0,
+   "graded": 10,
+   "hits": 0,
+   "misses": 10
+  },
+  {
+   "category": "regime",
+   "label": "Market regime calls",
+   "rate": 0.5,
+   "graded": 6,
+   "hits": 3,
+   "misses": 3
+  },
+  {
+   "category": "risk",
+   "label": "Flagged risks",
+   "rate": 0.7142857142857143,
+   "graded": 7,
+   "hits": 5,
+   "misses": 2
+  },
+  {
+   "category": "ticker",
+   "label": "Single-name calls",
+   "rate": 0.8333333333333334,
+   "graded": 15,
+   "hits": 12,
+   "misses": 2
+  },
+  {
+   "category": "conditional",
+   "label": "If-then reasoning",
+   "rate": 0.0,
+   "graded": 3,
+   "hits": 0,
+   "misses": 3
+  },
+  {
+   "category": "macro",
+   "label": "Macro / Fed reads",
+   "rate": 1.0,
+   "graded": 1,
+   "hits": 1,
+   "misses": 0
+  }
+ ],
+ "calibration": {
+  "n": 16,
+  "expected": 9.9,
+  "actual": 11.0,
+  "brier": 0.22187500000000002
+ },
+ "next_open": [
+  {
+   "by": "2026-11-27",
+   "ticker": "QQQ",
+   "say": "QQQ 725 by Black Friday possible"
+  },
+  {
+   "by": "2026-12-31",
+   "ticker": "NVDA",
+   "say": "NVDA probably crawls back to 200 by year end"
+  },
+  {
+   "by": "2026-12-31",
+   "ticker": "ANT",
+   "say": "ANT drops 10-20% from its first close; floor about 77.6"
+  }
+ ]
+}
