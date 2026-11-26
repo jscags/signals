@@ -169,11 +169,16 @@ def _grade_level(test, level, window, complete, basis):
     if test == "reach":
         key = "close" if basis == "close" else "high"
         best = max(b[key] for b in window)
-        return MISS, f"best {best:,.2f}"
+        label = "best close" if basis == "close" else "high"
+        return MISS, f"{label} {best:,.2f}"
     key = ("close" if basis == "close" else
            ("low" if test == "hold" else "high"))
     extreme = (min if test == "hold" else max)(b[key] for b in window)
-    return HIT, f"{'low' if test == 'hold' else 'high'} {extreme:,.2f}"
+    if basis == "close":
+        label = "lowest close" if test == "hold" else "highest close"
+    else:
+        label = "low" if test == "hold" else "high"
+    return HIT, f"{label} {extreme:,.2f}"
 
 
 def grade(call, conn):
@@ -462,7 +467,8 @@ def render(graded, conn, path):
         gc, gi = g["grades"]["close"], g["grades"]["intraday"]
         intraday = ("" if g["test"] in ("manual", "up", "down")
                     else _st(gi[0], gi[1]))
-        detail = g.get("note") or gc[1] or ""
+        hb = g.get("basis", "close") if g["test"] in LEVELLED else "close"
+        detail = g.get("note") or g["grades"][hb][1] or ""
         led_rows.append(
             f"<tr><td class=mono>{esc(g['made'])}</td>"
             f"<td class=mono>{esc(g['ticker'])}</td>"
