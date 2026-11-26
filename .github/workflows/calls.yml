@@ -1,0 +1,67 @@
+# Grades calls.json against daily prices and republishes docs/calls.html.
+#
+# Runs after the close on weekdays. 23:30 UTC is 18:30 EST / 19:30 EDT, late
+# enough that the free tier's end-of-day bar for the session exists. A run
+# before that would grade today's calls against yesterday's bar and report
+# them PENDING, which is honest but useless.
+
+name: calls
+
+on:
+  schedule:
+    - cron: '30 23 * * 1-5'
+  workflow_dispatch:
+  push:
+    paths:
+      - calls.json
+      - calls_score.py
+
+permissions:
+  contents: write
+
+concurrency:
+  group: calls
+  cancel-in-progress: false
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # A malformed hand-edit fails here, before anything is priced. A call
+      # dropped silently would look exactly like a call never made.
+      - name: Validate ledger and grading logic
+        run: |
+          python3 calls_score.py --selftest
+          python3 calls_score.py --check
+
+      - name: Grade
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          PRICE_DB: prices.db
+        run: |
+          if [ -z "${POLYGON_API_KEY}" ]; then
+            echo "::error::POLYGON_API_KEY is not set."
+            exit 1
+          fi
+          python3 calls_score.py --fetch --out docs/calls.html
+
+      - name: Commit page
+        run: |
+          git config user.name  "calls-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/calls.html
+          if git diff --staged --quiet; then
+            echo "nothing new"
+            exit 0
+          fi
+          git commit -m "calls: $(date -u +%Y-%m-%d)"
+          # The discovery workflow also pushes to this branch; rebase rather
+          # than fail if it landed first.
+          git pull --rebase
+          git push
