@@ -310,6 +310,86 @@ def refresh_dips(conn, tickers, price_db=None):
     return stored
 
 
+CALLS_CSS = """
+.k-card { background: var(--card); border: 1px solid var(--rule);
+          border-radius: 6px; padding: 12px 14px; margin: 0 0 18px; }
+.k-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 2px; }
+.k-head b { font-family: "IBM Plex Mono", monospace; font-size: 11px;
+            letter-spacing: .08em; text-transform: uppercase;
+            font-weight: 400; color: var(--muted); }
+.k-head a { margin-left: auto; font-size: 12px; white-space: nowrap; }
+.k-sub { color: var(--muted); font-family: "IBM Plex Mono", monospace;
+         font-size: 11px; margin: 0 0 10px; }
+.k-row { display: grid; grid-template-columns: 1fr 40px minmax(60px, 120px) 64px;
+         gap: 8px; align-items: center; font-size: 12.5px; padding: 3px 0; }
+.k-rate { text-align: right; font-weight: 600;
+          font-variant-numeric: tabular-nums; }
+.k-n { color: var(--muted); font-size: 11px; text-align: right; }
+.k-bar { height: 7px; background: var(--rule); border-radius: 4px;
+         position: relative; }
+.k-bar i { position: absolute; left: 0; top: 0; bottom: 0;
+           border-radius: 4px; background: var(--signal); }
+.k-foot { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+.k-stale { color: var(--warm); font-weight: 600; }
+"""
+
+
+def render_calls(path="docs/calls_summary.json", today=None, stale_days=4):
+    """The call-ledger scorecard, compact, from the file the calls workflow
+    commits. That workflow grades; this page only displays.
+
+    A missing file renders nothing -- the ledger is optional. A file older
+    than `stale_days` renders with its date and a STALE mark, because a
+    hit rate quoted without saying it stopped updating is the failure this
+    repo exists to avoid.
+    """
+    try:
+        with open(path) as fh:
+            s = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    esc = ed.html.escape
+    today = today or date.today()
+    try:
+        built = datetime.fromisoformat(s["built"]).date()
+        age = (today - built).days
+    except (KeyError, ValueError, TypeError):
+        built, age = None, None
+    stale = age is None or age > stale_days
+    rows = []
+    for c in sorted(s.get("categories", []),
+                    key=lambda c: -1 if c.get("rate") is None else -c["rate"]):
+        rate = c.get("rate")
+        pct = "—" if rate is None else f"{rate * 100:.0f}%"
+        width = 0 if rate is None else rate * 100
+        rows.append(
+            f'<div class="k-row"><span>{esc(c["label"])}</span>'
+            f'<span class="k-rate">{pct}</span>'
+            f'<span class="k-bar"><i style="width:{width:.0f}%"></i></span>'
+            f'<span class="k-n">{c.get("graded", 0)} graded</span></div>')
+    cal = s.get("calibration")
+    cal_text = (f"Stated confidence: {cal['expected']:.1f} expected hits, "
+                f"{cal['actual']:.0f} actual over {cal['n']} calls "
+                f"(Brier {cal['brier']:.3f}; coin-flip 0.250)."
+                if cal else "")
+    nxt = s.get("next_open") or []
+    next_text = ("Next to settle: " + "; ".join(
+        f"{esc(n['say'])} (by {esc(n['by'])})" for n in nxt)
+        + ".") if nxt else ""
+    when = (f'<span class="k-stale">STALE &middot; built {esc(str(built))}</span>'
+            if stale else f'prices through {esc(str(s.get("through") or "—"))}')
+    unpriced = (f' &middot; <span class="k-stale">{s["unpriced"]} unpriced</span>'
+                if s.get("unpriced") else "")
+    return (f'<div class="k-card"><div class="k-head"><b>Newsletter call ledger</b>'
+            f'<a href="calls.html">Full ledger &rarr;</a></div>'
+            f'<p class="k-sub">{s.get("n", 0)} calls &middot; '
+            f'{s.get("open", 0)} open &middot; {when}{unpriced}</p>'
+            + "".join(rows)
+            + (f'<p class="k-foot">{cal_text} {next_text}</p>'
+               if cal_text or next_text else "")
+            + "</div>")
+
+
 def render_dips(conn):
     """Where each name sits, and what followed dips that deep before.
 
@@ -573,11 +653,12 @@ def write_merged(conn, path="docs/index.html", clouds=wheel.CLOUDS,
 <meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
-<style>{ed.CSS}{WHEEL_CSS}{THESIS_CSS}</style>
+<style>{ed.CSS}{WHEEL_CSS}{THESIS_CSS}{CALLS_CSS}</style>
 </head><body><div class="wrap">
 <h1>Signals</h1>
 <p class="meta">{n_set} of {len(rows)} set up &nbsp;·&nbsp; {body["n_moves"]} transition{"" if body["n_moves"] == 1 else "s"} &nbsp;·&nbsp; {body["n_issuers"]:,} issuers tracked &nbsp;·&nbsp; built {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
 {ed.render_gauges(conn)}
+{render_calls()}
 <p class="w-note"><b>Leveraged ETFs, steps 1–3, 8 and 9 only.</b> No strike
 and no premium appear here: the price feed's free tier refuses a live
 options chain. These funds also reset leverage daily and can fail to recover
