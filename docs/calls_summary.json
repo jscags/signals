@@ -1,9 +1,9 @@
 {
- "built": "2026-11-26T18:52",
+ "built": "2026-11-27T05:14",
  "through": "2026-11-25",
  "n": 60,
  "open": 6,
- "unpriced": 1,
+ "unpriced": 0,
  "categories": [
   {
    "category": "level",
@@ -40,9 +40,9 @@
   {
    "category": "ticker",
    "label": "Single-name calls",
-   "rate": 0.8214285714285714,
-   "graded": 14,
-   "hits": 11,
+   "rate": 0.8333333333333334,
+   "graded": 15,
+   "hits": 12,
    "misses": 2
   },
   {
