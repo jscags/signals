@@ -104,6 +104,16 @@
     {"id": "2026-11-25-len-up", "made": "2026-11-25", "by": "2026-11-25", "ticker": "LEN", "test": "up", "basis": "close", "category": "ticker", "conf": null, "say": "Rates down; LEN looks juicy"},
     {"id": "2026-11-25-wmt-hide", "made": "2026-11-25", "by": "2026-11-25", "ticker": "WMT", "test": "up", "basis": "close", "category": "ticker", "conf": null, "say": "WMT as a hiding spot"},
     {"id": "2026-11-25-tgt-hide", "made": "2026-11-25", "by": "2026-11-25", "ticker": "TGT", "test": "up", "basis": "close", "category": "ticker", "conf": null, "say": "TGT as a hiding spot"},
-    {"id": "2026-11-25-cautious", "made": "2026-11-25", "by": "2026-11-25", "ticker": "-", "test": "manual", "category": "regime", "conf": null, "say": "Near-term ugly with new tariffs layered on; stay cautious", "grade": "hit", "note": "S&P down as much as 3.2% intraday before recovering to -0.3%"}
+    {"id": "2026-11-25-cautious", "made": "2026-11-25", "by": "2026-11-25", "ticker": "-", "test": "manual", "category": "regime", "conf": null, "say": "Near-term ugly with new tariffs layered on; stay cautious", "grade": "hit", "note": "S&P down as much as 3.2% intraday before recovering to -0.3%"},
+
+    {"id": "2026-11-27-qqq-hold-630", "made": "2026-11-27", "by": "2026-11-27", "ticker": "QQQ", "test": "hold", "level": 630, "basis": "close", "category": "level", "conf": 0.7, "say": "QQQ holds 630 through the half-day close"},
+    {"id": "2026-11-27-catalysts-done", "made": "2026-11-27", "by": "2026-12-07", "ticker": "-", "test": "manual", "category": "regime", "conf": null, "say": "Done with catalysts until Fed nerves around Dec 7; the worst is over", "grade": "pending", "note": "Fourth 'catalysts over / worst is behind us' call in the ledger (see 11/11, 11/13, 11/19)"},
+    {"id": "2026-11-27-hood-hold-69", "made": "2026-11-27", "by": "2026-12-07", "ticker": "HOOD", "test": "hold", "level": 69, "basis": "close", "category": "ticker", "conf": null, "say": "HOOD bottom is in; holds 69"},
+    {"id": "2026-11-27-ant-hold-7774", "made": "2026-11-27", "by": "2026-12-07", "ticker": "ANT", "test": "hold", "level": 77.74, "basis": "close", "category": "ticker", "conf": null, "say": "ANT bottom is in; 77.74 keeps holding"},
+    {"id": "2026-11-27-ant-reach-8745", "made": "2026-11-27", "by": "2026-12-07", "ticker": "ANT", "test": "reach", "level": 87.45, "basis": "close", "category": "target", "conf": null, "say": "ANT breaks through 87.45, possibly leading the market higher"},
+    {"id": "2026-11-27-ant-reach-97", "made": "2026-11-27", "by": "2026-12-07", "ticker": "ANT", "test": "reach", "level": 97, "basis": "close", "category": "target", "conf": null, "say": "ANT then breaks through 97"},
+    {"id": "2026-11-27-avgo-bottom-if-ant", "made": "2026-11-27", "by": "2026-12-07", "ticker": "-", "test": "manual", "category": "conditional", "conf": null, "say": "If ANT holds its bottom, AVGO's bottom is in", "grade": "pending", "note": "Grade both halves: did ANT hold 77.74, and did AVGO make a lower close?"},
+    {"id": "2026-11-27-nvda-hearing-risk", "made": "2026-11-27", "by": "2026-12-01", "ticker": "NVDA", "test": "down", "basis": "close", "category": "risk", "conf": null, "say": "Risk: Nvidia's Dec 1 House committee appearances"},
+    {"id": "2026-11-27-qqq-reach-800-may", "made": "2026-11-27", "by": "2027-05-31", "ticker": "QQQ", "test": "reach", "level": 800, "basis": "close", "category": "target", "conf": 0.5, "say": "QQQ 800 delayed to May on tariffs", "supersedes": "2026-11-16-qqq-reach-800"}
   ]
 }
