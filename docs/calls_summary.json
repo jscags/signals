@@ -1,25 +1,25 @@
 {
- "built": "2026-11-27T05:14",
- "through": "2026-11-25",
- "n": 60,
- "open": 6,
+ "built": "2026-11-28T03:21",
+ "through": "2026-11-27",
+ "n": 69,
+ "open": 9,
  "unpriced": 0,
  "categories": [
   {
    "category": "level",
    "label": "Support / floor levels",
-   "rate": 0.5,
-   "graded": 12,
-   "hits": 6,
+   "rate": 0.5384615384615384,
+   "graded": 13,
+   "hits": 7,
    "misses": 6
   },
   {
    "category": "target",
    "label": "Upside targets",
-   "rate": 0.0,
-   "graded": 10,
-   "hits": 0,
-   "misses": 10
+   "rate": 0.07142857142857142,
+   "graded": 14,
+   "hits": 1,
+   "misses": 13
   },
   {
    "category": "regime",
@@ -40,10 +40,10 @@
   {
    "category": "ticker",
    "label": "Single-name calls",
-   "rate": 0.8333333333333334,
-   "graded": 15,
+   "rate": 0.78125,
+   "graded": 16,
    "hits": 12,
-   "misses": 2
+   "misses": 3
   },
   {
    "category": "conditional",
@@ -63,26 +63,26 @@
   }
  ],
  "calibration": {
-  "n": 16,
-  "expected": 9.9,
-  "actual": 11.0,
-  "brier": 0.22187500000000002
+  "n": 17,
+  "expected": 10.6,
+  "actual": 12.0,
+  "brier": 0.21411764705882352
  },
  "next_open": [
   {
-   "by": "2026-11-27",
-   "ticker": "QQQ",
-   "say": "QQQ 725 by Black Friday possible"
-  },
-  {
-   "by": "2026-12-31",
+   "by": "2026-12-01",
    "ticker": "NVDA",
-   "say": "NVDA probably crawls back to 200 by year end"
+   "say": "Risk: Nvidia's Dec 1 House committee appearances"
   },
   {
-   "by": "2026-12-31",
+   "by": "2026-12-07",
+   "ticker": "-",
+   "say": "Done with catalysts until Fed nerves around Dec 7; the worst is over"
+  },
+  {
+   "by": "2026-12-07",
    "ticker": "ANT",
-   "say": "ANT drops 10-20% from its first close; floor about 77.6"
+   "say": "ANT bottom is in; 77.74 keeps holding"
   }
  ]
 }
